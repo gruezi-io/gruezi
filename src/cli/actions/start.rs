@@ -1,17 +1,12 @@
-use anyhow::Result;
 use crate::gruezi;
+use anyhow::Result;
 
 /// Execute the start action
 ///
 /// # Errors
 ///
 /// Returns an error if the service fails to start
-pub fn run(
-    bind: &str,
-    peers: Option<&str>,
-    node_id: Option<&str>,
-    verbose: bool,
-) -> Result<()> {
+pub fn run(bind: &str, peers: Option<&str>, node_id: Option<&str>, verbose: bool) -> Result<()> {
     if verbose {
         println!("Bind address: {bind}");
         if let Some(p) = peers {

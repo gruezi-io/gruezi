@@ -14,10 +14,9 @@ pub fn handler(matches: &ArgMatches) -> Result<Action> {
     // Route to the appropriate action based on subcommand
     match matches.subcommand() {
         Some(("start", sub_matches)) => {
-            let bind = sub_matches.get_one::<String>("bind").map_or_else(
-                || "0.0.0.0:8080".to_owned(),
-                String::from,
-            );
+            let bind = sub_matches
+                .get_one::<String>("bind")
+                .map_or_else(|| "0.0.0.0:8080".to_owned(), String::from);
 
             let peers = sub_matches.get_one::<String>("peers").cloned();
 
@@ -43,9 +42,7 @@ pub fn handler(matches: &ArgMatches) -> Result<Action> {
             Ok(Action::Peers { format, verbose })
         }
         _ => {
-            anyhow::bail!(
-                "Invalid command. Run with --help for usage information"
-            )
+            anyhow::bail!("Invalid command. Run with --help for usage information")
         }
     }
 }

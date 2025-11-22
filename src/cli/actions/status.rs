@@ -1,6 +1,6 @@
-use anyhow::Result;
 use crate::gruezi;
 use crate::gruezi::status::ClusterStatus;
+use anyhow::Result;
 
 /// Execute the status action
 ///

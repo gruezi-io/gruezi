@@ -13,13 +13,7 @@ pub enum Action {
         verbose: bool,
     },
     /// Show cluster status
-    Status {
-        node: Option<String>,
-        verbose: bool,
-    },
+    Status { node: Option<String>, verbose: bool },
     /// List cluster peers
-    Peers {
-        format: String,
-        verbose: bool,
-    },
+    Peers { format: String, verbose: bool },
 }

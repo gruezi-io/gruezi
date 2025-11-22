@@ -20,13 +20,7 @@ fn execute(action: Action) -> Result<()> {
             node_id,
             verbose,
         } => {
-            gruezi::cli::actions::start::run(
-                &bind,
-                peers.as_deref(),
-                node_id.as_deref(),
-                verbose,
-            )
-            ?;
+            gruezi::cli::actions::start::run(&bind, peers.as_deref(), node_id.as_deref(), verbose)?;
         }
         Action::Status { node, verbose } => {
             gruezi::cli::actions::status::run(node.as_deref(), verbose)?;

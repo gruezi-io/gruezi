@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::gruezi;
+use anyhow::Result;
 
 /// Execute the peers action
 ///

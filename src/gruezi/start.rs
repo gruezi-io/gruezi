@@ -5,11 +5,7 @@ use anyhow::Result;
 /// # Errors
 ///
 /// Returns an error if the service fails to start
-pub fn start_service(
-    bind: &str,
-    peers: Option<&str>,
-    node_id: Option<&str>,
-) -> Result<()> {
+pub fn start_service(bind: &str, peers: Option<&str>, node_id: Option<&str>) -> Result<()> {
     // TODO: Implement service startup logic
     // - Initialize RAFT consensus
     // - Set up RocksDB for key-value storage

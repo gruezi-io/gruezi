@@ -1,12 +1,12 @@
-use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose, Engine};
+use anyhow::{Result, anyhow};
+use base64::{Engine, engine::general_purpose};
 use once_cell::sync::OnceCell;
 use opentelemetry::propagation::TextMapCompositePropagator;
-use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
+use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
 use opentelemetry_otlp::{Compression, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::{
-    propagation::{BaggagePropagator, TraceContextPropagator},
     Resource,
+    propagation::{BaggagePropagator, TraceContextPropagator},
     trace::{SdkTracerProvider, Tracer},
 };
 use std::{collections::HashMap, env::var, time::Duration};
@@ -14,8 +14,8 @@ use tonic::{
     metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue},
     transport::ClientTlsConfig,
 };
-use tracing::{debug, Level};
-use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter, Registry};
+use tracing::{Level, debug};
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 use ulid::Ulid;
 
 /// Global tracer provider (initialized once)
