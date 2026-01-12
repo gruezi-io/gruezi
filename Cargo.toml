@@ -52,7 +52,7 @@ tokio = { version = "1.48.0", features = ["full"] }
 tonic = { version = "0.14.2", features = ["tls-native-roots"] }
 tracing = "0.1"
 tracing-futures = "0.2.5"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 ulid = "1.2.1"
 
