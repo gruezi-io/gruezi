@@ -9,6 +9,8 @@ subnet := "172.31.21.0/24"
 image := "localhost/gruezi:test"
 node_a := "gruezi-ha-a"
 node_b := "gruezi-ha-b"
+api_a := "19376"
+api_b := "29376"
 
 default: test
   @just --list
@@ -27,23 +29,34 @@ stop-ha:
   done
 
 test-ha: setup-network build-image stop-ha
-  podman run -d --name {{node_a}} \
+  podman run --replace -d --name {{node_a}} \
+    --cap-add NET_ADMIN \
     --network {{net}} --ip 172.31.21.11 \
+    -p {{api_a}}:9376 \
     -v {{root}}/examples/ha-node-a.yaml:/etc/gruezi/gruezi.yaml:ro \
     {{image}} start --config /etc/gruezi/gruezi.yaml
-  podman run -d --name {{node_b}} \
+  podman run --replace -d --name {{node_b}} \
+    --cap-add NET_ADMIN \
     --network {{net}} --ip 172.31.21.12 \
+    -p {{api_b}}:9376 \
     -v {{root}}/examples/ha-node-b.yaml:/etc/gruezi/gruezi.yaml:ro \
     {{image}} start --config /etc/gruezi/gruezi.yaml
-  @echo "HA smoke test containers created. Use 'just logs-ha' to inspect startup output."
+  @echo "HA containers created."
+  @echo "Query node A: cargo run -- status --node 127.0.0.1:{{api_a}}"
+  @echo "Query node B: cargo run -- status --node 127.0.0.1:{{api_b}}"
   podman ps -a --filter name={{node_a}} --filter name={{node_b}}
 
 logs-ha:
   podman logs {{node_a}}
   podman logs {{node_b}}
 
+status-ha:
+  cargo run -- status --node 127.0.0.1:{{api_a}}
+  cargo run -- status --node 127.0.0.1:{{api_b}}
+
 # Test suite
 test: clippy fmt
+  cargo test
 
 # Linting
 clippy:

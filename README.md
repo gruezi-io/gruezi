@@ -6,12 +6,14 @@ Service Discovery & Distributed Key-Value Store
 
 ### HA
 
-- [ ] HA mode over unicast UDP at L4
-- [ ] IPv6 support
-- [ ] CLI for peer management and status
+- [x] HA mode over unicast UDP at L4
+- [x] IPv6-first API listener with IPv4 fallback
+- [x] CLI for peer management and status
 - [ ] DNS-based service discovery
-- [ ] HA packet format and authentication
-- [ ] HA state machine (`INIT`, `BACKUP`, `MASTER`)
+- [x] HA packet format and authentication
+- [x] HA state machine (`INIT`, `BACKUP`, `MASTER`)
+- [x] HA management API on `9376/tcp`
+- [x] HA transition hooks (`on_promote`, `on_demote`, `on_backup`)
 - [ ] Split-brain prevention and conservative failover rules
 - [ ] Performance tuning for heartbeat, timers, and failover latency
 
@@ -106,8 +108,6 @@ ha:
   jitter_ms: 100
   auth:
     mode: none
-
-kv: {}
 ```
 
 ```yaml
@@ -122,8 +122,6 @@ kv:
     - node-a=http://10.0.0.1:2380
     - node-b=http://10.0.0.2:2380
     - witness=http://10.0.0.3:2380
-
-ha: {}
 ```
 
 This keeps the external configuration explicit and simple while leaving room for richer internal validation and future expansion.
@@ -141,6 +139,13 @@ This means:
 * leader election and liveness detection happen over UDP
 * the state machine should remain close to active/backup failover behavior
 * priority, advertisement interval, preemption, and authentication should be first-class concepts
+
+Operational scope for HA mode:
+
+* `mode: ha` is an internal infrastructure component, similar in intent to keepalived
+* HA advertisements on `9375/udp` are expected to stay on a trusted private network
+* the HA peer channel should not be exposed to the public Internet
+* firewall rules should restrict HA traffic to the expected peer nodes
 
 This is intentionally **VRRP/CARP-like**, not wire-compatible VRRP or CARP. The project should not claim protocol compatibility unless it implements the actual protocol semantics and packet format.
 
@@ -184,8 +189,8 @@ Operationally, `mode: kv` requires at least 3 quorum participants, or 2 nodes pl
 That means:
 
 * in `mode: kv`, it is the client-facing API port
-* in `mode: ha`, it is the management/status port if a remote API is enabled
-* CLI commands such as `gruezi status` or future management commands should be able to target this API instead of talking directly to the HA or Raft peer ports
+* in `mode: ha`, it is the live management/status port
+* CLI commands such as `gruezi status` already target this API instead of talking directly to the HA or Raft peer ports
 
 The port split should remain:
 
@@ -378,6 +383,86 @@ ha:
     mode: shared_key
     key: change-me
 ```
+
+Meaning of the HA fields:
+
+* `group_id`: logical HA domain. Only nodes in the same group should accept each other's advertisements.
+* `auth.mode: none`: disable packet authentication. This is only suitable for local development or isolated lab testing.
+* `auth.mode: shared_key`: every HA packet carries an authentication tag derived from a shared secret and the packet contents.
+* `auth.key`: the shared secret used by all nodes in the same HA group. It should be treated like any other cluster secret and distributed securely.
+
+`shared_key` in HA mode is not transport encryption. It exists to answer a narrower question:
+
+* is this UDP advertisement from a node that knows the group secret?
+* was the packet likely modified in transit?
+
+This is a better fit for HA v1 because the HA control plane is unicast UDP. `mTLS` is a strong option for TCP-based APIs and Raft peer links, but it does not apply directly to raw UDP advertisements. The comparable UDP-level option would be `DTLS` or a more advanced per-packet cryptographic scheme, which adds more complexity than is needed for the initial HA protocol.
+
+Recommended direction:
+
+* HA over UDP: start with explicit packet authentication using `shared_key`
+* API and KV peer traffic over TCP: use TLS/mTLS
+* future HA hardening: consider DTLS or stronger keyed message authentication if the simpler HA packet auth is not sufficient
+
+Threat-model note:
+
+* `shared_key` is a practical first step for a private HA network, not a full Internet-facing security model
+* it should be combined with network isolation, peer allow-listing, and standard infrastructure firewalling
+* if HA traffic ever needs to cross less-trusted networks, the design should be revisited with stronger transport or packet-level protections
+
+Operational guidance:
+
+* use `auth.mode: none` only for tests and local experiments
+* use a different `auth.key` per HA group/environment
+* rotate the key carefully, because all HA peers in the same group must agree on it
+* do not treat `shared_key` as a substitute for TLS on the management API
+
+### Current HA API
+
+The current HA management API is read-only and listens on `9376/tcp`.
+
+Available endpoints:
+
+* `GET /status`
+* `GET /ha/status`
+* `GET /healthz`
+
+The current `gruezi status` command queries this API.
+
+### Current HA Hooks
+
+The current HA implementation supports transition hooks in YAML:
+
+```yaml
+ha:
+  hooks:
+    on_promote: /etc/gruezi/hooks/promote.sh
+    on_demote: /etc/gruezi/hooks/demote.sh
+    on_backup: /etc/gruezi/hooks/backup.sh
+    on_fault: /etc/gruezi/hooks/fault.sh
+    timeout_ms: 5000
+```
+
+Implemented today:
+
+* `on_promote`
+* `on_demote`
+* `on_backup`
+
+Planned next:
+
+* wire `on_fault` to explicit HA failure paths
+
+Hook scripts currently receive runtime context through environment variables:
+
+* `GRUEZI_EVENT`
+* `GRUEZI_NODE_ID`
+* `GRUEZI_GROUP_ID`
+* `GRUEZI_INTERFACE`
+* `GRUEZI_STATE`
+* `GRUEZI_PREVIOUS_STATE`
+* `GRUEZI_PEER_ID`
+* `GRUEZI_PEER_STATE`
 
 ## DRAFT: API And Service Discovery
 

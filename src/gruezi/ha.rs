@@ -1,20 +1,29 @@
-use crate::config::{Config, HaAuthMode, Mode};
+use crate::{
+    config::{Config, HaAuthMode, Mode},
+    gruezi::{
+        addresses::{AddressAction, AddressManager, spawn_address_action},
+        hooks::{HaHooks, HookContext, HookEvent, spawn_hook},
+    },
+};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     cmp::Ordering,
     collections::hash_map::DefaultHasher,
+    future::Future,
     hash::{Hash, Hasher},
     time::{Duration, Instant},
 };
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 const PACKET_MAGIC: &[u8; 4] = b"GRHZ";
 const MAX_ID_LEN: usize = 64;
 const MAX_AUTH_TAG_LEN: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HaState {
     Init,
     Backup,
@@ -67,6 +76,10 @@ pub struct HaRuntimeConfig {
     pub hold_down_ms: u64,
     pub jitter_ms: u64,
     pub auth: HaAuth,
+    pub hooks: HaHooks,
+    pub ip_command: String,
+    pub arping_command: String,
+    pub ndsend_command: String,
 }
 
 impl HaRuntimeConfig {
@@ -168,6 +181,16 @@ impl TryFrom<&Config> for HaRuntimeConfig {
             hold_down_ms: config.ha.hold_down_ms,
             jitter_ms: config.ha.jitter_ms,
             auth,
+            hooks: HaHooks {
+                on_promote: config.ha.hooks.on_promote.clone(),
+                on_demote: config.ha.hooks.on_demote.clone(),
+                on_backup: config.ha.hooks.on_backup.clone(),
+                on_fault: config.ha.hooks.on_fault.clone(),
+                timeout_ms: config.ha.hooks.timeout_ms,
+            },
+            ip_command: "ip".to_owned(),
+            arping_command: "arping".to_owned(),
+            ndsend_command: "ndsend".to_owned(),
         })
     }
 }
@@ -191,6 +214,77 @@ struct PeerObservation {
     state: HaState,
     priority: u8,
     observed_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HaStatus {
+    pub node_id: String,
+    pub group_id: String,
+    pub bind: String,
+    pub peer: String,
+    pub state: HaState,
+    pub priority: u8,
+    pub advert_interval_ms: u64,
+    pub dead_timeout_ms: u64,
+    pub hold_down_ms: u64,
+    pub sequence: u64,
+    pub peer_node_id: Option<String>,
+    pub peer_state: Option<HaState>,
+    pub peer_alive: bool,
+    pub last_peer_seen_ms_ago: Option<u64>,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub invalid_packets: u64,
+    pub auth_failures: u64,
+}
+
+impl HaStatus {
+    #[must_use]
+    pub fn new(
+        node_id: impl Into<String>,
+        group_id: impl Into<String>,
+        bind: impl Into<String>,
+        peer: impl Into<String>,
+    ) -> Self {
+        Self {
+            node_id: node_id.into(),
+            group_id: group_id.into(),
+            bind: bind.into(),
+            peer: peer.into(),
+            state: HaState::Init,
+            priority: 0,
+            advert_interval_ms: 0,
+            dead_timeout_ms: 0,
+            hold_down_ms: 0,
+            sequence: 0,
+            peer_node_id: None,
+            peer_state: None,
+            peer_alive: false,
+            last_peer_seen_ms_ago: None,
+            packets_sent: 0,
+            packets_received: 0,
+            invalid_packets: 0,
+            auth_failures: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HaCounters {
+    packets_sent: u64,
+    packets_received: u64,
+    invalid_packets: u64,
+    auth_failures: u64,
+}
+
+#[derive(Debug)]
+struct HaLoopState {
+    startup_at: Instant,
+    sequence: u64,
+    state: HaState,
+    peer_observation: Option<PeerObservation>,
+    counters: HaCounters,
+    next_advert_at: tokio::time::Instant,
 }
 
 impl HaPacket {
@@ -318,17 +412,95 @@ fn validate_packet_field(value: &str, field_name: &str, max_len: usize) -> Resul
 ///
 /// Returns an error if the socket cannot be bound or packet I/O fails.
 pub async fn run(runtime: HaRuntimeConfig) -> Result<()> {
+    run_with_status(runtime, None, tokio::signal::ctrl_c()).await
+}
+
+/// Run the HA control loop until the provided shutdown future resolves.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be bound or packet I/O fails.
+pub async fn run_until<F, T>(runtime: HaRuntimeConfig, shutdown: F) -> Result<()>
+where
+    F: Future<Output = T>,
+{
+    run_with_status(runtime, None, shutdown).await
+}
+
+/// Run the HA control loop and publish snapshots to a watch channel.
+///
+/// This is primarily intended for integration tests and future API/status hooks.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be bound or packet I/O fails.
+pub async fn run_with_status<F, T>(
+    runtime: HaRuntimeConfig,
+    status_tx: Option<watch::Sender<HaStatus>>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = T>,
+{
     let (socket, local_bind) = bind_ha_socket(&runtime.bind)?;
     let peer_addr = runtime
         .peer
         .parse::<std::net::SocketAddr>()
         .with_context(|| format!("invalid HA peer address {}", runtime.peer))?;
-    let startup_at = Instant::now();
     let mut buffer = [0_u8; 1_024];
-    let mut sequence = 0_u64;
-    let mut state = HaState::Init;
-    let mut peer_observation: Option<PeerObservation> = None;
+    let mut loop_state = initialize_loop_state(&runtime, status_tx.as_ref());
+    tokio::pin!(shutdown);
 
+    log_runtime_start(&runtime, &local_bind, peer_addr);
+
+    loop {
+        refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state);
+        let sleep = tokio::time::sleep_until(loop_state.next_advert_at);
+        tokio::pin!(sleep);
+
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
+                break;
+            }
+            recv = socket.recv_from(&mut buffer) => {
+                handle_receive_event(&runtime, status_tx.as_ref(), &mut loop_state, recv, &buffer)?;
+            }
+            () = &mut sleep => {
+                handle_send_event(
+                    &socket,
+                    &runtime,
+                    peer_addr,
+                    status_tx.as_ref(),
+                    &mut loop_state,
+                ).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn initialize_loop_state(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+) -> HaLoopState {
+    let startup_at = Instant::now();
+    let loop_state = HaLoopState {
+        startup_at,
+        sequence: 0,
+        state: HaState::Init,
+        peer_observation: None,
+        counters: HaCounters::default(),
+        next_advert_at: tokio::time::Instant::now() + runtime.next_advert_delay(1),
+    };
+
+    publish_loop_status(runtime, status_tx, &loop_state, startup_at);
+
+    loop_state
+}
+
+fn log_runtime_start(runtime: &HaRuntimeConfig, local_bind: &str, peer_addr: std::net::SocketAddr) {
     info!(
         node_id = %runtime.node_id,
         bind = %local_bind,
@@ -336,63 +508,147 @@ pub async fn run(runtime: HaRuntimeConfig) -> Result<()> {
         group_id = %runtime.group_id,
         "HA runtime loop started"
     );
+}
 
-    loop {
-        let desired_state = desired_state(
-            &runtime,
-            peer_observation.as_ref(),
-            startup_at,
-            Instant::now(),
-        );
-        log_state_change(state, desired_state, &runtime.node_id);
-        state = desired_state;
+fn refresh_local_state(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+) {
+    let now = Instant::now();
+    let desired_state = desired_state(
+        runtime,
+        loop_state.state,
+        loop_state.peer_observation.as_ref(),
+        loop_state.startup_at,
+        now,
+    );
+    trigger_state_hooks(
+        runtime,
+        loop_state.state,
+        desired_state,
+        loop_state.peer_observation.as_ref(),
+    );
+    log_state_change(loop_state.state, desired_state, &runtime.node_id);
+    loop_state.state = desired_state;
+    publish_loop_status(runtime, status_tx, loop_state, now);
+}
 
-        let sleep = tokio::time::sleep(runtime.next_advert_delay(sequence + 1));
-        tokio::pin!(sleep);
+fn publish_loop_status(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &HaLoopState,
+    now: Instant,
+) {
+    publish_current_status(
+        runtime,
+        status_tx,
+        loop_state.state,
+        loop_state.sequence,
+        loop_state.peer_observation.as_ref(),
+        loop_state.counters,
+        now,
+    );
+}
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
-                break;
-            }
-            recv = socket.recv_from(&mut buffer) => {
-                let (len, from) = recv.context("failed to receive HA packet")?;
-                let now = Instant::now();
-                let payload = buffer
-                    .get(..len)
-                    .ok_or_else(|| anyhow!("received invalid HA payload length"))?;
+fn handle_receive_event(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    recv: std::io::Result<(usize, std::net::SocketAddr)>,
+    buffer: &[u8; 1_024],
+) -> Result<()> {
+    let (len, from) = recv.context("failed to receive HA packet")?;
+    let observed_at = Instant::now();
+    let payload = buffer
+        .get(..len)
+        .ok_or_else(|| anyhow!("received invalid HA payload length"))?;
 
-                if let Err(error) = handle_incoming_packet(
-                    &runtime,
-                    payload,
-                    from,
-                    now,
-                    &mut peer_observation,
-                ) {
-                    warn!(%error, from = %from, "ignoring invalid HA packet");
-                }
-            }
-            () = &mut sleep => {
-                sequence = sequence.saturating_add(1);
-                let packet = build_packet(&runtime, state, sequence)?;
-                let encoded = packet.encode()?;
-                socket
-                    .send_to(&encoded, peer_addr)
-                    .await
-                    .with_context(|| format!("failed to send HA packet to {peer_addr}"))?;
-
-                debug!(
-                    node_id = %runtime.node_id,
-                    state = ?state,
-                    sequence,
-                    peer = %peer_addr,
-                    "sent HA advertisement"
-                );
-            }
+    if let Err(error) = handle_incoming_packet(
+        runtime,
+        payload,
+        from,
+        observed_at,
+        &mut loop_state.peer_observation,
+    ) {
+        loop_state.counters.invalid_packets = loop_state.counters.invalid_packets.saturating_add(1);
+        if is_auth_failure(&error) {
+            loop_state.counters.auth_failures = loop_state.counters.auth_failures.saturating_add(1);
         }
+        warn!(%error, from = %from, "ignoring invalid HA packet");
+        return Ok(());
     }
 
+    loop_state.counters.packets_received = loop_state.counters.packets_received.saturating_add(1);
+    publish_loop_status(runtime, status_tx, loop_state, observed_at);
     Ok(())
+}
+
+async fn handle_send_event(
+    socket: &UdpSocket,
+    runtime: &HaRuntimeConfig,
+    peer_addr: std::net::SocketAddr,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+) -> Result<()> {
+    loop_state.sequence = send_advertisement(
+        socket,
+        runtime,
+        peer_addr,
+        loop_state.state,
+        loop_state.sequence,
+    )
+    .await?;
+    loop_state.counters.packets_sent = loop_state.counters.packets_sent.saturating_add(1);
+    loop_state.next_advert_at =
+        tokio::time::Instant::now() + runtime.next_advert_delay(loop_state.sequence + 1);
+    publish_loop_status(runtime, status_tx, loop_state, Instant::now());
+    Ok(())
+}
+
+fn trigger_state_hooks(
+    runtime: &HaRuntimeConfig,
+    previous_state: HaState,
+    current_state: HaState,
+    peer_observation: Option<&PeerObservation>,
+) {
+    if previous_state == current_state {
+        return;
+    }
+
+    let context = HookContext {
+        node_id: runtime.node_id.clone(),
+        group_id: runtime.group_id.clone(),
+        interface: runtime.interface.clone(),
+        state: current_state,
+        previous_state,
+        peer_id: peer_observation.map(|peer| peer.node_id.clone()),
+        peer_state: peer_observation.map(|peer| peer.state),
+    };
+    let address_manager = AddressManager {
+        ip_command: runtime.ip_command.clone(),
+        arping_command: runtime.arping_command.clone(),
+        ndsend_command: runtime.ndsend_command.clone(),
+        interface: runtime.interface.clone(),
+        addresses: runtime.addresses.clone(),
+    };
+
+    match current_state {
+        HaState::Master => {
+            spawn_address_action(address_manager, AddressAction::Add);
+            spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
+        }
+        HaState::Backup => {
+            spawn_address_action(address_manager, AddressAction::Remove);
+            let event = if previous_state == HaState::Master {
+                HookEvent::Demote
+            } else {
+                HookEvent::Backup
+            };
+            spawn_hook(runtime.hooks.clone(), event, context);
+        }
+        HaState::Init => {}
+    }
 }
 
 fn handle_incoming_packet(
@@ -445,9 +701,7 @@ fn handle_incoming_packet(
 fn build_packet(runtime: &HaRuntimeConfig, state: HaState, sequence: u64) -> Result<HaPacket> {
     let advert_interval_ms = u32::try_from(runtime.advert_interval_ms)
         .map_err(|_| anyhow!("HA advert interval exceeds u32"))?;
-    let auth_tag = auth_tag(runtime, state, sequence, advert_interval_ms);
-
-    Ok(HaPacket {
+    let mut packet = HaPacket {
         protocol_version: runtime.protocol_version,
         state,
         priority: runtime.priority,
@@ -456,12 +710,57 @@ fn build_packet(runtime: &HaRuntimeConfig, state: HaState, sequence: u64) -> Res
         sequence,
         node_id: runtime.node_id.clone(),
         group_id: runtime.group_id.clone(),
-        auth_tag,
-    })
+        auth_tag: Vec::new(),
+    };
+    packet.auth_tag = auth_tag(&runtime.auth, &packet);
+
+    Ok(packet)
+}
+
+fn publish_current_status(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    state: HaState,
+    sequence: u64,
+    peer_observation: Option<&PeerObservation>,
+    counters: HaCounters,
+    now: Instant,
+) {
+    publish_status(
+        status_tx,
+        status_snapshot(runtime, state, sequence, peer_observation, counters, now),
+    );
+}
+
+async fn send_advertisement(
+    socket: &UdpSocket,
+    runtime: &HaRuntimeConfig,
+    peer_addr: std::net::SocketAddr,
+    state: HaState,
+    sequence: u64,
+) -> Result<u64> {
+    let next_sequence = sequence.saturating_add(1);
+    let packet = build_packet(runtime, state, next_sequence)?;
+    let encoded = packet.encode()?;
+    socket
+        .send_to(&encoded, peer_addr)
+        .await
+        .with_context(|| format!("failed to send HA packet to {peer_addr}"))?;
+
+    debug!(
+        node_id = %runtime.node_id,
+        state = ?state,
+        sequence = next_sequence,
+        peer = %peer_addr,
+        "sent HA advertisement"
+    );
+
+    Ok(next_sequence)
 }
 
 fn desired_state(
     runtime: &HaRuntimeConfig,
+    current_state: HaState,
     peer_observation: Option<&PeerObservation>,
     startup_at: Instant,
     now: Instant,
@@ -471,7 +770,7 @@ fn desired_state(
     let Some(peer) =
         peer_observation.filter(|peer| runtime.follower_deadline(peer.observed_at) > now)
     else {
-        return if now >= startup_deadline {
+        return if current_state == HaState::Master || now >= startup_deadline {
             HaState::Master
         } else {
             HaState::Backup
@@ -494,17 +793,60 @@ fn desired_state(
             }
         }
         HaState::Init | HaState::Backup => {
-            if outranks(
-                runtime.priority,
-                &runtime.node_id,
-                peer.priority,
-                &peer.node_id,
-            ) {
+            if current_state == HaState::Master
+                || outranks(
+                    runtime.priority,
+                    &runtime.node_id,
+                    peer.priority,
+                    &peer.node_id,
+                )
+            {
                 HaState::Master
             } else {
                 HaState::Backup
             }
         }
+    }
+}
+
+fn status_snapshot(
+    runtime: &HaRuntimeConfig,
+    state: HaState,
+    sequence: u64,
+    peer_observation: Option<&PeerObservation>,
+    counters: HaCounters,
+    now: Instant,
+) -> HaStatus {
+    let live_peer =
+        peer_observation.filter(|peer| runtime.follower_deadline(peer.observed_at) > now);
+    let last_peer_seen_ms_ago =
+        peer_observation.map(|peer| saturating_elapsed_ms(now, peer.observed_at));
+
+    HaStatus {
+        node_id: runtime.node_id.clone(),
+        group_id: runtime.group_id.clone(),
+        bind: runtime.bind.clone(),
+        peer: runtime.peer.clone(),
+        state,
+        priority: runtime.priority,
+        advert_interval_ms: runtime.advert_interval_ms,
+        dead_timeout_ms: duration_millis_u64(runtime.dead_timeout()),
+        hold_down_ms: runtime.hold_down_ms,
+        sequence,
+        peer_node_id: peer_observation.map(|peer| peer.node_id.clone()),
+        peer_state: peer_observation.map(|peer| peer.state),
+        peer_alive: live_peer.is_some(),
+        last_peer_seen_ms_ago,
+        packets_sent: counters.packets_sent,
+        packets_received: counters.packets_received,
+        invalid_packets: counters.invalid_packets,
+        auth_failures: counters.auth_failures,
+    }
+}
+
+fn publish_status(status_tx: Option<&watch::Sender<HaStatus>>, snapshot: HaStatus) {
+    if let Some(status_tx) = status_tx {
+        status_tx.send_replace(snapshot);
     }
 }
 
@@ -521,36 +863,38 @@ fn outranks(
     }
 }
 
-fn auth_tag(
-    runtime: &HaRuntimeConfig,
-    state: HaState,
-    sequence: u64,
-    advert_interval_ms: u32,
-) -> Vec<u8> {
-    match &runtime.auth {
+fn auth_tag(auth: &HaAuth, packet: &HaPacket) -> Vec<u8> {
+    match auth {
         HaAuth::None => Vec::new(),
         HaAuth::SharedKey { key } => {
             let mut hasher = DefaultHasher::new();
             key.hash(&mut hasher);
-            runtime.group_id.hash(&mut hasher);
-            runtime.node_id.hash(&mut hasher);
-            runtime.priority.hash(&mut hasher);
-            runtime.dead_factor.hash(&mut hasher);
-            advert_interval_ms.hash(&mut hasher);
-            state.as_u8().hash(&mut hasher);
-            sequence.hash(&mut hasher);
+            packet.group_id.hash(&mut hasher);
+            packet.node_id.hash(&mut hasher);
+            packet.priority.hash(&mut hasher);
+            packet.dead_factor.hash(&mut hasher);
+            packet.advert_interval_ms.hash(&mut hasher);
+            packet.state.as_u8().hash(&mut hasher);
+            packet.sequence.hash(&mut hasher);
             hasher.finish().to_be_bytes().to_vec()
         }
     }
 }
 
 fn verify_auth_tag(runtime: &HaRuntimeConfig, packet: &HaPacket) -> bool {
-    auth_tag(
-        runtime,
-        packet.state,
-        packet.sequence,
-        packet.advert_interval_ms,
-    ) == packet.auth_tag
+    auth_tag(&runtime.auth, packet) == packet.auth_tag
+}
+
+fn is_auth_failure(error: &anyhow::Error) -> bool {
+    error.to_string().contains("authentication failed")
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn saturating_elapsed_ms(now: Instant, observed_at: Instant) -> u64 {
+    duration_millis_u64(now.saturating_duration_since(observed_at))
 }
 
 fn log_state_change(previous: HaState, current: HaState, node_id: &str) {
@@ -683,7 +1027,10 @@ impl<'a> PacketCursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HaAuth, HaPacket, HaRuntimeConfig, HaState, PeerObservation, desired_state};
+    use super::{
+        HaAuth, HaPacket, HaRuntimeConfig, HaState, PeerObservation, build_packet, desired_state,
+        handle_incoming_packet, verify_auth_tag,
+    };
     use crate::config::Config;
     use anyhow::Result;
     use std::time::{Duration, Instant};
@@ -821,7 +1168,13 @@ ha:
         };
 
         assert_eq!(
-            desired_state(&runtime, Some(&peer), Instant::now(), Instant::now()),
+            desired_state(
+                &runtime,
+                HaState::Backup,
+                Some(&peer),
+                Instant::now(),
+                Instant::now(),
+            ),
             HaState::Master
         );
 
@@ -861,9 +1214,183 @@ ha:
         };
 
         assert_eq!(
-            desired_state(&runtime, Some(&peer), Instant::now(), Instant::now()),
+            desired_state(
+                &runtime,
+                HaState::Backup,
+                Some(&peer),
+                Instant::now(),
+                Instant::now(),
+            ),
             HaState::Backup
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn startup_is_conservative_before_deadline() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 100
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let startup_at = Instant::now();
+
+        assert_eq!(
+            desired_state(
+                &runtime,
+                HaState::Init,
+                None,
+                startup_at,
+                startup_at + Duration::from_millis(500),
+            ),
+            HaState::Backup
+        );
+        assert_eq!(
+            desired_state(
+                &runtime,
+                HaState::Init,
+                None,
+                startup_at,
+                startup_at + runtime.dead_timeout() + runtime.hold_down(),
+            ),
+            HaState::Master
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn preempt_false_keeps_higher_priority_peer_in_backup() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 110
+  preempt: false
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let peer = PeerObservation {
+            node_id: "node-b".to_owned(),
+            state: HaState::Master,
+            priority: 100,
+            observed_at: Instant::now(),
+        };
+
+        assert_eq!(
+            desired_state(
+                &runtime,
+                HaState::Backup,
+                Some(&peer),
+                Instant::now(),
+                Instant::now(),
+            ),
+            HaState::Backup
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_truncated_packet() -> Result<()> {
+        let packet = HaPacket {
+            protocol_version: 1,
+            state: HaState::Backup,
+            priority: 100,
+            dead_factor: 3,
+            advert_interval_ms: 1_000,
+            sequence: 1,
+            node_id: "node-a".to_owned(),
+            group_id: "cluster-ha".to_owned(),
+            auth_tag: vec![],
+        };
+        let encoded = packet.encode()?;
+
+        let truncated = encoded
+            .get(..8)
+            .ok_or_else(|| anyhow::anyhow!("encoded packet shorter than expected"))?;
+        assert!(HaPacket::decode(truncated).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_packet_with_invalid_auth_tag() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 127.0.0.1:9375
+  protocol_version: 1
+  priority: 100
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: shared_key
+    key: shared-secret
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let mut packet = build_packet(&runtime, HaState::Master, 7)?;
+        packet.node_id = "peer-a".to_owned();
+        packet.auth_tag = vec![0, 1, 2, 3];
+
+        assert!(!verify_auth_tag(&runtime, &packet));
+
+        let mut peer_observation = None;
+        let result = handle_incoming_packet(
+            &runtime,
+            &packet.encode()?,
+            "127.0.0.1:9375".parse()?,
+            Instant::now(),
+            &mut peer_observation,
+        );
+
+        assert!(result.is_err());
+        assert!(peer_observation.is_none());
 
         Ok(())
     }

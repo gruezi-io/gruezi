@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::{fs, path::Path};
 
 pub const DEFAULT_HA_BIND: &str = "0.0.0.0:9375";
+pub const DEFAULT_API_PORT: u16 = 9376;
 pub const DEFAULT_KV_CLIENT_LISTEN: &str = "0.0.0.0:9376";
 pub const DEFAULT_KV_PEER_LISTEN: &str = "0.0.0.0:9377";
 
@@ -126,6 +127,15 @@ impl Config {
             bail!("mode 'ha' requires ha.jitter_ms to be smaller than ha.advert_interval_ms");
         }
 
+        if self.ha.hooks.timeout_ms == 0 {
+            bail!("mode 'ha' requires ha.hooks.timeout_ms to be greater than 0");
+        }
+
+        validate_hook_path(self.ha.hooks.on_promote.as_deref(), "ha.hooks.on_promote")?;
+        validate_hook_path(self.ha.hooks.on_demote.as_deref(), "ha.hooks.on_demote")?;
+        validate_hook_path(self.ha.hooks.on_backup.as_deref(), "ha.hooks.on_backup")?;
+        validate_hook_path(self.ha.hooks.on_fault.as_deref(), "ha.hooks.on_fault")?;
+
         match self.ha.auth.mode {
             HaAuthMode::None => {
                 if self.ha.auth.key.is_some() {
@@ -172,6 +182,14 @@ impl Config {
     }
 }
 
+fn validate_hook_path(path: Option<&str>, field_name: &str) -> Result<()> {
+    if path.is_some_and(|path| path.trim().is_empty()) {
+        bail!("mode 'ha' does not allow an empty value for {field_name}");
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
@@ -195,6 +213,7 @@ pub struct HaConfig {
     pub hold_down_ms: u64,
     pub jitter_ms: u64,
     pub auth: HaAuthConfig,
+    pub hooks: HaHooksConfig,
 }
 
 impl Default for HaConfig {
@@ -213,6 +232,7 @@ impl Default for HaConfig {
             hold_down_ms: 3_000,
             jitter_ms: 100,
             auth: HaAuthConfig::default(),
+            hooks: HaHooksConfig::default(),
         }
     }
 }
@@ -236,6 +256,35 @@ impl Default for HaAuthConfig {
         Self {
             mode: HaAuthMode::None,
             key: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HaHooksConfig {
+    pub on_promote: Option<String>,
+    pub on_demote: Option<String>,
+    pub on_backup: Option<String>,
+    pub on_fault: Option<String>,
+    pub timeout_ms: u64,
+}
+
+impl HaHooksConfig {
+    #[must_use]
+    pub fn default_timeout_ms() -> u64 {
+        5_000
+    }
+}
+
+impl Default for HaHooksConfig {
+    fn default() -> Self {
+        Self {
+            on_promote: None,
+            on_demote: None,
+            on_backup: None,
+            on_fault: None,
+            timeout_ms: Self::default_timeout_ms(),
         }
     }
 }

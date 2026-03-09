@@ -21,5 +21,3 @@ ha:
   auth:
     mode: shared_key
     key: change-me
-
-kv: {}
