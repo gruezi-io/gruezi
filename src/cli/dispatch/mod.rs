@@ -1,4 +1,5 @@
 use crate::cli::actions::Action;
+use crate::config::DEFAULT_HA_BIND;
 use anyhow::Result;
 use clap::ArgMatches;
 
@@ -14,15 +15,18 @@ pub fn handler(matches: &ArgMatches) -> Result<Action> {
     // Route to the appropriate action based on subcommand
     match matches.subcommand() {
         Some(("start", sub_matches)) => {
+            let config = sub_matches.get_one::<String>("config").cloned();
+
             let bind = sub_matches
                 .get_one::<String>("bind")
-                .map_or_else(|| "0.0.0.0:8080".to_owned(), String::from);
+                .map_or_else(|| DEFAULT_HA_BIND.to_owned(), String::from);
 
             let peers = sub_matches.get_one::<String>("peers").cloned();
 
             let node_id = sub_matches.get_one::<String>("node-id").cloned();
 
             Ok(Action::Start {
+                config,
                 bind,
                 peers,
                 node_id,

@@ -1,0 +1,16 @@
+mode: kv
+
+node:
+  id: node-a
+
+ha: {}
+
+kv:
+  role: voter
+  listen_client: 0.0.0.0:9376
+  listen_peer: 0.0.0.0:9377
+  data_dir: /var/lib/gruezi
+  initial_cluster:
+    - node-a=http://10.0.0.1:9377
+    - node-b=http://10.0.0.2:9377
+    - witness=http://10.0.0.3:9377

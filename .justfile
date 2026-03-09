@@ -1,9 +1,46 @@
+set shell := ["zsh", "-uc"]
+
 # Get the current user's UID and GID
 uid := `id -u`
 gid := `id -g`
+root := justfile_directory()
+net := "gruezi-net"
+subnet := "172.31.21.0/24"
+image := "localhost/gruezi:test"
+node_a := "gruezi-ha-a"
+node_b := "gruezi-ha-b"
 
 default: test
   @just --list
+
+setup-network:
+  podman network inspect {{net}} >/dev/null 2>&1 || podman network create --subnet {{subnet}} {{net}}
+
+build-image:
+  cargo build
+  podman build -t {{image}} -f {{root}}/Containerfile {{root}}
+
+stop-ha:
+  @for c in {{node_a}} {{node_b}}; do \
+        podman stop $$c 2>/dev/null || true; \
+        podman rm $$c 2>/dev/null || true; \
+  done
+
+test-ha: setup-network build-image stop-ha
+  podman run -d --name {{node_a}} \
+    --network {{net}} --ip 172.31.21.11 \
+    -v {{root}}/examples/ha-node-a.yaml:/etc/gruezi/gruezi.yaml:ro \
+    {{image}} start --config /etc/gruezi/gruezi.yaml
+  podman run -d --name {{node_b}} \
+    --network {{net}} --ip 172.31.21.12 \
+    -v {{root}}/examples/ha-node-b.yaml:/etc/gruezi/gruezi.yaml:ro \
+    {{image}} start --config /etc/gruezi/gruezi.yaml
+  @echo "HA smoke test containers created. Use 'just logs-ha' to inspect startup output."
+  podman ps -a --filter name={{node_a}} --filter name={{node_b}}
+
+logs-ha:
+  podman logs {{node_a}}
+  podman logs {{node_b}}
 
 # Test suite
 test: clippy fmt

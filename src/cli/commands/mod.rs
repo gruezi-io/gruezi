@@ -1,3 +1,4 @@
+use crate::config::DEFAULT_HA_BIND;
 use clap::{
     Arg, ArgAction, Command,
     builder::styling::{AnsiColor, Effects, Styles},
@@ -27,15 +28,21 @@ pub fn new() -> Command {
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .long_about(
-            "Gruezi provides distributed service discovery with RAFT consensus,\n\
-             a key-value store backed by RocksDB, and DNS-based service discovery.",
+            "Gruezi provides two operational modes:\n\
+             \n\
+             - `ha`: 2-node high availability using a UDP-based failover protocol on port 9375\n\
+             - `kv`: 3+ node consensus-backed key-value service with API traffic on port 9376 and peer traffic on port 9377\n\
+             \n\
+             Configuration is loaded from `--config`, then `GRUEZI_CONFIG`, then `/etc/gruezi/gruezi.yaml` if present.\n\
+             \n\
+             The CLI is intended to expose both local control and remote management workflows over time.",
         )
         .styles(styles)
         .arg(
             Arg::new("verbose")
                 .short('v')
                 .long("verbose")
-                .help("Show verbose output with cron expression")
+                .help("Enable verbose CLI output")
                 .long_help(
                     "Enable verbose logging for debugging purposes.\n\n\
                      Can be specified multiple times to increase verbosity:\n  \
@@ -46,54 +53,117 @@ pub fn new() -> Command {
                 )
                 .action(ArgAction::Count),
         )
-        .subcommand(
-            Command::new("start")
-                .about("Start the gruezi service")
-                .arg(
-                    Arg::new("bind")
-                        .short('b')
-                        .long("bind")
-                        .help("Address to bind to")
-                        .value_name("ADDRESS")
-                        .default_value("0.0.0.0:8080"),
-                )
-                .arg(
-                    Arg::new("peers")
-                        .short('p')
-                        .long("peers")
-                        .help("Comma-separated list of peer addresses")
-                        .value_name("PEERS"),
-                )
-                .arg(
-                    Arg::new("node-id")
-                        .short('n')
-                        .long("node-id")
-                        .help("Unique node identifier")
-                        .value_name("ID"),
-                ),
-        )
-        .subcommand(
-            Command::new("status").about("Show cluster status").arg(
-                Arg::new("node")
-                    .short('n')
-                    .long("node")
-                    .help("Query specific node")
-                    .value_name("ADDRESS"),
-            ),
-        )
-        .subcommand(
-            Command::new("peers").about("List cluster peers").arg(
-                Arg::new("format")
-                    .short('f')
-                    .long("format")
-                    .help("Output format")
-                    .value_name("FORMAT")
-                    .value_parser(["table", "json", "yaml"])
-                    .default_value("table"),
-            ),
-        )
+        .subcommand(start_command())
+        .subcommand(status_command())
+        .subcommand(peers_command())
         .subcommand_required(true)
         .arg_required_else_help(true)
+}
+
+fn start_command() -> Command {
+    Command::new("start")
+        .about("Start the gruezi service")
+        .long_about(
+            "Start `gruezi` using either YAML configuration or the direct HA CLI flags.\n\
+             \n\
+             Preferred path:\n\
+             - use `--config` with a YAML file\n\
+             - or rely on `GRUEZI_CONFIG`\n\
+             - or place the default file at `/etc/gruezi/gruezi.yaml`\n\
+             \n\
+             Direct flags remain available as an incremental HA-only path. In that case,\n\
+             `--bind` defaults to the HA control port on `0.0.0.0:9375`.",
+        )
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .help("Path to a YAML configuration file")
+                .long_help(
+                    "Path to a YAML configuration file.\n\n\
+                     When this is provided, `gruezi` ignores the direct `--bind`, `--peers`, and `--node-id` flags.\n\
+                     The config file can describe either `mode: ha` or `mode: kv`.",
+                )
+                .value_name("FILE")
+                .conflicts_with_all(["bind", "peers", "node-id"]),
+        )
+        .arg(
+            Arg::new("bind")
+                .short('b')
+                .long("bind")
+                .help("Address to bind the HA listener to")
+                .long_help(
+                    "Address to bind the HA listener to when using the direct CLI path.\n\n\
+                     This is primarily for `mode: ha` style startup without a YAML file.\n\
+                     The default is `0.0.0.0:9375`, which is the draft HA peer port.",
+                )
+                .value_name("ADDRESS")
+                .default_value(DEFAULT_HA_BIND),
+        )
+        .arg(
+            Arg::new("peers")
+                .short('p')
+                .long("peers")
+                .help("Comma-separated list of peer addresses")
+                .long_help(
+                    "Comma-separated list of peer addresses for the direct CLI startup path.\n\n\
+                     For HA mode this should identify the remote peer using the HA control port, for example `10.0.0.2:9375`.",
+                )
+                .value_name("PEERS"),
+        )
+        .arg(
+            Arg::new("node-id")
+                .short('n')
+                .long("node-id")
+                .help("Unique node identifier")
+                .long_help(
+                    "Unique node identifier for the local node when using the direct CLI startup path.\n\n\
+                     YAML-based HA configuration requires `node.id` explicitly.",
+                )
+                .value_name("ID"),
+        )
+}
+
+fn status_command() -> Command {
+    Command::new("status")
+        .about("Show cluster status")
+        .long_about(
+            "Show status for the local node or a remote node.\n\n\
+             Over time this command is expected to target the common API and management port on `9376/tcp` rather than the HA or Raft peer ports directly.",
+        )
+        .arg(
+            Arg::new("node")
+                .short('n')
+                .long("node")
+                .help("Query a specific node or API endpoint")
+                .long_help(
+                    "Query a specific node or API endpoint.\n\n\
+                     This should point to the management/API address, not the HA UDP peer port.",
+                )
+                .value_name("ADDRESS"),
+        )
+}
+
+fn peers_command() -> Command {
+    Command::new("peers")
+        .about("List cluster peers")
+        .long_about(
+            "List peers known to the current node.\n\n\
+             This command is intended for both HA and KV workflows and should eventually reflect peer information gathered through the shared management/API layer.",
+        )
+        .arg(
+            Arg::new("format")
+                .short('f')
+                .long("format")
+                .help("Render output as table, json, or yaml")
+                .long_help(
+                    "Render peer output in one of the supported formats.\n\n\
+                     `table` is intended for operators, while `json` and `yaml` are better for automation.",
+                )
+                .value_name("FORMAT")
+                .value_parser(["table", "json", "yaml"])
+                .default_value("table"),
+        )
 }
 
 #[cfg(test)]
@@ -110,6 +180,13 @@ mod tests {
     fn test_start_command() {
         let app = new();
         let matches = app.try_get_matches_from(vec!["gruezi", "start"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_start_command_with_config() {
+        let app = new();
+        let matches = app.try_get_matches_from(vec!["gruezi", "start", "--config", "gruezi.yml"]);
         assert!(matches.is_ok());
     }
 

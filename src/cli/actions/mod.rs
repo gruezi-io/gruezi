@@ -7,6 +7,7 @@ pub mod status;
 pub enum Action {
     /// Start the gruezi service
     Start {
+        config: Option<String>,
         bind: String,
         peers: Option<String>,
         node_id: Option<String>,
