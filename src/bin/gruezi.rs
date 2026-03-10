@@ -31,8 +31,13 @@ async fn execute(action: Action) -> Result<()> {
             )
             .await?;
         }
-        Action::Status { node, verbose } => {
-            gruezi::cli::actions::status::run(node.as_deref(), verbose).await?;
+        Action::Status {
+            node,
+            verbose,
+            watch,
+            interval_ms,
+        } => {
+            gruezi::cli::actions::status::run(node.as_deref(), verbose, watch, interval_ms).await?;
         }
         Action::Peers { format, verbose } => {
             gruezi::cli::actions::peers::run(&format, verbose)?;

@@ -9,11 +9,15 @@ Service Discovery & Distributed Key-Value Store
 - [x] HA mode over unicast UDP at L4
 - [x] IPv6-first API listener with IPv4 fallback
 - [x] CLI for peer management and status
+- [x] Live HA status watch mode and packet troubleshooting workflow
 - [ ] DNS-based service discovery
 - [x] HA packet format and authentication
 - [x] HA state machine (`INIT`, `BACKUP`, `MASTER`)
 - [x] HA management API on `9376/tcp`
 - [x] HA transition hooks (`on_promote`, `on_demote`, `on_backup`)
+- [x] HA fault hook (`on_fault`) for address-action and runtime failure paths
+- [x] Graceful VIP cleanup on shutdown (`SIGINT`, `SIGTERM`)
+- [x] Ansible-based HA lab deployment workflow
 - [ ] Split-brain prevention and conservative failover rules
 - [ ] Performance tuning for heartbeat, timers, and failover latency
 
@@ -51,6 +55,10 @@ Example configs for local testing live in:
 
 * `examples/ha.yaml`
 * `examples/kv.yaml`
+* `ansible-playbook -i ansible/inventory/lab.yml ansible/deploy-ha-lab.yml` after creating local files from `ansible/inventory/lab.yml.example` and `ansible/group_vars/gruezi_ha_lab.yml.example`
+* `ansible/README.md` for the HA lab deployment workflow
+* `contrib/README.md` for package-oriented `.deb` and `.rpm` builds
+* `CONTRIBUTING.md` for the development and pull request workflow
 
 Draft default ports:
 
@@ -132,6 +140,70 @@ This keeps the external configuration explicit and simple while leaving room for
 
 `mode: ha` should use a high-availability protocol over unicast UDP at L4.
 
+Current implementation overview:
+
+```mermaid
+flowchart TD
+    A["Node A<br/>gruezi start --config ..."] --> B["Bind HA socket<br/>9375/udp"]
+    C["Node B<br/>gruezi start --config ..."] --> D["Bind HA socket<br/>9375/udp"]
+
+    B --> E["Periodic HA advertisement<br/>protocol_version, state, priority,<br/>dead_factor, advert_interval, sequence,<br/>node_id, group_id, auth_tag"]
+    D --> F["Periodic HA advertisement<br/>same packet shape"]
+
+    E --> G["Peer receives UDP packet"]
+    F --> H["Peer receives UDP packet"]
+
+    G --> I["Validate packet<br/>version, group_id, auth_tag,<br/>not looped local node"]
+    H --> J["Validate packet<br/>version, group_id, auth_tag,<br/>not looped local node"]
+
+    I --> K["Update peer observation<br/>peer node_id, state, priority,<br/>last seen timestamp"]
+    J --> L["Update peer observation<br/>peer node_id, state, priority,<br/>last seen timestamp"]
+
+    K --> M["Recompute local state<br/>INIT | BACKUP | MASTER"]
+    L --> N["Recompute local state<br/>INIT | BACKUP | MASTER"]
+
+    M --> O{"State changed?"}
+    N --> P{"State changed?"}
+
+    O -- "to MASTER" --> Q["Add VIP addresses to interface<br/>run promote hook"]
+    O -- "to BACKUP" --> R["Remove VIP addresses from interface<br/>run backup/demote hook"]
+    P -- "to MASTER" --> S["Add VIP addresses to interface<br/>run promote hook"]
+    P -- "to BACKUP" --> T["Remove VIP addresses from interface<br/>run backup/demote hook"]
+
+    M --> U["Publish HA status snapshot<br/>9376/tcp API"]
+    N --> V["Publish HA status snapshot<br/>9376/tcp API"]
+```
+
+In practice, each node continuously:
+
+* sends HA advertisements to exactly one configured peer over `9375/udp`
+* tracks the peer's last observed state, priority, and liveness deadline
+* chooses `MASTER` or `BACKUP` based on peer health, priority, node ID tiebreak, and `preempt`
+* adds or removes the configured VIP addresses on state transition
+* exposes the current snapshot through the management API on `9376/tcp`
+
+Current implementation walkthrough:
+
+1. Startup:
+   the node loads the HA runtime config, binds the UDP socket on `ha.bind`, parses the single configured peer, initializes the local state as `INIT`, and publishes an initial status snapshot.
+2. Advertisement loop:
+   each iteration recomputes local state, waits until the next advertisement deadline, then either sends one HA packet to the configured peer or handles one received packet from that peer.
+3. Packet validation:
+   received packets are accepted only when the magic bytes, protocol version, `group_id`, and auth tag match, and when the packet is not looped back from the local node ID.
+4. Peer observation:
+   after a valid packet, the node stores the peer node ID, peer state, peer priority, and the timestamp of when that packet was observed.
+5. State choice:
+   if the peer is considered alive, the node compares peer state, peer priority, local priority, local node ID, and `preempt` to decide between `MASTER` and `BACKUP`.
+   if the peer is not alive, the node promotes itself after the startup follower deadline or keeps `MASTER` if it already held it.
+6. VIP handling:
+   transitions to `MASTER` add the configured VIP addresses to the interface and run `on_promote`.
+   transitions to `BACKUP` remove the configured VIP addresses and run either `on_backup` or `on_demote`.
+7. Fault handling:
+   address add/remove failures trigger `on_fault`.
+   fatal runtime send/receive failures also trigger shutdown cleanup and `on_fault`.
+8. Shutdown:
+   on graceful shutdown, including `SIGINT` and `SIGTERM`, the node removes its configured VIP addresses before the runtime exits and publishes a final `INIT` snapshot.
+
 The goal is to preserve the operational model of VRRP/CARP best practices while avoiding a dependency on L2 multicast, gratuitous ARP, or other mechanisms commonly blocked by cloud providers.
 
 This means:
@@ -168,6 +240,13 @@ Performance and reliability should be first-class requirements for HA mode:
 * explicit authentication on HA advertisements
 * predictable recovery after peer restart or transient network loss
 * first-class IPv6 support with IPv4 fallback when dual-stack binding is unavailable
+
+HA observability should also be a first-class design goal:
+
+* every promotion, demotion, backup transition, and VIP move should be explainable after the fact
+* operators should be able to tell whether the cause was peer timeout, priority/preempt logic, node ID tiebreak, shutdown cleanup, or an explicit fault path
+* `gruezi status`, logs, hooks, and future metrics should make the decision path visible instead of only showing the final state
+* debugging HA should answer "why did this node take or drop the VIP?" without requiring packet capture as the primary source of truth
 
 ### KV mode
 
@@ -429,6 +508,38 @@ Available endpoints:
 
 The current `gruezi status` command queries this API.
 
+For a live view during failover testing:
+
+```bash
+gruezi status --watch --interval-ms 1000 --node 192.0.2.5:9376
+```
+
+### HA Packet Troubleshooting
+
+For HA packet troubleshooting, use `gruezi status --watch` and `tcpdump` together:
+
+```bash
+gruezi status --watch --interval-ms 1000 --node 192.0.2.10:9376
+```
+
+```bash
+sudo tcpdump -ni eth0 'udp port 9375 and host 192.0.2.11' -tttt -vvv -X -s0
+```
+
+Recommended `tcpdump` flags:
+
+* `-n`: disable DNS lookups
+* `-tttt`: print readable timestamps for correlation with `status --watch`
+* `-vvv`: increase protocol detail
+* `-X`: show packet payload in hex and ASCII
+* `-s0`: capture the full packet instead of truncating it
+
+This lets you correlate:
+
+* `sent` and `recv` counters from `gruezi status --watch`
+* peer liveness and `last_peer_seen`
+* raw UDP payload bytes on `9375/udp`
+
 ### Current HA Hooks
 
 The current HA implementation supports transition hooks in YAML:
@@ -448,10 +559,7 @@ Implemented today:
 * `on_promote`
 * `on_demote`
 * `on_backup`
-
-Planned next:
-
-* wire `on_fault` to explicit HA failure paths
+* `on_fault` for explicit HA address-action and runtime failure paths
 
 Hook scripts currently receive runtime context through environment variables:
 

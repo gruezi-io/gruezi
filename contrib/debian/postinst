@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    systemctl enable gruezi.service || true
+
+    if [ -f /etc/gruezi/gruezi.yaml ]; then
+        systemctl restart gruezi.service || true
+    fi
+fi
+
+exit 0

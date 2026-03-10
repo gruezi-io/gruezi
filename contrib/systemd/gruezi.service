@@ -1,0 +1,21 @@
+[Unit]
+Description=gruezi service discovery and HA runtime
+Documentation=https://github.com/gruezi-io/gruezi
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/gruezi/gruezi.yaml
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment="GRUEZI_CONFIG=/etc/gruezi/gruezi.yaml"
+Environment="GRUEZI_VERBOSE=-v"
+EnvironmentFile=-/etc/gruezi/gruezi.env
+ExecStart=/usr/bin/gruezi ${GRUEZI_VERBOSE} start --config ${GRUEZI_CONFIG}
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

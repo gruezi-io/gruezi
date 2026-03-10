@@ -23,3 +23,9 @@ flycheck*.rs
 .idea/
 .vscode/
 .codexrc
+
+# Local Ansible lab data
+ansible/inventory/lab.yml
+ansible/group_vars/gruezi_ha_lab.yml
+ansible/inventory/*.local.yml
+ansible/group_vars/*.local.yml

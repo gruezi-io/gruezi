@@ -1,0 +1,152 @@
+---
+- name: Deploy gruezi HA lab nodes
+  hosts: gruezi_ha_lab
+  gather_facts: false
+  become: true
+  vars:
+    gruezi_repo_root: '{{ playbook_dir }}/..'
+    gruezi_local_binary: '{{ playbook_dir }}/../target/release/gruezi'
+    gruezi_remote_dir_resolved: "{{ gruezi_remote_dir | default('/home/' ~ ansible_user ~ '/gruezi-lab') }}"
+    gruezi_binary_path: '{{ gruezi_remote_dir_resolved }}/gruezi'
+    gruezi_binary_tmp_path: '{{ gruezi_remote_dir_resolved }}/gruezi.new'
+    gruezi_config_path: '{{ gruezi_remote_dir_resolved }}/gruezi.yaml'
+    gruezi_log_path: '{{ gruezi_remote_dir_resolved }}/gruezi.log'
+  pre_tasks:
+    - name: Build local release binary
+      ansible.builtin.command:
+        argv:
+          - cargo
+          - build
+          - --release
+          - --locked
+      args:
+        chdir: '{{ gruezi_repo_root }}'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+
+    - name: Check local release binary exists
+      ansible.builtin.stat:
+        path: '{{ gruezi_local_binary }}'
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      register: gruezi_local_binary_stat
+    - name: Fail if local release binary is missing
+      ansible.builtin.assert:
+        that:
+          - gruezi_local_binary_stat.stat.exists
+          - gruezi_local_binary_stat.stat.executable
+        fail_msg: Build target/release/gruezi first with cargo build --release --locked
+      delegate_to: localhost
+      become: false
+    - name: Validate required host variables
+      ansible.builtin.assert:
+        that:
+          - gruezi_node_id is defined
+          - gruezi_peer_ip is defined
+          - gruezi_priority is defined
+        fail_msg: Each host needs gruezi_node_id, gruezi_peer_ip, and gruezi_priority
+  tasks:
+    - name: Create remote directory
+      ansible.builtin.file:
+        path: '{{ gruezi_remote_dir_resolved }}'
+        state: directory
+        mode: 0755
+
+    - name: Check current remote release binary
+      ansible.builtin.stat:
+        path: '{{ gruezi_binary_path }}'
+        checksum_algorithm: sha256
+      register: gruezi_remote_binary_stat
+
+    - name: Determine whether the release binary changed
+      ansible.builtin.set_fact:
+        gruezi_binary_changed: >-
+          {{
+            (not (gruezi_remote_binary_stat.stat.exists | default(false)))
+            or ((gruezi_remote_binary_stat.stat.checksum | default('')) != gruezi_local_binary_stat.stat.checksum)
+          }}
+
+    - name: Upload release binary to a temporary path
+      ansible.builtin.copy:
+        src: '{{ gruezi_local_binary }}'
+        dest: '{{ gruezi_binary_tmp_path }}'
+        mode: 0755
+      when: gruezi_binary_changed
+
+    - name: Replace release binary atomically
+      ansible.builtin.command:
+        argv:
+          - mv
+          - '{{ gruezi_binary_tmp_path }}'
+          - '{{ gruezi_binary_path }}'
+      when: gruezi_binary_changed
+      notify: restart gruezi
+
+    - name: Render HA config
+      ansible.builtin.template:
+        src: templates/gruezi-ha.yaml.j2
+        dest: '{{ gruezi_config_path }}'
+        mode: 0644
+      notify: restart gruezi
+
+    - name: Check whether gruezi is already running
+      ansible.builtin.command:
+        argv:
+          - pgrep
+          - -x
+          - gruezi
+      register: gruezi_process
+      failed_when: false
+      changed_when: false
+
+    - name: Restart gruezi when the process is missing
+      ansible.builtin.command:
+        argv:
+          - /bin/true
+      when: gruezi_process.rc != 0
+      changed_when: true
+      notify: restart gruezi
+
+    - name: Apply pending restart
+      ansible.builtin.meta: flush_handlers
+
+    - name: Fetch HA status
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9376/status
+        return_content: true
+      register: gruezi_status
+    - name: Show HA status
+      ansible.builtin.debug:
+        msg: '{{ inventory_hostname }} -> {{ gruezi_status.json.ha.state }} via
+          {{ gruezi_status.json.ha.bind }}'
+  handlers:
+    - name: Stop any existing gruezi process
+      listen: restart gruezi
+      ansible.builtin.shell: |
+        pkill -x gruezi || true
+      args:
+        executable: /bin/bash
+
+    - name: Clear any stale VIP assignment
+      listen: restart gruezi
+      ansible.builtin.shell: |
+        ip address del {{ gruezi_vip }} dev {{ gruezi_interface }} || true
+      args:
+        executable: /bin/bash
+
+    - name: Start gruezi in the background
+      listen: restart gruezi
+      ansible.builtin.shell: |
+        nohup {{ gruezi_binary_path }} start --config {{ gruezi_config_path }} >{{ gruezi_log_path }} 2>&1 </dev/null &
+      args:
+        executable: /bin/bash
+
+    - name: Wait for HA API to listen
+      listen: restart gruezi
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 9376
+        timeout: 15

@@ -1,0 +1,11 @@
+---
+gruezi_bind: 0.0.0.0:9375
+gruezi_interface: eth0
+gruezi_group_id: example-ha
+gruezi_shared_key: change-me
+gruezi_protocol_version: 1
+gruezi_preempt: true
+gruezi_advert_interval_ms: 1000
+gruezi_dead_factor: 3
+gruezi_hold_down_ms: 3000
+gruezi_jitter_ms: 100

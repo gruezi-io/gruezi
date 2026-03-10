@@ -35,8 +35,18 @@ pub fn handler(matches: &ArgMatches) -> Result<Action> {
         }
         Some(("status", sub_matches)) => {
             let node = sub_matches.get_one::<String>("node").cloned();
+            let watch = sub_matches.get_flag("watch");
+            let interval_ms = sub_matches
+                .get_one::<u64>("interval-ms")
+                .copied()
+                .unwrap_or(1_000);
 
-            Ok(Action::Status { node, verbose })
+            Ok(Action::Status {
+                node,
+                verbose,
+                watch,
+                interval_ms,
+            })
         }
         Some(("peers", sub_matches)) => {
             let format = sub_matches

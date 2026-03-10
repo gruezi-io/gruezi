@@ -145,6 +145,26 @@ async fn wait_for_hook_line(path: &Path, description: &str) -> Result<String> {
     .map_err(|_| anyhow!("timed out waiting for {description}"))?
 }
 
+async fn wait_for_hook_contents(
+    path: &Path,
+    expected_lines: usize,
+    description: &str,
+) -> Result<String> {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(contents) = fs::read_to_string(path)
+                && contents.lines().count() >= expected_lines
+            {
+                return Ok(contents);
+            }
+
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting for {description}"))?
+}
+
 #[tokio::test]
 async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
     let dir = temp_dir("ha-hooks-promote")?;
@@ -245,6 +265,41 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
 
     stop_node(shutdown_a, task_a).await?;
     stop_node(shutdown_b, task_b).await?;
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
+    let dir = temp_dir("ha-hooks-fault")?;
+    let fault_output = dir.join("fault.log");
+    let fault_hook = write_hook_script(&dir, "fault", &fault_output)?;
+
+    let port_a = free_udp_port()?;
+    let port_b = free_udp_port()?;
+    let runtime_a = HaRuntimeConfig {
+        hooks: HaHooks {
+            on_fault: Some(fault_hook),
+            ..HaHooks::default()
+        },
+        ip_command: "false".to_owned(),
+        arping_command: "true".to_owned(),
+        ndsend_command: "true".to_owned(),
+        ..runtime_config("node-a", port_a, port_b, 110, true, HaHooks::default())
+    };
+
+    let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
+
+    wait_for_status(&mut status_a, "node-a standalone master state", |status| {
+        status.state == HaState::Master && !status.peer_alive
+    })
+    .await?;
+
+    let fault_contents = wait_for_hook_contents(&fault_output, 2, "fault hook output").await?;
+    assert!(fault_contents.contains("fault|BACKUP|INIT||"));
+    assert!(fault_contents.contains("fault|MASTER|BACKUP||"));
+
+    stop_node(shutdown_a, task_a).await?;
     fs::remove_dir_all(dir)?;
     Ok(())
 }

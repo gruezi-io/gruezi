@@ -412,7 +412,7 @@ fn validate_packet_field(value: &str, field_name: &str, max_len: usize) -> Resul
 ///
 /// Returns an error if the socket cannot be bound or packet I/O fails.
 pub async fn run(runtime: HaRuntimeConfig) -> Result<()> {
-    run_with_status(runtime, None, tokio::signal::ctrl_c()).await
+    run_with_status(runtime, None, crate::gruezi::signal::shutdown_signal()).await
 }
 
 /// Run the HA control loop until the provided shutdown future resolves.
@@ -461,19 +461,34 @@ where
         tokio::select! {
             _ = &mut shutdown => {
                 info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
+                cleanup_before_exit(&runtime, status_tx.as_ref(), &mut loop_state, false).await;
                 break;
             }
             recv = socket.recv_from(&mut buffer) => {
-                handle_receive_event(&runtime, status_tx.as_ref(), &mut loop_state, recv, &buffer)?;
+                if let Err(error) = handle_receive_event(
+                    &runtime,
+                    status_tx.as_ref(),
+                    &mut loop_state,
+                    recv,
+                    &buffer,
+                ) {
+                    cleanup_before_exit(&runtime, status_tx.as_ref(), &mut loop_state, true).await;
+                    return Err(error);
+                }
             }
             () = &mut sleep => {
-                handle_send_event(
+                if let Err(error) = handle_send_event(
                     &socket,
                     &runtime,
                     peer_addr,
                     status_tx.as_ref(),
                     &mut loop_state,
-                ).await?;
+                )
+                .await
+                {
+                    cleanup_before_exit(&runtime, status_tx.as_ref(), &mut loop_state, true).await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -616,30 +631,24 @@ fn trigger_state_hooks(
         return;
     }
 
-    let context = HookContext {
-        node_id: runtime.node_id.clone(),
-        group_id: runtime.group_id.clone(),
-        interface: runtime.interface.clone(),
-        state: current_state,
-        previous_state,
-        peer_id: peer_observation.map(|peer| peer.node_id.clone()),
-        peer_state: peer_observation.map(|peer| peer.state),
-    };
-    let address_manager = AddressManager {
-        ip_command: runtime.ip_command.clone(),
-        arping_command: runtime.arping_command.clone(),
-        ndsend_command: runtime.ndsend_command.clone(),
-        interface: runtime.interface.clone(),
-        addresses: runtime.addresses.clone(),
-    };
+    let context = hook_context(runtime, current_state, previous_state, peer_observation);
+    let address_manager = address_manager(runtime);
 
     match current_state {
         HaState::Master => {
-            spawn_address_action(address_manager, AddressAction::Add);
+            spawn_address_action(
+                address_manager,
+                AddressAction::Add,
+                Some((runtime.hooks.clone(), context.clone())),
+            );
             spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
         }
         HaState::Backup => {
-            spawn_address_action(address_manager, AddressAction::Remove);
+            spawn_address_action(
+                address_manager,
+                AddressAction::Remove,
+                Some((runtime.hooks.clone(), context.clone())),
+            );
             let event = if previous_state == HaState::Master {
                 HookEvent::Demote
             } else {
@@ -649,6 +658,59 @@ fn trigger_state_hooks(
         }
         HaState::Init => {}
     }
+}
+
+fn hook_context(
+    runtime: &HaRuntimeConfig,
+    state: HaState,
+    previous_state: HaState,
+    peer_observation: Option<&PeerObservation>,
+) -> HookContext {
+    HookContext {
+        node_id: runtime.node_id.clone(),
+        group_id: runtime.group_id.clone(),
+        interface: runtime.interface.clone(),
+        state,
+        previous_state,
+        peer_id: peer_observation.map(|peer| peer.node_id.clone()),
+        peer_state: peer_observation.map(|peer| peer.state),
+    }
+}
+
+fn address_manager(runtime: &HaRuntimeConfig) -> AddressManager {
+    AddressManager {
+        ip_command: runtime.ip_command.clone(),
+        arping_command: runtime.arping_command.clone(),
+        ndsend_command: runtime.ndsend_command.clone(),
+        interface: runtime.interface.clone(),
+        addresses: runtime.addresses.clone(),
+    }
+}
+
+async fn cleanup_before_exit(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    faulted: bool,
+) {
+    let previous_state = loop_state.state;
+    let context = hook_context(
+        runtime,
+        HaState::Init,
+        previous_state,
+        loop_state.peer_observation.as_ref(),
+    );
+
+    if let Err(error) = address_manager(runtime).apply(AddressAction::Remove).await {
+        warn!(%error, node_id = %runtime.node_id, "HA shutdown address cleanup failed");
+    }
+
+    if faulted && let Err(error) = runtime.hooks.run(HookEvent::Fault, context).await {
+        warn!(%error, node_id = %runtime.node_id, "HA fault hook execution failed during shutdown");
+    }
+
+    loop_state.state = HaState::Init;
+    publish_loop_status(runtime, status_tx, loop_state, Instant::now());
 }
 
 fn handle_incoming_packet(

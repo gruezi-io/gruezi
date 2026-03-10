@@ -73,6 +73,16 @@ coverage:
   firefox target/coverage/html/index.html
   rm -rf *.profraw
 
+# Build a Debian package from the release binary and contrib assets
+package-deb:
+  cargo build --release --locked
+  cargo deb --no-build
+
+# Build an RPM package from the release binary and contrib assets
+package-rpm:
+  cargo build --release --locked
+  cargo generate-rpm
+
 # Update dependencies
 update:
   cargo update

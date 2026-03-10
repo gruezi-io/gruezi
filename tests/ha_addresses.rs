@@ -223,6 +223,46 @@ async fn master_adds_and_backup_removes_addresses() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shutdown_removes_master_addresses() -> Result<()> {
+    let dir = temp_dir("ha-addresses-shutdown")?;
+    let log = dir.join("node-a.log");
+    let ip = write_command_script(&dir, "node-a-ip", &log)?;
+    let arping = write_command_script(&dir, "node-a-arping", &log)?;
+    let ndsend = write_command_script(&dir, "node-a-ndsend", &log)?;
+
+    let port_a = free_udp_port()?;
+    let port_b = free_udp_port()?;
+    let runtime_a = runtime_config(
+        "node-a",
+        port_a,
+        port_b,
+        110,
+        true,
+        CommandPaths { ip, arping, ndsend },
+    );
+
+    let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
+
+    wait_for_status(&mut status_a, "node-a standalone master state", |status| {
+        status.state == HaState::Master && !status.peer_alive
+    })
+    .await?;
+
+    let startup_contents = wait_for_log_lines(&log, 4, "node-a startup address actions").await?;
+    assert!(startup_contents.contains("address add 10.0.0.10/24 dev lo"));
+    assert!(startup_contents.contains("address add fd00::10/64 dev lo"));
+
+    stop_node(shutdown_a, task_a).await?;
+
+    let contents = wait_for_log_lines(&log, 6, "node-a shutdown address cleanup").await?;
+    assert!(contents.contains("address del 10.0.0.10/24 dev lo"));
+    assert!(contents.contains("address del fd00::10/64 dev lo"));
+
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn demotion_removes_addresses_after_preemption() -> Result<()> {
     let dir = temp_dir("ha-addresses-demote")?;
     let log_a = dir.join("node-a.log");

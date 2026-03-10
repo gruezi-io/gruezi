@@ -142,6 +142,29 @@ fn status_command() -> Command {
                 )
                 .value_name("ADDRESS"),
         )
+        .arg(
+            Arg::new("watch")
+                .short('w')
+                .long("watch")
+                .help("Refresh status continuously until interrupted")
+                .long_help(
+                    "Refresh status continuously until interrupted.\n\n\
+                     This is intended for live HA observation and correlation with packet captures.",
+                )
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("interval-ms")
+                .long("interval-ms")
+                .help("Polling interval in milliseconds for --watch")
+                .long_help(
+                    "Polling interval in milliseconds for `--watch`.\n\n\
+                     The default is 1000ms.",
+                )
+                .value_name("MILLISECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .default_value("1000"),
+        )
 }
 
 fn peers_command() -> Command {
@@ -194,6 +217,14 @@ mod tests {
     fn test_status_command() {
         let app = new();
         let matches = app.try_get_matches_from(vec!["gruezi", "status"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_status_watch_command() {
+        let app = new();
+        let matches =
+            app.try_get_matches_from(vec!["gruezi", "status", "--watch", "--interval-ms", "500"]);
         assert!(matches.is_ok());
     }
 

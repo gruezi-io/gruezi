@@ -1,8 +1,7 @@
+---
 mode: kv
-
 node:
   id: node-a
-
 kv:
   role: voter
   listen_client: 0.0.0.0:9376

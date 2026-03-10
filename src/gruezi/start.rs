@@ -2,6 +2,7 @@ use crate::config::{Config, DEFAULT_HA_BIND, Mode};
 use crate::gruezi::{
     api,
     ha::{self, HaRuntimeConfig, HaStatus},
+    signal,
 };
 use anyhow::{Context, Result};
 use tokio::{sync::watch, task::JoinHandle};
@@ -100,8 +101,8 @@ async fn start_ha_service(runtime: HaRuntimeConfig) -> Result<()> {
         );
 
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("failed to listen for shutdown signal")?;
+        signal = signal::shutdown_signal() => {
+            signal?;
             let _ = shutdown_tx.send(true);
         }
         result = &mut ha_task => {

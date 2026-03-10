@@ -67,13 +67,18 @@ built = { version = "0.8.0", features = ["git2"] }
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/gruezi", dest = "/usr/bin/gruezi", mode = "0755" },
+    { source = "contrib/systemd/gruezi.service", dest = "/etc/systemd/system/gruezi.service", mode = "0644" },
+    { source = "contrib/systemd/gruezi.env.example", dest = "/etc/gruezi/gruezi.env", mode = "0640" },
 ]
 
 [package.metadata.deb]
 assets = [
   ["target/release/gruezi", "/usr/bin/gruezi", "755"],
+  ["contrib/systemd/gruezi.service", "/etc/systemd/system/gruezi.service", "644"],
+  ["contrib/systemd/gruezi.env.example", "/etc/gruezi/gruezi.env", "640"],
 ]
 depends = ""
+maintainer-scripts = "contrib/debian"
 
 [profile.release]
 opt-level = 3

@@ -1,15 +1,12 @@
+---
 mode: ha
-
 node:
   id: node-a
-
 ha:
   bind: 0.0.0.0:9375
   interface: eth0
   group_id: cluster-ha
-  addresses:
-    - 10.0.0.10/24
-    - fd00::10/64
+  addresses: [10.0.0.10/24, fd00::10/64]
   peer: 10.0.0.2:9375
   protocol_version: 1
   priority: 100
