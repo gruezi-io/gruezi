@@ -26,8 +26,59 @@ const MAX_AUTH_TAG_LEN: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HaState {
     Init,
-    Backup,
-    Master,
+    Standby,
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HaDecisionReason {
+    Startup,
+    StartupHold,
+    StartupDeadlineExpired,
+    AlreadyActive,
+    PeerTimeout,
+    LocalHigherPriority,
+    LocalNodeIdTiebreak,
+    PeerHigherPriority,
+    PeerNodeIdTiebreak,
+    PeerActiveNoPreempt,
+    PeerBecameActiveConflict,
+    PreemptHigherPriority,
+    PreemptNodeIdTiebreak,
+    GracefulShutdown,
+    RuntimeFault,
+    AddressActionFailed,
+}
+
+impl HaDecisionReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::StartupHold => "startup_hold",
+            Self::StartupDeadlineExpired => "startup_deadline_expired",
+            Self::AlreadyActive => "already_active",
+            Self::PeerTimeout => "peer_timeout",
+            Self::LocalHigherPriority => "local_higher_priority",
+            Self::LocalNodeIdTiebreak => "local_node_id_tiebreak",
+            Self::PeerHigherPriority => "peer_higher_priority",
+            Self::PeerNodeIdTiebreak => "peer_node_id_tiebreak",
+            Self::PeerActiveNoPreempt => "peer_active_no_preempt",
+            Self::PeerBecameActiveConflict => "peer_became_active_conflict",
+            Self::PreemptHigherPriority => "preempt_higher_priority",
+            Self::PreemptNodeIdTiebreak => "preempt_node_id_tiebreak",
+            Self::GracefulShutdown => "graceful_shutdown",
+            Self::RuntimeFault => "runtime_fault",
+            Self::AddressActionFailed => "address_action_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for HaDecisionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl HaState {
@@ -35,8 +86,8 @@ impl HaState {
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Init => 0,
-            Self::Backup => 1,
-            Self::Master => 2,
+            Self::Standby => 1,
+            Self::Active => 2,
         }
     }
 }
@@ -47,8 +98,8 @@ impl TryFrom<u8> for HaState {
     fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(Self::Init),
-            1 => Ok(Self::Backup),
-            2 => Ok(Self::Master),
+            1 => Ok(Self::Standby),
+            2 => Ok(Self::Active),
             _ => bail!("invalid HA state value {value}"),
         }
     }
@@ -213,6 +264,9 @@ struct PeerObservation {
     node_id: String,
     state: HaState,
     priority: u8,
+    // Keep this sticky for the current peer liveness window so a node that
+    // just yielded does not immediately preempt back on the next packet.
+    became_active: bool,
     observed_at: Instant,
 }
 
@@ -236,6 +290,10 @@ pub struct HaStatus {
     pub packets_received: u64,
     pub invalid_packets: u64,
     pub auth_failures: u64,
+    pub duplicate_node_id_packets: u64,
+    pub decision_reason: HaDecisionReason,
+    pub last_transition_reason: Option<HaDecisionReason>,
+    pub last_transition_ms_ago: Option<u64>,
 }
 
 impl HaStatus {
@@ -265,6 +323,10 @@ impl HaStatus {
             packets_received: 0,
             invalid_packets: 0,
             auth_failures: 0,
+            duplicate_node_id_packets: 0,
+            decision_reason: HaDecisionReason::Startup,
+            last_transition_reason: None,
+            last_transition_ms_ago: None,
         }
     }
 }
@@ -275,6 +337,7 @@ struct HaCounters {
     packets_received: u64,
     invalid_packets: u64,
     auth_failures: u64,
+    duplicate_node_id_packets: u64,
 }
 
 #[derive(Debug)]
@@ -282,9 +345,21 @@ struct HaLoopState {
     startup_at: Instant,
     sequence: u64,
     state: HaState,
+    // Keep this sticky while a live peer remains Active so an asymmetric-loss
+    // demotion does not immediately flip back on the next advertisement.
+    active_peer_conflict: bool,
+    decision_reason: HaDecisionReason,
+    last_transition_reason: Option<HaDecisionReason>,
+    last_transition_at: Option<Instant>,
     peer_observation: Option<PeerObservation>,
     counters: HaCounters,
     next_advert_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HaDecision {
+    state: HaState,
+    reason: HaDecisionReason,
 }
 
 impl HaPacket {
@@ -505,6 +580,10 @@ fn initialize_loop_state(
         startup_at,
         sequence: 0,
         state: HaState::Init,
+        active_peer_conflict: false,
+        decision_reason: HaDecisionReason::Startup,
+        last_transition_reason: None,
+        last_transition_at: None,
         peer_observation: None,
         counters: HaCounters::default(),
         next_advert_at: tokio::time::Instant::now() + runtime.next_advert_delay(1),
@@ -531,21 +610,51 @@ fn refresh_local_state(
     loop_state: &mut HaLoopState,
 ) {
     let now = Instant::now();
-    let desired_state = desired_state(
+    let decision = desired_state(
         runtime,
         loop_state.state,
         loop_state.peer_observation.as_ref(),
         loop_state.startup_at,
         now,
+        loop_state.active_peer_conflict,
     );
-    trigger_state_hooks(
-        runtime,
-        loop_state.state,
-        desired_state,
-        loop_state.peer_observation.as_ref(),
-    );
-    log_state_change(loop_state.state, desired_state, &runtime.node_id);
-    loop_state.state = desired_state;
+    if decision.reason == HaDecisionReason::PeerBecameActiveConflict {
+        loop_state.active_peer_conflict = true;
+    } else if !has_live_active_peer(runtime, loop_state.peer_observation.as_ref(), now) {
+        loop_state.active_peer_conflict = false;
+    }
+    loop_state.decision_reason = decision.reason;
+
+    if loop_state.state == decision.state {
+        debug!(
+            node_id = %runtime.node_id,
+            state = ?loop_state.state,
+            reason = %decision.reason,
+            "HA state decision evaluated"
+        );
+    } else {
+        trigger_state_hooks(
+            runtime,
+            loop_state.state,
+            decision.state,
+            decision.reason,
+            loop_state.peer_observation.as_ref(),
+            now,
+        );
+        log_state_change(
+            loop_state.state,
+            decision.state,
+            decision.reason,
+            &runtime.node_id,
+            runtime.priority,
+            loop_state.peer_observation.as_ref(),
+            now,
+        );
+        loop_state.state = decision.state;
+        loop_state.last_transition_reason = Some(decision.reason);
+        loop_state.last_transition_at = Some(now);
+    }
+
     publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
@@ -555,15 +664,7 @@ fn publish_loop_status(
     loop_state: &HaLoopState,
     now: Instant,
 ) {
-    publish_current_status(
-        runtime,
-        status_tx,
-        loop_state.state,
-        loop_state.sequence,
-        loop_state.peer_observation.as_ref(),
-        loop_state.counters,
-        now,
-    );
+    publish_status(status_tx, status_snapshot(runtime, loop_state, now));
 }
 
 fn handle_receive_event(
@@ -590,6 +691,12 @@ fn handle_receive_event(
         if is_auth_failure(&error) {
             loop_state.counters.auth_failures = loop_state.counters.auth_failures.saturating_add(1);
         }
+        if is_duplicate_node_id_failure(&error) {
+            loop_state.counters.duplicate_node_id_packets = loop_state
+                .counters
+                .duplicate_node_id_packets
+                .saturating_add(1);
+        }
         warn!(%error, from = %from, "ignoring invalid HA packet");
         return Ok(());
     }
@@ -606,15 +713,31 @@ async fn handle_send_event(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
 ) -> Result<()> {
-    loop_state.sequence = send_advertisement(
+    match send_advertisement(
         socket,
         runtime,
         peer_addr,
         loop_state.state,
         loop_state.sequence,
     )
-    .await?;
-    loop_state.counters.packets_sent = loop_state.counters.packets_sent.saturating_add(1);
+    .await
+    {
+        Ok(sequence) => {
+            loop_state.sequence = sequence;
+            loop_state.counters.packets_sent = loop_state.counters.packets_sent.saturating_add(1);
+        }
+        Err(error) if is_transient_send_failure(&error) => {
+            warn!(
+                %error,
+                node_id = %runtime.node_id,
+                peer = %peer_addr,
+                state = ?loop_state.state,
+                "HA advertisement send failed; continuing"
+            );
+        }
+        Err(error) => return Err(error),
+    }
+
     loop_state.next_advert_at =
         tokio::time::Instant::now() + runtime.next_advert_delay(loop_state.sequence + 1);
     publish_loop_status(runtime, status_tx, loop_state, Instant::now());
@@ -625,17 +748,26 @@ fn trigger_state_hooks(
     runtime: &HaRuntimeConfig,
     previous_state: HaState,
     current_state: HaState,
+    reason: HaDecisionReason,
     peer_observation: Option<&PeerObservation>,
+    now: Instant,
 ) {
     if previous_state == current_state {
         return;
     }
 
-    let context = hook_context(runtime, current_state, previous_state, peer_observation);
+    let context = hook_context(
+        runtime,
+        current_state,
+        previous_state,
+        Some(reason),
+        peer_observation,
+        now,
+    );
     let address_manager = address_manager(runtime);
 
     match current_state {
-        HaState::Master => {
+        HaState::Active => {
             spawn_address_action(
                 address_manager,
                 AddressAction::Add,
@@ -643,13 +775,13 @@ fn trigger_state_hooks(
             );
             spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
         }
-        HaState::Backup => {
+        HaState::Standby => {
             spawn_address_action(
                 address_manager,
                 AddressAction::Remove,
                 Some((runtime.hooks.clone(), context.clone())),
             );
-            let event = if previous_state == HaState::Master {
+            let event = if previous_state == HaState::Active {
                 HookEvent::Demote
             } else {
                 HookEvent::Backup
@@ -664,7 +796,9 @@ fn hook_context(
     runtime: &HaRuntimeConfig,
     state: HaState,
     previous_state: HaState,
+    reason: Option<HaDecisionReason>,
     peer_observation: Option<&PeerObservation>,
+    now: Instant,
 ) -> HookContext {
     HookContext {
         node_id: runtime.node_id.clone(),
@@ -672,8 +806,13 @@ fn hook_context(
         interface: runtime.interface.clone(),
         state,
         previous_state,
+        reason,
+        priority: runtime.priority,
         peer_id: peer_observation.map(|peer| peer.node_id.clone()),
         peer_state: peer_observation.map(|peer| peer.state),
+        peer_priority: peer_observation.map(|peer| peer.priority),
+        last_peer_seen_ms_ago: peer_observation
+            .map(|peer| saturating_elapsed_ms(now, peer.observed_at)),
     }
 }
 
@@ -694,11 +833,19 @@ async fn cleanup_before_exit(
     faulted: bool,
 ) {
     let previous_state = loop_state.state;
+    let now = Instant::now();
+    let reason = if faulted {
+        HaDecisionReason::RuntimeFault
+    } else {
+        HaDecisionReason::GracefulShutdown
+    };
     let context = hook_context(
         runtime,
         HaState::Init,
         previous_state,
+        Some(reason),
         loop_state.peer_observation.as_ref(),
+        now,
     );
 
     if let Err(error) = address_manager(runtime).apply(AddressAction::Remove).await {
@@ -709,8 +856,23 @@ async fn cleanup_before_exit(
         warn!(%error, node_id = %runtime.node_id, "HA fault hook execution failed during shutdown");
     }
 
+    if previous_state != HaState::Init {
+        log_state_change(
+            previous_state,
+            HaState::Init,
+            reason,
+            &runtime.node_id,
+            runtime.priority,
+            loop_state.peer_observation.as_ref(),
+            now,
+        );
+        loop_state.last_transition_reason = Some(reason);
+        loop_state.last_transition_at = Some(now);
+    }
+
     loop_state.state = HaState::Init;
-    publish_loop_status(runtime, status_tx, loop_state, Instant::now());
+    loop_state.decision_reason = reason;
+    publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
 fn handle_incoming_packet(
@@ -721,6 +883,9 @@ fn handle_incoming_packet(
     peer_observation: &mut Option<PeerObservation>,
 ) -> Result<()> {
     let packet = HaPacket::decode(payload)?;
+    let previous_peer_state = peer_observation.as_ref().and_then(|observation| {
+        (observation.node_id == packet.node_id).then_some(observation.state)
+    });
 
     if packet.protocol_version != runtime.protocol_version {
         bail!(
@@ -735,7 +900,7 @@ fn handle_incoming_packet(
     }
 
     if packet.node_id == runtime.node_id {
-        bail!("received looped HA packet from local node");
+        bail!("received HA packet with duplicate node.id");
     }
 
     if !verify_auth_tag(runtime, &packet) {
@@ -746,6 +911,11 @@ fn handle_incoming_packet(
         node_id: packet.node_id,
         state: packet.state,
         priority: packet.priority,
+        became_active: matches!(packet.state, HaState::Active)
+            && matches!(
+                previous_peer_state,
+                Some(previous_state) if previous_state != HaState::Active
+            ),
         observed_at,
     });
 
@@ -777,21 +947,6 @@ fn build_packet(runtime: &HaRuntimeConfig, state: HaState, sequence: u64) -> Res
     packet.auth_tag = auth_tag(&runtime.auth, &packet);
 
     Ok(packet)
-}
-
-fn publish_current_status(
-    runtime: &HaRuntimeConfig,
-    status_tx: Option<&watch::Sender<HaStatus>>,
-    state: HaState,
-    sequence: u64,
-    peer_observation: Option<&PeerObservation>,
-    counters: HaCounters,
-    now: Instant,
-) {
-    publish_status(
-        status_tx,
-        status_snapshot(runtime, state, sequence, peer_observation, counters, now),
-    );
 }
 
 async fn send_advertisement(
@@ -826,83 +981,183 @@ fn desired_state(
     peer_observation: Option<&PeerObservation>,
     startup_at: Instant,
     now: Instant,
-) -> HaState {
+    active_peer_conflict: bool,
+) -> HaDecision {
     let startup_deadline = runtime.follower_deadline(startup_at);
+    let live_peer =
+        peer_observation.filter(|peer| runtime.follower_deadline(peer.observed_at) > now);
 
-    let Some(peer) =
-        peer_observation.filter(|peer| runtime.follower_deadline(peer.observed_at) > now)
-    else {
-        return if current_state == HaState::Master || now >= startup_deadline {
-            HaState::Master
-        } else {
-            HaState::Backup
-        };
+    let Some(peer) = live_peer else {
+        return desired_state_without_live_peer(
+            current_state,
+            peer_observation,
+            startup_deadline,
+            now,
+        );
     };
 
     match peer.state {
-        HaState::Master => {
-            if runtime.preempt
-                && outranks(
-                    runtime.priority,
-                    &runtime.node_id,
-                    peer.priority,
-                    &peer.node_id,
-                )
-            {
-                HaState::Master
+        HaState::Active => desired_state_with_active_peer(runtime, peer, active_peer_conflict),
+        HaState::Init | HaState::Standby => {
+            if current_state == HaState::Active {
+                HaDecision {
+                    state: HaState::Active,
+                    reason: HaDecisionReason::AlreadyActive,
+                }
+            } else if outranks(
+                runtime.priority,
+                &runtime.node_id,
+                peer.priority,
+                &peer.node_id,
+            ) {
+                HaDecision {
+                    state: HaState::Active,
+                    reason: local_win_reason(
+                        runtime.priority,
+                        peer.priority,
+                        HaDecisionReason::LocalHigherPriority,
+                        HaDecisionReason::LocalNodeIdTiebreak,
+                    ),
+                }
             } else {
-                HaState::Backup
-            }
-        }
-        HaState::Init | HaState::Backup => {
-            if current_state == HaState::Master
-                || outranks(
-                    runtime.priority,
-                    &runtime.node_id,
-                    peer.priority,
-                    &peer.node_id,
-                )
-            {
-                HaState::Master
-            } else {
-                HaState::Backup
+                HaDecision {
+                    state: HaState::Standby,
+                    reason: peer_win_reason(
+                        runtime.priority,
+                        peer.priority,
+                        HaDecisionReason::PeerHigherPriority,
+                        HaDecisionReason::PeerNodeIdTiebreak,
+                    ),
+                }
             }
         }
     }
 }
 
-fn status_snapshot(
+fn has_live_active_peer(
     runtime: &HaRuntimeConfig,
-    state: HaState,
-    sequence: u64,
     peer_observation: Option<&PeerObservation>,
-    counters: HaCounters,
     now: Instant,
-) -> HaStatus {
-    let live_peer =
-        peer_observation.filter(|peer| runtime.follower_deadline(peer.observed_at) > now);
-    let last_peer_seen_ms_ago =
-        peer_observation.map(|peer| saturating_elapsed_ms(now, peer.observed_at));
+) -> bool {
+    peer_observation
+        .filter(|peer| runtime.follower_deadline(peer.observed_at) > now)
+        .is_some_and(|peer| peer.state == HaState::Active)
+}
+
+fn desired_state_without_live_peer(
+    current_state: HaState,
+    peer_observation: Option<&PeerObservation>,
+    startup_deadline: Instant,
+    now: Instant,
+) -> HaDecision {
+    if peer_observation.is_some() {
+        HaDecision {
+            state: HaState::Active,
+            reason: HaDecisionReason::PeerTimeout,
+        }
+    } else if current_state == HaState::Active {
+        HaDecision {
+            state: HaState::Active,
+            reason: HaDecisionReason::AlreadyActive,
+        }
+    } else if now >= startup_deadline {
+        HaDecision {
+            state: HaState::Active,
+            reason: HaDecisionReason::StartupDeadlineExpired,
+        }
+    } else {
+        HaDecision {
+            state: HaState::Standby,
+            reason: HaDecisionReason::StartupHold,
+        }
+    }
+}
+
+fn desired_state_with_active_peer(
+    runtime: &HaRuntimeConfig,
+    peer: &PeerObservation,
+    active_peer_conflict: bool,
+) -> HaDecision {
+    let local_wins = outranks(
+        runtime.priority,
+        &runtime.node_id,
+        peer.priority,
+        &peer.node_id,
+    );
+
+    if local_wins && (peer.became_active || active_peer_conflict) {
+        return HaDecision {
+            state: HaState::Standby,
+            reason: HaDecisionReason::PeerBecameActiveConflict,
+        };
+    }
+
+    if runtime.preempt && local_wins {
+        HaDecision {
+            state: HaState::Active,
+            reason: local_win_reason(
+                runtime.priority,
+                peer.priority,
+                HaDecisionReason::PreemptHigherPriority,
+                HaDecisionReason::PreemptNodeIdTiebreak,
+            ),
+        }
+    } else if runtime.preempt {
+        HaDecision {
+            state: HaState::Standby,
+            reason: peer_win_reason(
+                runtime.priority,
+                peer.priority,
+                HaDecisionReason::PeerHigherPriority,
+                HaDecisionReason::PeerNodeIdTiebreak,
+            ),
+        }
+    } else {
+        HaDecision {
+            state: HaState::Standby,
+            reason: HaDecisionReason::PeerActiveNoPreempt,
+        }
+    }
+}
+
+fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Instant) -> HaStatus {
+    let live_peer = loop_state
+        .peer_observation
+        .as_ref()
+        .filter(|peer| runtime.follower_deadline(peer.observed_at) > now);
+    let last_peer_seen_ms_ago = loop_state
+        .peer_observation
+        .as_ref()
+        .map(|peer| saturating_elapsed_ms(now, peer.observed_at));
 
     HaStatus {
         node_id: runtime.node_id.clone(),
         group_id: runtime.group_id.clone(),
         bind: runtime.bind.clone(),
         peer: runtime.peer.clone(),
-        state,
+        state: loop_state.state,
         priority: runtime.priority,
         advert_interval_ms: runtime.advert_interval_ms,
         dead_timeout_ms: duration_millis_u64(runtime.dead_timeout()),
         hold_down_ms: runtime.hold_down_ms,
-        sequence,
-        peer_node_id: peer_observation.map(|peer| peer.node_id.clone()),
-        peer_state: peer_observation.map(|peer| peer.state),
+        sequence: loop_state.sequence,
+        peer_node_id: loop_state
+            .peer_observation
+            .as_ref()
+            .map(|peer| peer.node_id.clone()),
+        peer_state: loop_state.peer_observation.as_ref().map(|peer| peer.state),
         peer_alive: live_peer.is_some(),
         last_peer_seen_ms_ago,
-        packets_sent: counters.packets_sent,
-        packets_received: counters.packets_received,
-        invalid_packets: counters.invalid_packets,
-        auth_failures: counters.auth_failures,
+        packets_sent: loop_state.counters.packets_sent,
+        packets_received: loop_state.counters.packets_received,
+        invalid_packets: loop_state.counters.invalid_packets,
+        auth_failures: loop_state.counters.auth_failures,
+        duplicate_node_id_packets: loop_state.counters.duplicate_node_id_packets,
+        decision_reason: loop_state.decision_reason,
+        last_transition_reason: loop_state.last_transition_reason,
+        last_transition_ms_ago: loop_state
+            .last_transition_at
+            .map(|transition_at| saturating_elapsed_ms(now, transition_at)),
     }
 }
 
@@ -918,10 +1173,44 @@ fn outranks(
     peer_priority: u8,
     peer_node_id: &str,
 ) -> bool {
+    rank_order(local_priority, local_node_id, peer_priority, peer_node_id) == Ordering::Greater
+}
+
+fn rank_order(
+    local_priority: u8,
+    local_node_id: &str,
+    peer_priority: u8,
+    peer_node_id: &str,
+) -> Ordering {
     match local_priority.cmp(&peer_priority) {
-        Ordering::Greater => true,
-        Ordering::Less => false,
-        Ordering::Equal => local_node_id > peer_node_id,
+        Ordering::Equal => local_node_id.cmp(peer_node_id),
+        ordering => ordering,
+    }
+}
+
+fn local_win_reason(
+    local_priority: u8,
+    peer_priority: u8,
+    higher_priority_reason: HaDecisionReason,
+    tiebreak_reason: HaDecisionReason,
+) -> HaDecisionReason {
+    if local_priority > peer_priority {
+        higher_priority_reason
+    } else {
+        tiebreak_reason
+    }
+}
+
+fn peer_win_reason(
+    local_priority: u8,
+    peer_priority: u8,
+    higher_priority_reason: HaDecisionReason,
+    tiebreak_reason: HaDecisionReason,
+) -> HaDecisionReason {
+    if local_priority < peer_priority {
+        higher_priority_reason
+    } else {
+        tiebreak_reason
     }
 }
 
@@ -951,6 +1240,28 @@ fn is_auth_failure(error: &anyhow::Error) -> bool {
     error.to_string().contains("authentication failed")
 }
 
+fn is_duplicate_node_id_failure(error: &anyhow::Error) -> bool {
+    error.to_string().contains("duplicate node.id")
+}
+
+fn is_transient_send_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_error| {
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+            )
+        })
+}
+
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -959,9 +1270,34 @@ fn saturating_elapsed_ms(now: Instant, observed_at: Instant) -> u64 {
     duration_millis_u64(now.saturating_duration_since(observed_at))
 }
 
-fn log_state_change(previous: HaState, current: HaState, node_id: &str) {
+fn log_state_change(
+    previous: HaState,
+    current: HaState,
+    reason: HaDecisionReason,
+    node_id: &str,
+    local_priority: u8,
+    peer_observation: Option<&PeerObservation>,
+    now: Instant,
+) {
     if previous != current {
-        info!(node_id, ?previous, ?current, "HA state changed");
+        let peer_node_id = peer_observation.map_or("unknown", |peer| peer.node_id.as_str());
+        let peer_state = peer_observation.map(|peer| format!("{:?}", peer.state));
+        let peer_priority = peer_observation.map(|peer| peer.priority);
+        let last_peer_seen_ms_ago =
+            peer_observation.map(|peer| saturating_elapsed_ms(now, peer.observed_at));
+
+        info!(
+            node_id,
+            ?previous,
+            ?current,
+            reason = %reason,
+            local_priority,
+            peer_node_id,
+            peer_state = peer_state.as_deref().unwrap_or("unknown"),
+            peer_priority,
+            last_peer_seen_ms_ago,
+            "HA state changed"
+        );
     }
 }
 
@@ -1090,12 +1426,42 @@ impl<'a> PacketCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HaAuth, HaPacket, HaRuntimeConfig, HaState, PeerObservation, build_packet, desired_state,
-        handle_incoming_packet, verify_auth_tag,
+        HaAuth, HaDecisionReason, HaPacket, HaRuntimeConfig, HaState, PeerObservation,
+        build_packet, desired_state, handle_incoming_packet, is_duplicate_node_id_failure,
+        is_transient_send_failure, verify_auth_tag,
     };
     use crate::config::Config;
     use anyhow::Result;
     use std::time::{Duration, Instant};
+
+    fn runtime_with_timers(
+        advert_interval_ms: u64,
+        dead_factor: u8,
+        hold_down_ms: u64,
+    ) -> Result<HaRuntimeConfig> {
+        Config::from_yaml_str(&format!(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 100
+  advert_interval_ms: {advert_interval_ms}
+  dead_factor: {dead_factor}
+  hold_down_ms: {hold_down_ms}
+  jitter_ms: 0
+  auth:
+    mode: none
+"
+        ))
+        .and_then(|config| HaRuntimeConfig::try_from(&config))
+    }
 
     #[test]
     fn builds_runtime_config_from_ha_yaml() -> Result<()> {
@@ -1137,7 +1503,7 @@ ha:
     fn encodes_and_decodes_packet() -> Result<()> {
         let packet = HaPacket {
             protocol_version: 1,
-            state: HaState::Backup,
+            state: HaState::Standby,
             priority: 110,
             dead_factor: 3,
             advert_interval_ms: 1_000,
@@ -1176,6 +1542,7 @@ ha:
   peer: 10.0.0.2:9375
   protocol_version: 1
   priority: 100
+  preempt: true
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
@@ -1198,7 +1565,7 @@ ha:
     }
 
     #[test]
-    fn higher_priority_backup_promotes_to_master() -> Result<()> {
+    fn higher_priority_standby_promotes_when_it_outranks_peer() -> Result<()> {
         let config = Config::from_yaml_str(
             r"
 mode: ha
@@ -1224,27 +1591,29 @@ ha:
         let runtime = HaRuntimeConfig::try_from(&config)?;
         let peer = PeerObservation {
             node_id: "node-a".to_owned(),
-            state: HaState::Backup,
+            state: HaState::Standby,
             priority: 100,
+            became_active: false,
             observed_at: Instant::now(),
         };
 
-        assert_eq!(
-            desired_state(
-                &runtime,
-                HaState::Backup,
-                Some(&peer),
-                Instant::now(),
-                Instant::now(),
-            ),
-            HaState::Master
+        let decision = desired_state(
+            &runtime,
+            HaState::Standby,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            false,
         );
+
+        assert_eq!(decision.state, HaState::Active);
+        assert_eq!(decision.reason, HaDecisionReason::LocalHigherPriority);
 
         Ok(())
     }
 
     #[test]
-    fn lower_priority_node_stays_backup_when_peer_is_master() -> Result<()> {
+    fn lower_priority_node_stays_standby_when_peer_is_active() -> Result<()> {
         let config = Config::from_yaml_str(
             r"
 mode: ha
@@ -1258,6 +1627,7 @@ ha:
   peer: 10.0.0.2:9375
   protocol_version: 1
   priority: 100
+  preempt: true
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
@@ -1270,21 +1640,23 @@ ha:
         let runtime = HaRuntimeConfig::try_from(&config)?;
         let peer = PeerObservation {
             node_id: "node-b".to_owned(),
-            state: HaState::Master,
+            state: HaState::Active,
             priority: 110,
+            became_active: false,
             observed_at: Instant::now(),
         };
 
-        assert_eq!(
-            desired_state(
-                &runtime,
-                HaState::Backup,
-                Some(&peer),
-                Instant::now(),
-                Instant::now(),
-            ),
-            HaState::Backup
+        let decision = desired_state(
+            &runtime,
+            HaState::Standby,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            false,
         );
+
+        assert_eq!(decision.state, HaState::Standby);
+        assert_eq!(decision.reason, HaDecisionReason::PeerHigherPriority);
 
         Ok(())
     }
@@ -1316,32 +1688,75 @@ ha:
         let runtime = HaRuntimeConfig::try_from(&config)?;
         let startup_at = Instant::now();
 
-        assert_eq!(
-            desired_state(
-                &runtime,
-                HaState::Init,
-                None,
-                startup_at,
-                startup_at + Duration::from_millis(500),
-            ),
-            HaState::Backup
+        let hold_decision = desired_state(
+            &runtime,
+            HaState::Init,
+            None,
+            startup_at,
+            startup_at + Duration::from_millis(500),
+            false,
         );
+        let expired_decision = desired_state(
+            &runtime,
+            HaState::Init,
+            None,
+            startup_at,
+            startup_at + runtime.dead_timeout() + runtime.hold_down(),
+            false,
+        );
+
+        assert_eq!(hold_decision.state, HaState::Standby);
+        assert_eq!(hold_decision.reason, HaDecisionReason::StartupHold);
+        assert_eq!(expired_decision.state, HaState::Active);
         assert_eq!(
-            desired_state(
-                &runtime,
-                HaState::Init,
-                None,
-                startup_at,
-                startup_at + runtime.dead_timeout() + runtime.hold_down(),
-            ),
-            HaState::Master
+            expired_decision.reason,
+            HaDecisionReason::StartupDeadlineExpired
         );
 
         Ok(())
     }
 
     #[test]
-    fn preempt_false_keeps_higher_priority_peer_in_backup() -> Result<()> {
+    fn startup_deadline_respects_multiple_timer_combinations() -> Result<()> {
+        let timer_cases = [
+            (200_u64, 2_u8, 100_u64),
+            (500_u64, 3_u8, 250_u64),
+            (750_u64, 4_u8, 0_u64),
+        ];
+
+        for (advert_interval_ms, dead_factor, hold_down_ms) in timer_cases {
+            let runtime = runtime_with_timers(advert_interval_ms, dead_factor, hold_down_ms)?;
+            let startup_at = Instant::now();
+            let deadline = runtime.dead_timeout() + runtime.hold_down();
+
+            let before_deadline = desired_state(
+                &runtime,
+                HaState::Init,
+                None,
+                startup_at,
+                startup_at + deadline.saturating_sub(Duration::from_millis(1)),
+                false,
+            );
+            let at_deadline = desired_state(
+                &runtime,
+                HaState::Init,
+                None,
+                startup_at,
+                startup_at + deadline,
+                false,
+            );
+
+            assert_eq!(before_deadline.state, HaState::Standby);
+            assert_eq!(before_deadline.reason, HaDecisionReason::StartupHold);
+            assert_eq!(at_deadline.state, HaState::Active);
+            assert_eq!(at_deadline.reason, HaDecisionReason::StartupDeadlineExpired);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn preempt_false_keeps_higher_priority_peer_in_standby() -> Result<()> {
         let config = Config::from_yaml_str(
             r"
 mode: ha
@@ -1368,21 +1783,313 @@ ha:
         let runtime = HaRuntimeConfig::try_from(&config)?;
         let peer = PeerObservation {
             node_id: "node-b".to_owned(),
-            state: HaState::Master,
+            state: HaState::Active,
             priority: 100,
+            became_active: false,
             observed_at: Instant::now(),
         };
 
-        assert_eq!(
-            desired_state(
-                &runtime,
-                HaState::Backup,
-                Some(&peer),
-                Instant::now(),
-                Instant::now(),
-            ),
-            HaState::Backup
+        let decision = desired_state(
+            &runtime,
+            HaState::Standby,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            false,
         );
+
+        assert_eq!(decision.state, HaState::Standby);
+        assert_eq!(decision.reason, HaDecisionReason::PeerActiveNoPreempt);
+
+        Ok(())
+    }
+
+    #[test]
+    fn peer_timeout_promotes_a_waiting_standby() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 100
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let startup_at = Instant::now();
+        let peer = PeerObservation {
+            node_id: "node-b".to_owned(),
+            state: HaState::Active,
+            priority: 110,
+            became_active: false,
+            observed_at: startup_at,
+        };
+        let now =
+            startup_at + runtime.dead_timeout() + runtime.hold_down() + Duration::from_millis(1);
+        let decision = desired_state(
+            &runtime,
+            HaState::Standby,
+            Some(&peer),
+            startup_at,
+            now,
+            false,
+        );
+
+        assert_eq!(decision.state, HaState::Active);
+        assert_eq!(decision.reason, HaDecisionReason::PeerTimeout);
+
+        Ok(())
+    }
+
+    #[test]
+    fn peer_timeout_deadline_respects_multiple_timer_combinations() -> Result<()> {
+        let timer_cases = [
+            (200_u64, 2_u8, 100_u64),
+            (400_u64, 3_u8, 200_u64),
+            (800_u64, 2_u8, 500_u64),
+        ];
+
+        for (advert_interval_ms, dead_factor, hold_down_ms) in timer_cases {
+            let runtime = runtime_with_timers(advert_interval_ms, dead_factor, hold_down_ms)?;
+            let observed_at = Instant::now();
+            let peer = PeerObservation {
+                node_id: "node-b".to_owned(),
+                state: HaState::Active,
+                priority: 110,
+                became_active: false,
+                observed_at,
+            };
+            let deadline = runtime.dead_timeout() + runtime.hold_down();
+
+            let before_deadline = desired_state(
+                &runtime,
+                HaState::Standby,
+                Some(&peer),
+                observed_at,
+                observed_at + deadline.saturating_sub(Duration::from_millis(1)),
+                false,
+            );
+            let after_deadline = desired_state(
+                &runtime,
+                HaState::Standby,
+                Some(&peer),
+                observed_at,
+                observed_at + deadline + Duration::from_millis(1),
+                false,
+            );
+
+            assert_eq!(before_deadline.state, HaState::Standby);
+            assert!(matches!(
+                before_deadline.reason,
+                HaDecisionReason::PeerHigherPriority | HaDecisionReason::PeerActiveNoPreempt
+            ));
+            assert_eq!(after_deadline.state, HaState::Active);
+            assert_eq!(after_deadline.reason, HaDecisionReason::PeerTimeout);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_node_keeps_ownership_against_standby_peer() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 100
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let peer = PeerObservation {
+            node_id: "node-b".to_owned(),
+            state: HaState::Standby,
+            priority: 110,
+            became_active: false,
+            observed_at: Instant::now(),
+        };
+        let decision = desired_state(
+            &runtime,
+            HaState::Active,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            false,
+        );
+
+        assert_eq!(decision.state, HaState::Active);
+        assert_eq!(decision.reason, HaDecisionReason::AlreadyActive);
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_node_yields_when_peer_newly_becomes_active() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 110
+  preempt: true
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let peer = PeerObservation {
+            node_id: "node-b".to_owned(),
+            state: HaState::Active,
+            priority: 100,
+            became_active: true,
+            observed_at: Instant::now(),
+        };
+        let decision = desired_state(
+            &runtime,
+            HaState::Active,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            false,
+        );
+
+        assert_eq!(decision.state, HaState::Standby);
+        assert_eq!(decision.reason, HaDecisionReason::PeerBecameActiveConflict);
+
+        Ok(())
+    }
+
+    #[test]
+    fn standby_node_does_not_immediately_reclaim_after_conflict_yield() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 110
+  preempt: true
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let peer = PeerObservation {
+            node_id: "node-b".to_owned(),
+            state: HaState::Active,
+            priority: 100,
+            became_active: true,
+            observed_at: Instant::now(),
+        };
+        let decision = desired_state(
+            &runtime,
+            HaState::Standby,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            true,
+        );
+
+        assert_eq!(decision.state, HaState::Standby);
+        assert_eq!(decision.reason, HaDecisionReason::PeerBecameActiveConflict);
+
+        Ok(())
+    }
+
+    #[test]
+    fn equal_priority_preempt_uses_node_id_tiebreak_reason() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-b
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 10.0.0.2:9375
+  protocol_version: 1
+  priority: 100
+  preempt: true
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: none
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let peer = PeerObservation {
+            node_id: "node-a".to_owned(),
+            state: HaState::Active,
+            priority: 100,
+            became_active: false,
+            observed_at: Instant::now(),
+        };
+        let decision = desired_state(
+            &runtime,
+            HaState::Standby,
+            Some(&peer),
+            Instant::now(),
+            Instant::now(),
+            false,
+        );
+
+        assert_eq!(decision.state, HaState::Active);
+        assert_eq!(decision.reason, HaDecisionReason::PreemptNodeIdTiebreak);
 
         Ok(())
     }
@@ -1391,7 +2098,7 @@ ha:
     fn rejects_truncated_packet() -> Result<()> {
         let packet = HaPacket {
             protocol_version: 1,
-            state: HaState::Backup,
+            state: HaState::Standby,
             priority: 100,
             dead_factor: 3,
             advert_interval_ms: 1_000,
@@ -1436,7 +2143,7 @@ ha:
         )?;
 
         let runtime = HaRuntimeConfig::try_from(&config)?;
-        let mut packet = build_packet(&runtime, HaState::Master, 7)?;
+        let mut packet = build_packet(&runtime, HaState::Active, 7)?;
         packet.node_id = "peer-a".to_owned();
         packet.auth_tag = vec![0, 1, 2, 3];
 
@@ -1455,5 +2162,63 @@ ha:
         assert!(peer_observation.is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn rejects_packet_with_duplicate_node_id() -> Result<()> {
+        let config = Config::from_yaml_str(
+            r"
+mode: ha
+node:
+  id: node-a
+ha:
+  interface: eth0
+  group_id: cluster-ha
+  addresses:
+    - 10.0.0.10/24
+  peer: 127.0.0.1:9375
+  protocol_version: 1
+  priority: 100
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  auth:
+    mode: shared_key
+    key: shared-secret
+",
+        )?;
+
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let packet = build_packet(&runtime, HaState::Active, 7)?;
+
+        let mut peer_observation = None;
+        let result = handle_incoming_packet(
+            &runtime,
+            &packet.encode()?,
+            "127.0.0.1:9375".parse()?,
+            Instant::now(),
+            &mut peer_observation,
+        );
+
+        let Err(error) = result else {
+            anyhow::bail!("duplicate node.id packet should be rejected");
+        };
+        assert!(is_duplicate_node_id_failure(&error));
+        assert!(peer_observation.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_permission_denied_send_failure_as_transient() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        assert!(is_transient_send_failure(&error));
+    }
+
+    #[test]
+    fn does_not_classify_invalid_input_as_transient_send_failure() {
+        let error = std::io::Error::from(std::io::ErrorKind::InvalidInput).into();
+        assert!(!is_transient_send_failure(&error));
     }
 }

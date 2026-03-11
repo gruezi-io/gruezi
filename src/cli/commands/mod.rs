@@ -51,7 +51,8 @@ pub fn new() -> Command {
                      -vvv  = TRACE level\n\n\
                      Note: Verbose output is sent to stderr via the RUST_LOG environment variable.",
                 )
-                .action(ArgAction::Count),
+                .action(ArgAction::Count)
+                .global(true),
         )
         .subcommand(start_command())
         .subcommand(status_command())

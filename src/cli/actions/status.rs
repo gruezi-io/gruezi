@@ -99,6 +99,21 @@ fn snapshot_lines(status: &gruezi::status::StatusResponse) -> Vec<String> {
         lines.push(format!("  Packets Received: {}", ha.packets_received));
         lines.push(format!("  Invalid Packets: {}", ha.invalid_packets));
         lines.push(format!("  Auth Failures: {}", ha.auth_failures));
+        lines.push(format!(
+            "  Duplicate Node ID Packets: {}",
+            ha.duplicate_node_id_packets
+        ));
+        lines.push(format!("  Decision Reason: {}", ha.decision_reason));
+        lines.push(format!(
+            "  Last Transition Reason: {}",
+            ha.last_transition_reason
+                .map_or_else(|| "unknown".to_owned(), |reason| reason.to_string())
+        ));
+        lines.push(format!(
+            "  Last Transition: {}",
+            ha.last_transition_ms_ago
+                .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"))
+        ));
     }
 
     lines
@@ -115,9 +130,12 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
             .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"));
 
         format!(
-            "[{timestamp}] node={} state={:?} peer_alive={} peer_node={} peer_state={} seq={} sent={} recv={} invalid={} auth_failures={} last_peer_seen={}",
+            "[{timestamp}] node={} state={:?} reason={} last_transition_reason={} peer_alive={} peer_node={} peer_state={} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
             ha.node_id,
             ha.state,
+            ha.decision_reason,
+            ha.last_transition_reason
+                .map_or_else(|| "unknown".to_owned(), |reason| reason.to_string()),
             ha.peer_alive,
             peer_node_id,
             peer_state,
@@ -126,7 +144,10 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
             ha.packets_received,
             ha.invalid_packets,
             ha.auth_failures,
-            last_peer_seen
+            ha.duplicate_node_id_packets,
+            last_peer_seen,
+            ha.last_transition_ms_ago
+                .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"))
         )
     } else {
         format!("[{timestamp}] mode={}", status.mode)
@@ -136,7 +157,7 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
 #[cfg(test)]
 mod tests {
     use super::{format_watch_line, snapshot_lines};
-    use crate::gruezi::ha::{HaState, HaStatus};
+    use crate::gruezi::ha::{HaDecisionReason, HaState, HaStatus};
     use crate::gruezi::status::StatusResponse;
 
     fn sample_status() -> StatusResponse {
@@ -145,20 +166,24 @@ mod tests {
             group_id: "lab-ha".to_owned(),
             bind: "0.0.0.0:9375".to_owned(),
             peer: "192.0.2.11:9375".to_owned(),
-            state: HaState::Master,
+            state: HaState::Active,
             priority: 150,
             advert_interval_ms: 1_000,
             dead_timeout_ms: 3_000,
             hold_down_ms: 3_000,
             sequence: 42,
             peer_node_id: Some("gruezi-b".to_owned()),
-            peer_state: Some(HaState::Backup),
+            peer_state: Some(HaState::Standby),
             peer_alive: true,
             last_peer_seen_ms_ago: Some(17),
             packets_sent: 42,
             packets_received: 41,
             invalid_packets: 1,
             auth_failures: 0,
+            duplicate_node_id_packets: 0,
+            decision_reason: HaDecisionReason::PeerTimeout,
+            last_transition_reason: Some(HaDecisionReason::LocalHigherPriority),
+            last_transition_ms_ago: Some(250),
         })
     }
 
@@ -170,6 +195,9 @@ mod tests {
         assert!(output.contains("Dead Timeout: 3000ms"));
         assert!(output.contains("Last Peer Seen: 17ms"));
         assert!(output.contains("Packets Received: 41"));
+        assert!(output.contains("Duplicate Node ID Packets: 0"));
+        assert!(output.contains("Decision Reason: peer_timeout"));
+        assert!(output.contains("Last Transition Reason: local_higher_priority"));
     }
 
     #[test]
@@ -177,8 +205,11 @@ mod tests {
         let line = format_watch_line("2026-03-10T12:00:00+01:00", &sample_status());
         assert!(line.contains("[2026-03-10T12:00:00+01:00]"));
         assert!(line.contains("node=gruezi-a"));
-        assert!(line.contains("state=Master"));
+        assert!(line.contains("state=Active"));
+        assert!(line.contains("reason=peer_timeout"));
         assert!(line.contains("recv=41"));
+        assert!(line.contains("duplicate_node_id_packets=0"));
         assert!(line.contains("last_peer_seen=17ms"));
+        assert!(line.contains("last_transition=250ms"));
     }
 }

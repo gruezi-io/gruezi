@@ -22,6 +22,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 ```
 
+For Linux HA failure-injection coverage:
+
+```bash
+cargo build --release --locked
+sudo ./scripts/test-ha-netem.sh all
+```
+
 There is also a `just`-based workflow:
 
 ```bash
@@ -106,6 +113,21 @@ For local container-based HA testing, use:
 ```bash
 just test-ha
 ```
+
+For Linux namespace and `tc netem` impairment testing, use:
+
+```bash
+sudo ./scripts/test-ha-netem.sh all
+```
+
+This covers delay, asymmetric loss, full partition, and heal-after-partition behavior.
+
+When changing HA election or failover behavior, also compare the resulting operator behavior to the keepalived guidance in [README.md](README.md):
+
+* match priority and advertisement timing as closely as practical
+* verify `preempt: false` against keepalived `nopreempt`
+* compare takeover and failback outcomes, not packet formats
+* document intentional differences, especially around asymmetric loss handling
 
 ## Packaging and deployment
 

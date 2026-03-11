@@ -1,4 +1,7 @@
-use crate::gruezi::hooks::{HaHooks, HookContext, HookEvent};
+use crate::gruezi::{
+    ha::HaDecisionReason,
+    hooks::{HaHooks, HookContext, HookEvent},
+};
 use anyhow::{Context, Result, bail};
 use std::net::IpAddr;
 use tokio::process::Command;
@@ -63,10 +66,11 @@ pub fn spawn_address_action(
     tokio::spawn(async move {
         if let Err(error) = manager.apply(action).await {
             warn!(%error, action = action.ip_subcommand(), "HA address action failed");
-            if let Some((hooks, context)) = fault_hook
-                && let Err(hook_error) = hooks.run(HookEvent::Fault, context).await
-            {
-                warn!(%hook_error, "HA fault hook execution failed after address action failure");
+            if let Some((hooks, mut context)) = fault_hook {
+                context.reason = Some(HaDecisionReason::AddressActionFailed);
+                if let Err(hook_error) = hooks.run(HookEvent::Fault, context).await {
+                    warn!(%hook_error, "HA fault hook execution failed after address action failure");
+                }
             }
         }
     });

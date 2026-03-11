@@ -226,7 +226,9 @@ impl Default for HaConfig {
             group_id: String::new(),
             protocol_version: 1,
             priority: 100,
-            preempt: true,
+            // Prefer stable failover over automatic failback for application VIPs.
+            // This avoids a second VIP move when the original preferred node recovers.
+            preempt: false,
             advert_interval_ms: 1_000,
             dead_factor: 3,
             hold_down_ms: 3_000,
@@ -446,5 +448,11 @@ kv:
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn ha_defaults_disable_preemption() {
+        let defaults = super::HaConfig::default();
+        assert!(!defaults.preempt);
     }
 }

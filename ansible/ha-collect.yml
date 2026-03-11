@@ -1,0 +1,119 @@
+---
+- name: Collect HA lab status and log artifacts
+  hosts: '{{ gruezi_collect_hosts | default("gruezi_ha_lab") }}'
+  gather_facts: false
+  become: true
+  vars:
+    gruezi_remote_dir_resolved: "{{ gruezi_remote_dir | default('/home/' ~ ansible_user ~ '/gruezi-lab') }}"
+    gruezi_log_path: '{{ gruezi_remote_dir_resolved }}/gruezi.log'
+    gruezi_collect_log_lines: 200
+    gruezi_artifact_root: '{{ playbook_dir }}/artifacts'
+    gruezi_artifact_label: '{{ lookup("pipe", "date -u +%Y%m%dT%H%M%SZ") }}'
+    gruezi_artifact_dir: '{{ gruezi_artifact_root }}/{{ gruezi_artifact_label }}'
+  pre_tasks:
+    - name: Validate HA interface variable
+      ansible.builtin.assert:
+        that:
+          - gruezi_interface is defined
+          - gruezi_interface | trim | length > 0
+        fail_msg: gruezi_interface must be defined in the HA lab inventory or group vars
+
+    - name: Validate log line count
+      ansible.builtin.assert:
+        that:
+          - gruezi_collect_log_lines | int > 0
+        fail_msg: gruezi_collect_log_lines must be greater than 0
+
+    - name: Create local artifact directory
+      ansible.builtin.file:
+        path: '{{ gruezi_artifact_dir }}'
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+  tasks:
+    - name: Fetch HA status JSON
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -fsS
+          - http://127.0.0.1:9376/status
+      register: gruezi_status
+      changed_when: false
+
+    - name: Read current qdisc state
+      ansible.builtin.command:
+        argv:
+          - tc
+          - qdisc
+          - show
+          - dev
+          - '{{ gruezi_interface }}'
+      register: gruezi_qdisc
+      failed_when: false
+      changed_when: false
+
+    - name: Read current VIP interface state
+      ansible.builtin.command:
+        argv:
+          - ip
+          - address
+          - show
+          - dev
+          - '{{ gruezi_interface }}'
+      register: gruezi_ip_addr
+      failed_when: false
+      changed_when: false
+
+    - name: Read recent gruezi log lines
+      ansible.builtin.command:
+        argv:
+          - tail
+          - -n
+          - '{{ gruezi_collect_log_lines | string }}'
+          - '{{ gruezi_log_path }}'
+      register: gruezi_log_tail
+      failed_when: false
+      changed_when: false
+
+    - name: Store HA status JSON locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-status.json'
+        content: |
+          {{ gruezi_status.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Store qdisc snapshot locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-qdisc.txt'
+        content: |
+          {{ gruezi_qdisc.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Store interface snapshot locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-ip-address.txt'
+        content: |
+          {{ gruezi_ip_addr.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Store recent log lines locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-gruezi.log.tail'
+        content: |
+          {{ gruezi_log_tail.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Show artifact location
+      ansible.builtin.debug:
+        msg: '{{ inventory_hostname }} artifacts -> {{ gruezi_artifact_dir }}'

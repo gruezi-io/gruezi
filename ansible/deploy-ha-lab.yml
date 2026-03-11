@@ -140,7 +140,7 @@
     - name: Start gruezi in the background
       listen: restart gruezi
       ansible.builtin.shell: |
-        nohup {{ gruezi_binary_path }} start --config {{ gruezi_config_path }} >{{ gruezi_log_path }} 2>&1 </dev/null &
+        nohup {{ gruezi_binary_path }} start --config {{ gruezi_config_path }} -v >{{ gruezi_log_path }} 2>&1 </dev/null &
       args:
         executable: /bin/bash
 

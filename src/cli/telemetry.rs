@@ -168,7 +168,7 @@ pub fn init(verbosity_level: Option<Level>) -> Result<()> {
         .with_thread_ids(false)
         .with_thread_names(false)
         .with_target(false)
-        .pretty();
+        .with_ansi(false);
 
     let filter = EnvFilter::builder()
         .with_default_directive(verbosity_level.into())

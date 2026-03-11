@@ -10,7 +10,7 @@ ha:
   peer: 10.0.0.2:9375
   protocol_version: 1
   priority: 100
-  preempt: true
+  preempt: false
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000

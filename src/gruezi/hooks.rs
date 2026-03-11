@@ -1,4 +1,4 @@
-use crate::gruezi::ha::HaState;
+use crate::gruezi::ha::{HaDecisionReason, HaState};
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
 use tokio::{process::Command, time::timeout};
@@ -52,8 +52,12 @@ pub struct HookContext {
     pub interface: String,
     pub state: HaState,
     pub previous_state: HaState,
+    pub reason: Option<HaDecisionReason>,
+    pub priority: u8,
     pub peer_id: Option<String>,
     pub peer_state: Option<HaState>,
+    pub peer_priority: Option<u8>,
+    pub last_peer_seen_ms_ago: Option<u64>,
 }
 
 impl HaHooks {
@@ -114,6 +118,7 @@ fn hook_command(script: &str, event: HookEvent, context: &HookContext) -> Comman
         .env("GRUEZI_NODE_ID", &context.node_id)
         .env("GRUEZI_GROUP_ID", &context.group_id)
         .env("GRUEZI_INTERFACE", &context.interface)
+        .env("GRUEZI_PRIORITY", context.priority.to_string())
         .env(
             "GRUEZI_STATE",
             format!("{:?}", context.state).to_ascii_uppercase(),
@@ -123,6 +128,10 @@ fn hook_command(script: &str, event: HookEvent, context: &HookContext) -> Comman
             format!("{:?}", context.previous_state).to_ascii_uppercase(),
         );
 
+    if let Some(reason) = context.reason {
+        command.env("GRUEZI_REASON", reason.as_str().to_ascii_uppercase());
+    }
+
     if let Some(peer_id) = &context.peer_id {
         command.env("GRUEZI_PEER_ID", peer_id);
     }
@@ -131,6 +140,17 @@ fn hook_command(script: &str, event: HookEvent, context: &HookContext) -> Comman
         command.env(
             "GRUEZI_PEER_STATE",
             format!("{peer_state:?}").to_ascii_uppercase(),
+        );
+    }
+
+    if let Some(peer_priority) = context.peer_priority {
+        command.env("GRUEZI_PEER_PRIORITY", peer_priority.to_string());
+    }
+
+    if let Some(last_peer_seen_ms_ago) = context.last_peer_seen_ms_ago {
+        command.env(
+            "GRUEZI_LAST_PEER_SEEN_MS",
+            last_peer_seen_ms_ago.to_string(),
         );
     }
 

@@ -1,0 +1,104 @@
+---
+- name: Apply or clear HA UDP packet drop on gruezi lab hosts
+  hosts: '{{ gruezi_drop_hosts | default("gruezi_ha_lab") }}'
+  gather_facts: false
+  become: true
+  vars:
+    gruezi_drop_state: present
+    gruezi_ha_peer_port: 9375
+    gruezi_drop_comment: gruezi-ha-drop
+  pre_tasks:
+    - name: Validate drop state
+      ansible.builtin.assert:
+        that:
+          - gruezi_drop_state in ['present', 'absent']
+        fail_msg: gruezi_drop_state must be 'present' or 'absent'
+
+    - name: Validate peer IP variable
+      ansible.builtin.assert:
+        that:
+          - gruezi_peer_ip is defined
+          - gruezi_peer_ip | trim | length > 0
+        fail_msg: gruezi_peer_ip must be defined for each HA lab host
+
+  tasks:
+    - name: Apply HA UDP drop rule
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/iptables
+          - -C
+          - OUTPUT
+          - -p
+          - udp
+          - -d
+          - '{{ gruezi_peer_ip }}'
+          - --dport
+          - '{{ gruezi_ha_peer_port | string }}'
+          - -m
+          - comment
+          - --comment
+          - '{{ gruezi_drop_comment }}'
+          - -j
+          - DROP
+      register: gruezi_drop_rule_check
+      failed_when: false
+      changed_when: false
+      when: gruezi_drop_state == 'present'
+
+    - name: Insert HA UDP drop rule
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/iptables
+          - -I
+          - OUTPUT
+          - -p
+          - udp
+          - -d
+          - '{{ gruezi_peer_ip }}'
+          - --dport
+          - '{{ gruezi_ha_peer_port | string }}'
+          - -m
+          - comment
+          - --comment
+          - '{{ gruezi_drop_comment }}'
+          - -j
+          - DROP
+      when:
+        - gruezi_drop_state == 'present'
+        - gruezi_drop_rule_check.rc != 0
+      changed_when: true
+
+    - name: Remove HA UDP drop rule
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/iptables
+          - -D
+          - OUTPUT
+          - -p
+          - udp
+          - -d
+          - '{{ gruezi_peer_ip }}'
+          - --dport
+          - '{{ gruezi_ha_peer_port | string }}'
+          - -m
+          - comment
+          - --comment
+          - '{{ gruezi_drop_comment }}'
+          - -j
+          - DROP
+      register: gruezi_drop_rule_remove
+      failed_when: false
+      changed_when: gruezi_drop_rule_remove.rc == 0
+      when: gruezi_drop_state == 'absent'
+
+    - name: Show matching iptables rules
+      ansible.builtin.shell: |
+        /usr/sbin/iptables -S OUTPUT | grep '{{ gruezi_drop_comment }}' || true
+      args:
+        executable: /bin/bash
+      register: gruezi_drop_rules
+      changed_when: false
+
+    - name: Display matching iptables rules
+      ansible.builtin.debug:
+        msg: '{{ inventory_hostname }} drop rules -> {{ gruezi_drop_rules.stdout | default("none") }}'

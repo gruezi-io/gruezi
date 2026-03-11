@@ -198,11 +198,11 @@ async fn master_adds_and_backup_removes_addresses() -> Result<()> {
     let (mut status_b, shutdown_b, task_b) = spawn_node(runtime_b);
 
     wait_for_status(&mut status_a, "node-a master state", |status| {
-        status.state == HaState::Master && status.peer_alive
+        status.state == HaState::Active && status.peer_alive
     })
     .await?;
     wait_for_status(&mut status_b, "node-b backup state", |status| {
-        status.state == HaState::Backup && status.peer_alive
+        status.state == HaState::Standby && status.peer_alive
     })
     .await?;
 
@@ -244,7 +244,7 @@ async fn shutdown_removes_master_addresses() -> Result<()> {
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
 
     wait_for_status(&mut status_a, "node-a standalone master state", |status| {
-        status.state == HaState::Master && !status.peer_alive
+        status.state == HaState::Active && !status.peer_alive
     })
     .await?;
 
@@ -291,7 +291,7 @@ async fn demotion_removes_addresses_after_preemption() -> Result<()> {
 
     let (mut status_b, shutdown_b, task_b) = spawn_node(runtime_b);
     wait_for_status(&mut status_b, "node-b standalone master state", |status| {
-        status.state == HaState::Master && !status.peer_alive
+        status.state == HaState::Active && !status.peer_alive
     })
     .await?;
 
@@ -310,11 +310,11 @@ async fn demotion_removes_addresses_after_preemption() -> Result<()> {
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
 
     wait_for_status(&mut status_a, "node-a master after preemption", |status| {
-        status.state == HaState::Master && status.peer_alive
+        status.state == HaState::Active && status.peer_alive
     })
     .await?;
     wait_for_status(&mut status_b, "node-b backup after demotion", |status| {
-        status.state == HaState::Backup && status.peer_alive
+        status.state == HaState::Standby && status.peer_alive
     })
     .await?;
 

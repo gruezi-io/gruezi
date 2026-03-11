@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 500">
+  <g transform="translate(0, 0)">
+    <path
+      d="M 90 50
+         C 60 50 40 70 40 100
+         L 40 350
+         C 40 380 60 400 90 400
+         L 120 400
+         L 120 470
+         L 190 400
+         L 410 400
+         C 440 400 460 380 460 350
+         L 460 100
+         C 460 70 440 50 410 50
+         Z"
+      fill="#3A8A94"
+    />
+    <circle cx="170" cy="180" r="25" fill="#FFFFFF" />
+    <circle cx="250" cy="180" r="25" fill="#FFFFFF" />
+    <circle cx="330" cy="180" r="25" fill="#FFFFFF" />
+    <path
+      d="M 150 270
+         Q 250 380 350 270"
+      fill="none"
+      stroke="#FFFFFF"
+      stroke-width="35"
+      stroke-linecap="round"
+    />
+  </g>
+  <text
+    x="500"
+    y="325"
+    font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+    font-size="240"
+    font-weight="800"
+    fill="#1E293B"
+    letter-spacing="-5"
+  >
+    Gruezi
+  </text>
+</svg>

@@ -3,7 +3,7 @@ use crate::{
     gruezi::{ha::HaStatus, net::bind_tcp_listener, status::StatusResponse},
 };
 use anyhow::Result;
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, http::Uri, routing::get};
 use std::future::Future;
 use tokio::sync::watch;
 use tracing::info;
@@ -29,7 +29,7 @@ where
 {
     let (listener, bind) = bind_tcp_listener(DEFAULT_API_PORT, None).await?;
     let app = Router::new()
-        .route("/healthz", get(healthz))
+        .route("/health", get(health))
         .route("/status", get(ha_status))
         .route("/ha/status", get(ha_status))
         .with_state(ApiState { status_tx });
@@ -43,10 +43,19 @@ where
     Ok(())
 }
 
-async fn healthz() -> Json<HealthResponse> {
+async fn health(uri: Uri) -> Json<HealthResponse> {
+    info!(path = %uri.path(), "served HA API health request");
     Json(HealthResponse { status: "ok" })
 }
 
-async fn ha_status(State(state): State<ApiState>) -> Json<StatusResponse> {
-    Json(StatusResponse::ha(state.status_tx.borrow().clone()))
+async fn ha_status(State(state): State<ApiState>, uri: Uri) -> Json<StatusResponse> {
+    let status = state.status_tx.borrow().clone();
+    info!(
+        path = %uri.path(),
+        node_id = %status.node_id,
+        state = ?status.state,
+        "served HA API status request"
+    );
+
+    Json(StatusResponse::ha(status))
 }

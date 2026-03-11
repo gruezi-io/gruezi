@@ -119,7 +119,7 @@ fn temp_dir(name: &str) -> Result<PathBuf> {
 fn write_hook_script(dir: &Path, name: &str, output_path: &Path) -> Result<String> {
     let script_path = dir.join(format!("{name}.sh"));
     let script = format!(
-        "#!/usr/bin/env bash\nset -eu\nprintf '%s|%s|%s|%s|%s\\n' \"${{GRUEZI_EVENT}}\" \"${{GRUEZI_STATE}}\" \"${{GRUEZI_PREVIOUS_STATE}}\" \"${{GRUEZI_PEER_ID:-}}\" \"${{GRUEZI_PEER_STATE:-}}\" >> \"{}\"\n",
+        "#!/usr/bin/env bash\nset -eu\nprintf '%s|%s|%s|%s|%s|%s|%s|%s\\n' \"${{GRUEZI_EVENT}}\" \"${{GRUEZI_STATE}}\" \"${{GRUEZI_PREVIOUS_STATE}}\" \"${{GRUEZI_REASON:-}}\" \"${{GRUEZI_PRIORITY}}\" \"${{GRUEZI_PEER_ID:-}}\" \"${{GRUEZI_PEER_STATE:-}}\" \"${{GRUEZI_PEER_PRIORITY:-}}\" >> \"{}\"\n",
         output_path.display()
     );
     fs::write(&script_path, script)?;
@@ -202,19 +202,22 @@ async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
     let (mut status_b, shutdown_b, task_b) = spawn_node(runtime_b);
 
     wait_for_status(&mut status_a, "node-a master state", |status| {
-        status.state == HaState::Master && status.peer_alive
+        status.state == HaState::Active && status.peer_alive
     })
     .await?;
     wait_for_status(&mut status_b, "node-b backup state", |status| {
-        status.state == HaState::Backup
+        status.state == HaState::Standby
     })
     .await?;
 
     let promote_line = wait_for_hook_line(&promote_output, "promote hook output").await?;
     let backup_line = wait_for_hook_line(&backup_output, "backup hook output").await?;
 
-    assert!(promote_line.starts_with("promote|MASTER|BACKUP|node-b|BACKUP"));
-    assert!(backup_line.starts_with("backup|BACKUP|INIT|"));
+    assert!(
+        promote_line
+            .starts_with("promote|ACTIVE|STANDBY|LOCAL_HIGHER_PRIORITY|110|node-b|STANDBY|100")
+    );
+    assert!(backup_line.starts_with("backup|STANDBY|INIT|STARTUP_HOLD|100|||"));
 
     stop_node(shutdown_a, task_a).await?;
     stop_node(shutdown_b, task_b).await?;
@@ -244,7 +247,7 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
 
     let (mut status_b, shutdown_b, task_b) = spawn_node(runtime_b);
     wait_for_status(&mut status_b, "node-b standalone master state", |status| {
-        status.state == HaState::Master && !status.peer_alive
+        status.state == HaState::Active && !status.peer_alive
     })
     .await?;
 
@@ -252,16 +255,18 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
 
     wait_for_status(&mut status_a, "node-a master after preemption", |status| {
-        status.state == HaState::Master && status.peer_alive
+        status.state == HaState::Active && status.peer_alive
     })
     .await?;
     wait_for_status(&mut status_b, "node-b backup after demotion", |status| {
-        status.state == HaState::Backup && status.peer_alive
+        status.state == HaState::Standby && status.peer_alive
     })
     .await?;
 
     let demote_line = wait_for_hook_line(&demote_output, "demote hook output").await?;
-    assert!(demote_line.starts_with("demote|BACKUP|MASTER|node-a|MASTER"));
+    assert!(
+        demote_line.starts_with("demote|STANDBY|ACTIVE|PEER_HIGHER_PRIORITY|100|node-a|ACTIVE|110")
+    );
 
     stop_node(shutdown_a, task_a).await?;
     stop_node(shutdown_b, task_b).await?;
@@ -291,13 +296,13 @@ async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
 
     wait_for_status(&mut status_a, "node-a standalone master state", |status| {
-        status.state == HaState::Master && !status.peer_alive
+        status.state == HaState::Active && !status.peer_alive
     })
     .await?;
 
     let fault_contents = wait_for_hook_contents(&fault_output, 2, "fault hook output").await?;
-    assert!(fault_contents.contains("fault|BACKUP|INIT||"));
-    assert!(fault_contents.contains("fault|MASTER|BACKUP||"));
+    assert!(fault_contents.contains("fault|STANDBY|INIT|ADDRESS_ACTION_FAILED|110|||"));
+    assert!(fault_contents.contains("fault|ACTIVE|STANDBY|ADDRESS_ACTION_FAILED|110|||"));
 
     stop_node(shutdown_a, task_a).await?;
     fs::remove_dir_all(dir)?;
