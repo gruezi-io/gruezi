@@ -22,7 +22,7 @@ flycheck*.rs
 .cursor/
 .idea/
 .vscode/
-.codexrc
+.codex
 
 # Local Ansible lab data
 ansible/inventory/lab.yml
