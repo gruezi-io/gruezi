@@ -1329,7 +1329,7 @@ fn bind_ha_socket(bind: &str) -> Result<(UdpSocket, String)> {
 
     if bind_addr.ip().is_unspecified()
         && bind_addr.is_ipv4()
-        && let Ok(socket) = bind_udp_socket(
+        && let Ok(socket) = bind_udp_socket_with_retry(
             Domain::IPV6,
             std::net::SocketAddr::from(([0_u16; 8], bind_addr.port())),
             Some(false),
@@ -1345,10 +1345,44 @@ fn bind_ha_socket(bind: &str) -> Result<(UdpSocket, String)> {
         Domain::IPV4
     };
     let only_v6 = bind_addr.is_ipv6().then_some(true);
-    let socket = bind_udp_socket(domain, bind_addr, only_v6)?;
+    let socket = bind_udp_socket_with_retry(domain, bind_addr, only_v6)?;
     let display = format_socket_addr(socket.local_addr()?);
 
     Ok((socket, display))
+}
+
+/// Bind the HA UDP socket, retrying briefly on a transient `AddressInUse`.
+///
+/// On Linux, binding a loopback UDP port that was very recently released can
+/// momentarily fail with `EADDRINUSE` even though `ss` shows no socket holding it
+/// (observed under rapid rebind — a quick daemon restart, or parallel test churn).
+/// The port is genuinely free, so a few short retries reliably succeed; a port that
+/// is actually occupied still fails once the bounded window is exhausted.
+fn bind_udp_socket_with_retry(
+    domain: Domain,
+    socket_addr: std::net::SocketAddr,
+    only_v6: Option<bool>,
+) -> Result<UdpSocket> {
+    const MAX_ATTEMPTS: u32 = 20;
+    const BACKOFF: Duration = Duration::from_millis(25);
+
+    let mut attempt: u32 = 0;
+    loop {
+        match bind_udp_socket(domain, socket_addr, only_v6) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => {
+                attempt += 1;
+                let transient = error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|io| io.kind() == std::io::ErrorKind::AddrInUse);
+                if !transient || attempt >= MAX_ATTEMPTS {
+                    return Err(error);
+                }
+                std::thread::sleep(BACKOFF);
+            }
+        }
+    }
 }
 
 fn bind_udp_socket(
