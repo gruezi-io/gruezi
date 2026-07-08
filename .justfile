@@ -303,6 +303,14 @@ t-deploy message="CI test": check-develop check-clean test
     echo "   git push origin :refs/tags/${tag} && git tag -d ${tag}"
 
 
+# On-demand Jaeger for the devcontainer (compose "observability" profile)
+obs-dev:
+  {{root}}/scripts/obs-dev up
+
+# Stop the on-demand devcontainer Jaeger
+obs-dev-stop:
+  {{root}}/scripts/obs-dev down
+
 jaeger:
   podman run --rm -d --name jaeger \
     -e COLLECTOR_OTLP_ENABLED=true \

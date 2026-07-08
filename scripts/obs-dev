@@ -1,0 +1,64 @@
+#!/usr/bin/env sh
+set -eu
+
+# On-demand Jaeger (OTLP tracing backend) for the running gruezi devcontainer.
+#
+# Jaeger lives in .devcontainer/compose.yaml behind the "observability" profile, so
+# a plain `devpod up` (app only) stays lean. This script attaches it to the SAME
+# compose network DevPod created, so the app reaches the collector by service name
+# (jaeger:4317) with no host networking — identical on macOS / Linux / Atomic.
+#
+# After starting it, point gruezi at the collector and run it so it exports spans:
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+#   cargo run -- start --config examples/ha-node-a.yaml
+# The Jaeger UI is published to the host at http://localhost:16686.
+#
+# Usage: scripts/obs-dev [up|down]
+
+action="${1:-up}"
+
+cmd="${GRUEZI_CONTAINER_CMD:-}"
+if [ -z "$cmd" ]; then
+    if command -v podman >/dev/null 2>&1; then
+        cmd=podman
+    else
+        cmd=docker
+    fi
+fi
+
+project_dir="$(
+    unset CDPATH
+    cd -- "$(dirname -- "$0")/.." && pwd
+)"
+compose_file="$project_dir/.devcontainer/compose.yaml"
+
+# DevPod overrides the compose `name:` with its own project, so discover the real
+# project name from the running `app` container (named <project>-app-1).
+app_ctr="$("$cmd" ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-app-1$' | head -1 || true)"
+if [ -z "$app_ctr" ]; then
+    echo "Error: devcontainer 'app' container not running." >&2
+    echo "Start the workspace first:  ./scripts/dev-up" >&2
+    exit 1
+fi
+project="${app_ctr%-app-1}"
+
+case "$action" in
+up)
+    echo "Using compose project: $project"
+    "$cmd" compose -p "$project" -f "$compose_file" --profile observability up -d jaeger
+    echo ""
+    echo "  Jaeger UI: http://localhost:16686"
+    echo ""
+    echo "  Point gruezi at the collector inside the app container and run it:"
+    echo "    export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317"
+    echo "    cargo run -- start --config examples/ha-node-a.yaml"
+    ;;
+down | stop)
+    echo "Using compose project: $project"
+    "$cmd" compose -p "$project" -f "$compose_file" --profile observability stop jaeger
+    ;;
+*)
+    echo "usage: $0 [up|down]" >&2
+    exit 1
+    ;;
+esac

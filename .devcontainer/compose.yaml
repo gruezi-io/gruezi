@@ -1,0 +1,118 @@
+# Compose-based devcontainer for gruezi.
+#
+# A single compose project defines the dev container (`app`) and an optional
+# tracing sibling (`jaeger`, behind the "observability" profile). DevPod
+# (devcontainer.json -> dockerComposeFile) brings the app up and execs into it, so
+# the environment is fully self-contained. The default devcontainer is tuned for a
+# local rootless podman/docker host; use devcontainer.portable.json for remote
+# providers that cannot apply the local podman/1Password overrides.
+#
+# gruezi's core workflow (`just test` = clippy + fmt + cargo test) needs no external
+# service. The HA integration workflow (`just test-ha`) spins up multiple gruezi
+# nodes via `podman` from inside the justfile. To make that work *inside* the dev
+# container, `app` runs a nested podman: it is marked `privileged` so the inner,
+# ROOTFUL podman can build the local image and create the bridge network + static
+# IPs the HA lab needs. (Rootless-in-rootless is impossible on a rootless host — the
+# host-podman -> app -> inner userns nesting breaks `newuidmap` — so postcreate.sh
+# installs a `podman -> sudo podman` shim.) Because the inner podman shares the app
+# container's filesystem, the justfile's `{{root}}/examples/*.yaml` bind mounts
+# resolve natively — no host path matching or socket forwarding needed.
+#
+# Trust boundary: local/dev only. The nested podman runs in a privileged container;
+# never reuse this stack outside a disposable dev machine.
+
+name: gruezi
+
+networks:
+  gruezi:
+    driver: bridge
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  rustup:
+  mise-data:
+  mise-cache:
+  # Persist the nested (rootful) podman's image/container storage so `just
+  # build-image` and `just test-ha` don't re-pull/re-build base layers on every
+  # container recreate. Mounted at /var/lib/containers (the rootful store).
+  containers-storage:
+  # Persist Neovim plugins / treesitter / state across rebuilds so a recreate does
+  # not re-download everything (the config itself comes from the chezmoi dotfiles).
+  nvim-data:
+  nvim-state:
+  nvim-cache:
+
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/rust:trixie
+    init: true
+    user: vscode
+    # Nested podman (podman-in-podman) for `just test-ha`. `privileged` lets the
+    # inner ROOTFUL podman use overlay storage and stand up the HA bridge network
+    # with static IPs. /dev/fuse is harmless/handy but not required for rootful.
+    privileged: true
+    devices:
+      - /dev/fuse
+    # Disable SELinux labeling for bind mounts (clean on fedora-atomic / rootless
+    # podman) instead of per-mount :Z.
+    security_opt:
+      - label=disable
+    # Keep the dev container alive; DevPod execs in and runs lifecycle hooks.
+    command: sleep infinity
+    environment:
+      DEVPOD: "true"
+      DEVPOD_WORKSPACE_ID: gruezi
+      EDITOR: nvim
+      VISUAL: nvim
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      CARGO_HOME: /home/vscode/.cargo
+      MISE_DATA_DIR: /home/vscode/.local/share/mise
+      MISE_CACHE_DIR: /home/vscode/.cache/mise
+      MISE_CONFIG_DIR: /home/vscode/.config/mise
+      MISE_CONFIG_FILE: /workspaces/gruezi/mise.toml
+      # gruezi's Containerfile does `COPY target/debug/gruezi`, and `just build-image`
+      # runs a plain `cargo build`. Keep the default target dir (inside the workspace)
+      # so the build context always contains target/debug/gruezi — do NOT redirect
+      # CARGO_TARGET_DIR here or `just build-image`/`just test-ha` would break.
+    volumes:
+      - ..:/workspaces/gruezi
+      - cargo-registry:/home/vscode/.cargo/registry
+      - cargo-git:/home/vscode/.cargo/git
+      - rustup:/home/vscode/.rustup
+      - mise-data:/home/vscode/.local/share/mise
+      - mise-cache:/home/vscode/.cache/mise
+      - containers-storage:/var/lib/containers
+      - nvim-data:/home/vscode/.local/share/nvim
+      - nvim-state:/home/vscode/.local/state/nvim
+      - nvim-cache:/home/vscode/.cache/nvim
+    networks:
+      gruezi:
+        aliases:
+          - app
+
+  # ---------------------------------------------------------------------------
+  # Optional tracing backend (Jaeger, OTLP) for telemetry work. On-demand: gated
+  # behind the "observability" profile, so a plain `devpod up` (app only) stays
+  # lean. Bring it up with:
+  #   just obs-dev
+  #   # or: <podman|docker> compose -f .devcontainer/compose.yaml --profile observability up -d
+  # Then point the app at it and run gruezi so it exports spans:
+  #   export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+  #   cargo run -- start --config examples/ha-node-a.yaml
+  # Jaeger UI is published to the host at http://localhost:16686.
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: docker.io/jaegertracing/all-in-one:latest
+    profiles: ["observability"]
+    security_opt:
+      - label=disable
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - gruezi

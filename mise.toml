@@ -1,0 +1,44 @@
+# mise toolchain for gruezi. Primarily used by the devcontainer
+# (.devcontainer/postcreate.sh runs `mise install`), but works on any host too:
+#
+#   mise install            # install the tools below
+#
+# Host users who don't use mise are unaffected — the project still builds with a
+# plain `cargo` + `just` install and CI does not depend on mise. Rust itself is NOT
+# managed here: in the devcontainer it comes from the base image, and on a host it
+# comes from your existing rustup, so `cargo`/`clippy`/`rustfmt` resolve to one
+# toolchain (avoids shadowing by a mise shim).
+
+[settings]
+cargo.binstall = true
+minimum_release_age = "0"
+
+[tools]
+"github:nbari/slick" = "latest"
+# cargo-edit provides `cargo set-version` used by the just bump/deploy recipes.
+"cargo:cargo-edit" = "latest"
+"cargo:cargo-watch" = "latest"
+# Packaging + coverage helpers used by the justfile (package-deb / package-rpm /
+# coverage). Best-effort: binstall pulls prebuilt binaries when available.
+"cargo:cargo-deb" = "latest"
+"cargo:cargo-generate-rpm" = "latest"
+"cargo:grcov" = "latest"
+bat = "latest"
+eza = "latest"
+go = "latest"
+just = "latest"
+node = "lts"
+python = "3.14"
+"pipx:pgcli" = "latest"
+ripgrep = "latest"
+tmux = "latest"
+tree-sitter = "latest"
+uv = "latest"
+
+[env]
+EDITOR = "nvim"
+VISUAL = "nvim"
+
+[tasks.setup-tig]
+run = "sudo apt install -y tig"
+description = "Install tig git browser"
