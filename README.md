@@ -24,6 +24,7 @@
 - [x] HA transition hooks (`on_promote`, `on_demote`, `on_backup`)
 - [x] HA fault hook (`on_fault`) for address-action and runtime failure paths
 - [x] Graceful VIP cleanup on shutdown (`SIGINT`, `SIGTERM`)
+- [ ] Native netlink VIP management (replace shelling out to `ip`/`arping`/`ndsend` with direct netlink `RTM_NEWADDR`/`RTM_DELADDR` + raw gratuitous ARP/NA, dropping the `iproute2`/`arping`/`ndisc6` runtime dependency — as keepalived does)
 - [x] Ansible-based HA lab deployment workflow
 - [ ] Split-brain prevention and conservative failover rules
 - [ ] Performance tuning for heartbeat, timers, and failover latency
