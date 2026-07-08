@@ -54,8 +54,30 @@ fn runtime_config(
 }
 
 fn free_udp_port() -> Result<u16> {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    Ok(socket.local_addr()?.port())
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    // Allocate a loopback port from a per-process window instead of asking the OS
+    // for an ephemeral port and immediately closing it. That close-then-rebind gap
+    // lets a parallel test grab the same number before the node binds it, causing
+    // intermittent EADDRINUSE ("status channel closed"). Keying the window on the
+    // PID keeps concurrently-running test binaries (whose PIDs differ by a small
+    // amount) on disjoint ranges, and a per-process counter keeps parallel tests in
+    // the same binary distinct; the bind check only guards the rare clash with an
+    // unrelated process. Fresh sockets are still used, so packet-delivery semantics
+    // are unchanged.
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    const WINDOW: u16 = 200;
+    let pid_slot = u16::try_from(std::process::id() % u32::from(WINDOW)).unwrap_or(0);
+    let base = 10_000_u16 + pid_slot * WINDOW;
+    for _ in 0..WINDOW {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % WINDOW;
+        let port = base + offset;
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    Err(anyhow!("no free UDP port available for test node"))
 }
 
 fn spawn_node(

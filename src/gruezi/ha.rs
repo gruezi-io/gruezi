@@ -674,7 +674,26 @@ fn handle_receive_event(
     recv: std::io::Result<(usize, std::net::SocketAddr)>,
     buffer: &[u8; 1_024],
 ) -> Result<()> {
-    let (len, from) = recv.context("failed to receive HA packet")?;
+    let (len, from) = match recv {
+        Ok(value) => value,
+        // On loopback (and some real setups) sending an advertisement to a peer
+        // whose port has no listener queues an ICMP port-unreachable that the
+        // kernel then reports as ECONNREFUSED on the socket's *next* operation —
+        // which may be this `recv_from` rather than the send. Treat the same set
+        // of transient network errors as non-fatal here as on the send path: a
+        // temporarily-down or ICMP-rejecting peer must not tear down the node.
+        Err(error) if is_transient_io_error(&error) => {
+            warn!(
+                %error,
+                node_id = %runtime.node_id,
+                "HA receive failed transiently; continuing"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error)).context("failed to receive HA packet");
+        }
+    };
     let observed_at = Instant::now();
     let payload = buffer
         .get(..len)
@@ -1244,22 +1263,24 @@ fn is_duplicate_node_id_failure(error: &anyhow::Error) -> bool {
     error.to_string().contains("duplicate node.id")
 }
 
+fn is_transient_io_error(io_error: &std::io::Error) -> bool {
+    matches!(
+        io_error.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
 fn is_transient_send_failure(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(|io_error| {
-            matches!(
-                io_error.kind(),
-                std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::HostUnreachable
-                    | std::io::ErrorKind::NetworkUnreachable
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::TimedOut
-            )
-        })
+        .any(is_transient_io_error)
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -1428,7 +1449,7 @@ mod tests {
     use super::{
         HaAuth, HaDecisionReason, HaPacket, HaRuntimeConfig, HaState, PeerObservation,
         build_packet, desired_state, handle_incoming_packet, is_duplicate_node_id_failure,
-        is_transient_send_failure, verify_auth_tag,
+        is_transient_io_error, is_transient_send_failure, verify_auth_tag,
     };
     use crate::config::Config;
     use anyhow::Result;
@@ -2220,5 +2241,21 @@ ha:
     fn does_not_classify_invalid_input_as_transient_send_failure() {
         let error = std::io::Error::from(std::io::ErrorKind::InvalidInput).into();
         assert!(!is_transient_send_failure(&error));
+    }
+
+    #[test]
+    fn classifies_connection_refused_receive_as_transient() {
+        // On loopback, sending to a peer port with no listener makes the kernel
+        // report the ICMP port-unreachable as ECONNREFUSED on the socket's next
+        // operation (which may be recv_from). This must be tolerated, not fatal,
+        // so a node whose peer is down does not tear itself down.
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(is_transient_io_error(&error));
+    }
+
+    #[test]
+    fn does_not_classify_invalid_input_receive_as_transient() {
+        let error = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        assert!(!is_transient_io_error(&error));
     }
 }
