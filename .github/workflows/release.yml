@@ -21,6 +21,7 @@ jobs:
       - test
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: linux
@@ -51,8 +52,15 @@ jobs:
           echo "name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
           echo "Package name: $PACKAGE_NAME"
 
-      - name: Get the release version from the tag
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+      - name: Get release version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
