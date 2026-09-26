@@ -24,6 +24,7 @@ impl StatusResponse {
 /// # Errors
 ///
 /// Returns an error if the request or response parsing fails.
+#[tracing::instrument(name = "gruezi.status.fetch", skip(node))]
 pub async fn fetch_status(node: Option<&str>) -> Result<StatusResponse> {
     let endpoint = status_endpoint(node);
     let response = reqwest::Client::new()

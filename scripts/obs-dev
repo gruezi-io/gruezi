@@ -10,7 +10,7 @@ set -eu
 #
 # After starting it, point gruezi at the collector and run it so it exports spans:
 #   export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
-#   cargo run -- start --config examples/ha-node-a.yaml
+#   cargo run --features telemetry -- start --config examples/ha-node-a.yaml
 # The Jaeger UI is published to the host at http://localhost:16686.
 #
 # Usage: scripts/obs-dev [up|down]
@@ -51,7 +51,7 @@ up)
     echo ""
     echo "  Point gruezi at the collector inside the app container and run it:"
     echo "    export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317"
-    echo "    cargo run -- start --config examples/ha-node-a.yaml"
+    echo "    cargo run --features telemetry -- start --config examples/ha-node-a.yaml"
     ;;
 down | stop)
     echo "Using compose project: $project"

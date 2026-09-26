@@ -49,6 +49,23 @@
 - [ ] Security model (mTLS and auth)
 - [ ] Observability (metrics and tracing)
 
+## Telemetry
+
+Every build includes local tracing logs. OTLP trace export requires a binary
+built with the default-off `telemetry` feature and an endpoint set when the
+process starts:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+cargo run --features telemetry -- peers
+```
+
+Point `OTEL_EXPORTER_OTLP_ENDPOINT` at an OTLP gRPC collector.
+`OTEL_EXPORTER_OTLP_HEADERS` can provide request headers.
+The release, package, and container builds use the default feature set, so
+setting an endpoint on those binaries alone does not enable trace export.
+See [`CLI_ARCHITECTURE.md`](CLI_ARCHITECTURE.md) for the startup behavior.
+
 ## DRAFT: Configuration Model
 
 Configuration should use YAML.

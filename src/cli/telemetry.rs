@@ -1,131 +1,110 @@
-use anyhow::{Result, anyhow};
-use base64::{Engine, engine::general_purpose};
-use once_cell::sync::OnceCell;
-use opentelemetry::propagation::TextMapCompositePropagator;
-use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
+use anyhow::Result;
+#[cfg(feature = "telemetry")]
+use anyhow::{Context, bail};
+#[cfg(feature = "telemetry")]
+use base64::{Engine, engine::general_purpose::STANDARD};
+#[cfg(feature = "telemetry")]
+use opentelemetry::{
+    KeyValue, global, propagation::TextMapCompositePropagator, trace::TracerProvider as _,
+};
+#[cfg(feature = "telemetry")]
 use opentelemetry_otlp::{Compression, WithExportConfig, WithTonicConfig};
+#[cfg(feature = "telemetry")]
 use opentelemetry_sdk::{
     Resource,
     propagation::{BaggagePropagator, TraceContextPropagator},
     trace::{SdkTracerProvider, Tracer},
 };
-use std::{collections::HashMap, env::var, time::Duration};
+use std::sync::OnceLock;
+#[cfg(feature = "telemetry")]
+use std::{env, time::Duration};
+#[cfg(feature = "telemetry")]
 use tonic::{
     metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue},
     transport::ClientTlsConfig,
 };
-use tracing::{Level, debug};
+use tracing::Level;
+#[cfg(feature = "telemetry")]
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
+#[cfg(feature = "telemetry")]
 use ulid::Ulid;
 
-/// Global tracer provider (initialized once)
-static TRACER_PROVIDER: OnceCell<SdkTracerProvider> = OnceCell::new();
+static TELEMETRY_INIT: OnceLock<()> = OnceLock::new();
+#[cfg(feature = "telemetry")]
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
-fn parse_headers_env(headers_str: &str) -> HashMap<String, String> {
-    headers_str
-        .split(',')
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?.trim().to_string();
-            let value = parts.next()?.trim().to_string();
-            Some((key, value))
-        })
-        .collect()
-}
+#[cfg(feature = "telemetry")]
+fn parse_headers(value: &str) -> Result<MetadataMap> {
+    let mut metadata = MetadataMap::new();
+    for pair in value.split(',').filter(|pair| !pair.trim().is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .context("OTEL_EXPORTER_OTLP_HEADERS entries must be key=value")?;
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
 
-// Convert HashMap<String, String> into tonic::MetadataMap
-// - Supports ASCII metadata (normal keys)
-// - Supports binary metadata keys (ending with "-bin"), values must be base64-encoded
-fn headers_to_metadata(headers: &HashMap<String, String>) -> Result<MetadataMap> {
-    let mut meta = MetadataMap::with_capacity(headers.len());
-
-    for (k, v) in headers {
-        let key_str = k.to_ascii_lowercase();
-
-        if key_str.ends_with("-bin") {
-            let bytes = general_purpose::STANDARD
-                .decode(v.as_bytes())
-                .map_err(|e| anyhow!("failed to base64-decode value for key {key_str}: {e}"))?;
-
-            let key = MetadataKey::<Binary>::from_bytes(key_str.as_bytes())
-                .map_err(|e| anyhow!("invalid binary metadata key {key_str}: {e}"))?;
-
-            let val = MetadataValue::from_bytes(&bytes);
-            meta.insert_bin(key, val);
+        if key.ends_with("-bin") {
+            let key = MetadataKey::<Binary>::from_bytes(key.as_bytes())
+                .context("invalid binary OTLP header name")?;
+            let bytes = STANDARD
+                .decode(value)
+                .context("invalid base64 OTLP header value")?;
+            metadata.insert_bin(key, MetadataValue::from_bytes(&bytes));
         } else {
-            let key = MetadataKey::<Ascii>::from_bytes(key_str.as_bytes())
-                .map_err(|e| anyhow!("invalid ASCII metadata key {key_str}: {e}"))?;
-
-            let val: MetadataValue<_> = v
-                .parse()
-                .map_err(|e| anyhow!("invalid ASCII metadata value for key {key_str}: {e}"))?;
-            meta.insert(key, val);
+            let key = MetadataKey::<Ascii>::from_bytes(key.as_bytes())
+                .context("invalid OTLP header name")?;
+            let value = value.parse().context("invalid OTLP header value")?;
+            metadata.insert(key, value);
         }
     }
-
-    Ok(meta)
+    Ok(metadata)
 }
 
-fn normalize_endpoint(ep: String) -> String {
-    if ep.starts_with("http://") || ep.starts_with("https://") {
-        ep
+#[cfg(feature = "telemetry")]
+fn normalize_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_owned()
     } else {
-        // Default to https for gRPC if no scheme supplied
-        format!("https://{}", ep.trim_end_matches('/'))
+        format!("https://{}", endpoint.trim_end_matches('/'))
     }
 }
 
-fn init_tracer() -> Result<Tracer> {
-    // We only support gRPC now. If the user set a different protocol, log and ignore.
-    if let Ok(proto) = var("OTEL_EXPORTER_OTLP_PROTOCOL")
-        && proto != "grpc"
+#[cfg(feature = "telemetry")]
+fn init_tracer(endpoint: &str) -> Result<(SdkTracerProvider, Tracer)> {
+    if let Ok(protocol) = env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
+        && protocol != "grpc"
     {
-        debug!(
-            "OTEL_EXPORTER_OTLP_PROTOCOL='{}' ignored: only 'grpc' is supported now",
-            proto
-        );
+        bail!("OTEL_EXPORTER_OTLP_PROTOCOL must be grpc");
     }
 
-    // gRPC sensible default
-    let default_ep = "http://localhost:4317";
-    let endpoint = var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| default_ep.to_string());
     let endpoint = normalize_endpoint(endpoint);
-
-    let headers = var("OTEL_EXPORTER_OTLP_HEADERS")
-        .ok()
-        .map(|s| parse_headers_env(&s))
-        .unwrap_or_default();
-
-    // Build gRPC exporter
-    let mut builder = opentelemetry_otlp::SpanExporter::builder()
+    let mut exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(&endpoint)
         .with_compression(Compression::Gzip)
         .with_timeout(Duration::from_secs(3));
 
-    // TLS (https) support
     if let Some(host) = endpoint
         .strip_prefix("https://")
-        .and_then(|s| s.split('/').next())
-        .and_then(|h| h.split(':').next())
+        .and_then(|address| address.split('/').next())
+        .and_then(|authority| authority.split(':').next())
     {
-        let tls = ClientTlsConfig::new()
-            .domain_name(host.to_string())
-            .with_native_roots();
-        builder = builder.with_tls_config(tls);
+        exporter = exporter.with_tls_config(
+            ClientTlsConfig::new()
+                .domain_name(host.to_owned())
+                .with_native_roots(),
+        );
     }
 
-    if !headers.is_empty() {
-        let metadata = headers_to_metadata(&headers)?;
-        builder = builder.with_metadata(metadata);
+    if let Ok(headers) = env::var("OTEL_EXPORTER_OTLP_HEADERS") {
+        exporter = exporter.with_metadata(parse_headers(&headers)?);
     }
 
-    let exporter = builder.build()?;
-
-    // Generate or take service.instance.id
-    let instance_id = var("OTEL_SERVICE_INSTANCE_ID").unwrap_or_else(|_| Ulid::new().to_string());
-
-    let trace_provider = SdkTracerProvider::builder()
+    let exporter = exporter.build()?;
+    let instance_id =
+        env::var("OTEL_SERVICE_INSTANCE_ID").unwrap_or_else(|_| Ulid::generate().to_string());
+    let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_resource(
             Resource::builder_empty()
@@ -137,246 +116,131 @@ fn init_tracer() -> Result<Tracer> {
                 .build(),
         )
         .build();
-
-    // Store provider for later shutdown
-    let stored = trace_provider.clone();
-    let _ = TRACER_PROVIDER.set(stored);
-
-    // Register globally
-    global::set_tracer_provider(trace_provider.clone());
-    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
-        Box::new(TraceContextPropagator::new()),
-        Box::new(BaggagePropagator::new()),
-    ]));
-
-    Ok(trace_provider.tracer(env!("CARGO_PKG_NAME")))
+    let tracer = provider.tracer(env!("CARGO_PKG_NAME"));
+    Ok((provider, tracer))
 }
 
-/// Initialize logging + (optional) tracing exporter
+/// Initialize local logging and optional OTLP trace export.
 ///
-/// Tracing is enabled if `OTEL_EXPORTER_OTLP_ENDPOINT` is set (gRPC only).
+/// An exporter is created only when the `telemetry` feature is enabled and
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set at startup.
 ///
 /// # Errors
 ///
-/// Returns an error if the logging or tracing subscribers fail to initialize
+/// Returns an error if the tracing filter, exporter, or global subscriber
+/// cannot be initialized.
 pub fn init(verbosity_level: Option<Level>) -> Result<()> {
-    let verbosity_level = verbosity_level.unwrap_or(Level::ERROR);
+    if TELEMETRY_INIT.get().is_some() {
+        return Ok(());
+    }
 
+    let default_level = verbosity_level.unwrap_or(Level::ERROR);
     let fmt_layer = fmt::layer()
         .with_file(false)
         .with_line_number(false)
+        .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
-        .with_target(false)
-        .with_ansi(false);
+        .compact();
 
     let filter = EnvFilter::builder()
-        .with_default_directive(verbosity_level.into())
+        .with_default_directive(default_level.into())
         .from_env_lossy()
         .add_directive("hyper=error".parse()?)
-        .add_directive("tokio=error".parse()?)
-        .add_directive("opentelemetry_sdk=warn".parse()?);
+        .add_directive("tokio=error".parse()?);
 
-    if var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-        let tracer = init_tracer()?;
-        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
+    #[cfg(feature = "telemetry")]
+    if let Ok(endpoint) = env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        let (provider, tracer) = init_tracer(&endpoint)?;
         let subscriber = Registry::default()
-            .with(fmt_layer)
-            .with(otel_layer)
-            .with(filter);
+            .with(fmt_layer.with_filter(filter))
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(tracer)
+                    .with_filter(EnvFilter::new("gruezi=info")),
+            );
         tracing::subscriber::set_global_default(subscriber)?;
-    } else {
-        let subscriber = Registry::default().with(fmt_layer).with(filter);
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+            Box::new(TraceContextPropagator::new()),
+            Box::new(BaggagePropagator::new()),
+        ]));
+        let _ = TRACER_PROVIDER.set(provider);
+        let _ = TELEMETRY_INIT.set(());
+        return Ok(());
+    }
+
+    #[cfg(feature = "telemetry")]
+    {
+        let subscriber = Registry::default().with(fmt_layer.with_filter(filter));
         tracing::subscriber::set_global_default(subscriber)?;
     }
 
+    #[cfg(not(feature = "telemetry"))]
+    {
+        let subscriber = Registry::default().with(filter).with(fmt_layer);
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
+
+    let _ = TELEMETRY_INIT.set(());
     Ok(())
 }
 
-/// Gracefully shut down tracer provider (noop if not initialized)
+/// Flush and shut down an initialized tracer provider.
 ///
-/// ## Short-lived Process Challenge
-///
-/// This function attempts to flush spans before exit, but for short-lived CLIs
-/// (execution time ~10ms), the flush operation may timeout (needs ~5000ms).
-///
-/// **Expected behavior:**
-/// - `force_flush()` sends pending spans (may timeout)
-/// - `shutdown()` cleans up resources (may timeout)
-/// - Timeout errors are **cosmetic** - spans are sent asynchronously
-/// - Traces still appear in your observability backend!
-///
-/// **To suppress timeout errors:**
-/// ```bash
-/// export RUST_LOG="warn,opentelemetry_sdk=error"
-/// ```
-///
-/// ## Why This Happens
-///
-/// OpenTelemetry uses a `BatchSpanProcessor` which batches spans for efficiency.
-/// For long-running services this is perfect. For CLIs that exit in milliseconds,
-/// we can't wait for the full batch timeout.
-///
-/// ## Alternative Solutions Not Used Here
-///
-/// 1. **`SimpleSpanProcessor`**: Sends each span immediately (slower, no batching)
-/// 2. **Longer sleep**: Wait 5+ seconds before exit (defeats CLI speed)
-/// 3. **Fire and forget**: Don't call shutdown (proper cleanup is better)
-///
-/// We accept the cosmetic timeout for educational purposes to show the "proper"
-/// way to shutdown, even though it's imperfect for short-lived processes.
-pub fn shutdown_tracer() {
-    if let Some(tp) = TRACER_PROVIDER.get() {
-        debug!("flushing and shutting down tracer provider");
-
-        // Force flush all pending spans
-        // Note: May timeout for short-lived CLIs, but spans are sent anyway
-        if let Err(e) = tp.force_flush() {
-            eprintln!("Failed to flush spans: {e}");
+/// Returns whether OTLP export was initialized.
+#[cfg(feature = "telemetry")]
+#[must_use]
+pub fn shutdown_tracer() -> bool {
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(error) = provider.force_flush() {
+            tracing::warn!(%error, "failed to flush traces");
         }
-
-        // Shutdown the provider
-        if let Err(e) = tp.shutdown() {
-            eprintln!("Failed to shutdown tracer provider: {e}");
+        if let Err(error) = provider.shutdown() {
+            tracing::warn!(%error, "failed to shut down tracer provider");
         }
-
-        debug!("tracer provider shutdown complete");
+        true
+    } else {
+        false
     }
 }
 
-#[cfg(test)]
+/// Return immediately when OTLP export is not compiled in.
+#[cfg(not(feature = "telemetry"))]
+#[must_use]
+pub const fn shutdown_tracer() -> bool {
+    false
+}
+
+#[cfg(all(test, feature = "telemetry"))]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_headers_env_empty() {
-        let result = parse_headers_env("");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_parse_headers_env_single() {
-        let result = parse_headers_env("key1=value1");
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.get("key1"), Some(&"value1".to_string()));
-    }
-
-    #[test]
-    fn test_parse_headers_env_multiple() {
-        let result = parse_headers_env("key1=value1,key2=value2,key3=value3");
-        assert_eq!(result.len(), 3);
-        assert_eq!(result.get("key1"), Some(&"value1".to_string()));
-        assert_eq!(result.get("key2"), Some(&"value2".to_string()));
-        assert_eq!(result.get("key3"), Some(&"value3".to_string()));
-    }
-
-    #[test]
-    fn test_parse_headers_env_with_spaces() {
-        let result = parse_headers_env("key1 = value1 , key2 = value2");
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.get("key1"), Some(&"value1".to_string()));
-        assert_eq!(result.get("key2"), Some(&"value2".to_string()));
-    }
-
-    #[test]
-    fn test_parse_headers_env_malformed() {
-        // Missing values should be filtered out
-        let result = parse_headers_env("key1=value1,malformed,key2=value2");
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.get("key1"), Some(&"value1".to_string()));
-        assert_eq!(result.get("key2"), Some(&"value2".to_string()));
-        assert!(!result.contains_key("malformed"));
-    }
-
-    #[test]
-    fn test_headers_to_metadata_empty() -> Result<()> {
-        let headers = HashMap::new();
-        let metadata = headers_to_metadata(&headers)?;
-        assert_eq!(metadata.len(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn test_headers_to_metadata_ascii() -> Result<()> {
-        let mut headers = HashMap::new();
-        headers.insert("authorization".to_string(), "Bearer token123".to_string());
-        headers.insert("x-custom-header".to_string(), "custom-value".to_string());
-
-        let metadata = headers_to_metadata(&headers)?;
-        assert_eq!(metadata.len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn test_headers_to_metadata_binary() -> Result<()> {
-        let mut headers = HashMap::new();
-        // Base64 encoded "binary data"
-        headers.insert("custom-bin".to_string(), "YmluYXJ5IGRhdGE=".to_string());
-
-        let metadata = headers_to_metadata(&headers)?;
-        assert_eq!(metadata.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_headers_to_metadata_invalid_base64() -> Result<()> {
-        let mut headers = HashMap::new();
-        headers.insert("custom-bin".to_string(), "not-valid-base64!!!".to_string());
-
-        match headers_to_metadata(&headers) {
-            Ok(_) => Err(anyhow!("base64 decoding should fail")),
-            Err(err) => {
-                assert!(err.to_string().contains("failed to base64-decode"));
-                Ok(())
-            }
+    fn parses_ascii_and_binary_otlp_headers() {
+        let headers = parse_headers("authorization=Bearer token,custom-bin=YmluYXJ5");
+        assert!(headers.is_ok());
+        if let Ok(headers) = headers {
+            assert_eq!(headers.len(), 2);
         }
     }
 
     #[test]
-    fn test_headers_to_metadata_mixed() -> Result<()> {
-        let mut headers = HashMap::new();
-        headers.insert("authorization".to_string(), "Bearer token123".to_string());
-        headers.insert("custom-bin".to_string(), "YmluYXJ5IGRhdGE=".to_string());
-
-        let metadata = headers_to_metadata(&headers)?;
-        assert_eq!(metadata.len(), 2);
-        Ok(())
+    fn rejects_malformed_otlp_headers() {
+        assert!(parse_headers("authorization").is_err());
+        assert!(parse_headers("custom-bin=invalid!").is_err());
     }
 
     #[test]
-    fn test_normalize_endpoint_http() {
-        let result = normalize_endpoint("http://localhost:4317".to_string());
-        assert_eq!(result, "http://localhost:4317");
+    fn normalizes_scheme_less_endpoint_to_https() {
+        assert_eq!(
+            normalize_endpoint("collector.example:4317/"),
+            "https://collector.example:4317"
+        );
     }
 
     #[test]
-    fn test_normalize_endpoint_https() {
-        let result = normalize_endpoint("https://api.example.com:4317".to_string());
-        assert_eq!(result, "https://api.example.com:4317");
-    }
-
-    #[test]
-    fn test_normalize_endpoint_no_scheme() {
-        let result = normalize_endpoint("localhost:4317".to_string());
-        assert_eq!(result, "https://localhost:4317");
-    }
-
-    #[test]
-    fn test_normalize_endpoint_trailing_slash() {
-        let result = normalize_endpoint("api.example.com:4317/".to_string());
-        assert_eq!(result, "https://api.example.com:4317");
-    }
-
-    #[test]
-    fn test_normalize_endpoint_with_path() {
-        let result = normalize_endpoint("https://api.example.com:4317/v1/traces".to_string());
-        assert_eq!(result, "https://api.example.com:4317/v1/traces");
-    }
-
-    #[test]
-    fn test_shutdown_tracer_no_provider() {
-        // Should not panic when no provider is initialized
-        shutdown_tracer();
+    fn shutdown_without_exporter_returns_false() {
+        assert!(!shutdown_tracer());
     }
 }

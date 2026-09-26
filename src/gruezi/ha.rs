@@ -1307,6 +1307,14 @@ fn log_state_change(
         let last_peer_seen_ms_ago =
             peer_observation.map(|peer| saturating_elapsed_ms(now, peer.observed_at));
 
+        let span = tracing::info_span!(
+            "gruezi.ha.state_change",
+            node_id,
+            ?previous,
+            ?current,
+            reason = %reason
+        );
+        let _entered = span.enter();
         info!(
             node_id,
             ?previous,

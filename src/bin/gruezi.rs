@@ -1,18 +1,18 @@
 use anyhow::Result;
-use gruezi::cli::{actions::Action, start};
+use gruezi::cli::{actions::Action, start, telemetry};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize CLI and get the action to execute
-    let action = start()?;
-
-    // Execute the action
-    execute(action).await?;
-
-    Ok(())
+    let result = match start() {
+        Ok(action) => execute(action).await,
+        Err(error) => Err(error),
+    };
+    let _ = telemetry::shutdown_tracer();
+    result
 }
 
 /// Execute the given action
+#[tracing::instrument(name = "gruezi.execute", skip(action))]
 async fn execute(action: Action) -> Result<()> {
     match action {
         Action::Start {
