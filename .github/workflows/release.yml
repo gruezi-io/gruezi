@@ -27,9 +27,17 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
 
+          - build: linux
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+
+          - build: macos
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+
           - build: macos
             os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -70,30 +78,25 @@ jobs:
         if: matrix.build == 'linux'
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # Strip once and prep paths for both packagers
-      - name: Strip and prepare packaging paths (Linux)
+      - name: Strip Linux binary
         if: matrix.build == 'linux'
         run: |
           BIN="target/${{ matrix.target }}/release/${{ steps.package.outputs.name }}"
           ls -al "$BIN"
           strip -s "$BIN" || true
-          # Ensure cargo-generate-rpm's asset path exists without copying the file
-          mkdir -p target/release
-          ln -sf "../${{ matrix.target }}/release/${{ steps.package.outputs.name }}" "target/release/${{ steps.package.outputs.name }}"
-          ls -al target/release/${{ steps.package.outputs.name }}
 
       - name: Generate RPM
         if: matrix.build == 'linux'
         run: |
-          cargo generate-rpm
-          RPM_PATH="$(find target/generate-rpm -type f -name '*.rpm' -print -quit)"
+          cargo generate-rpm --target "${{ matrix.target }}"
+          RPM_PATH="$(find "target/${{ matrix.target }}/generate-rpm" -type f -name '*.rpm' -print -quit)"
           echo "RPM_ASSET=$RPM_PATH" >> $GITHUB_ENV
           echo "RPM: $RPM_PATH"
 
       - name: Generate DEB (musl static)
         if: matrix.build == 'linux'
         run: |
-          cargo deb --no-build
+          cargo deb --no-build --target "${{ matrix.target }}"
           DEB_PATH="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
           echo "DEB_ASSET=$DEB_PATH" >> $GITHUB_ENV
           echo "DEB: $DEB_PATH"
