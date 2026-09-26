@@ -177,6 +177,26 @@ async fn wait_for_log_lines(
     .map_err(|_| anyhow!("timed out waiting for {description}"))?
 }
 
+async fn wait_for_log_contents(
+    path: &Path,
+    expected: &[&str],
+    description: &str,
+) -> Result<String> {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(contents) = fs::read_to_string(path)
+                && expected.iter().all(|line| contents.contains(line))
+            {
+                return Ok(contents);
+            }
+
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting for {description}"))?
+}
+
 #[tokio::test]
 async fn master_adds_and_backup_removes_addresses() -> Result<()> {
     let dir = temp_dir("ha-addresses-startup")?;
@@ -270,13 +290,29 @@ async fn shutdown_removes_master_addresses() -> Result<()> {
     })
     .await?;
 
-    let startup_contents = wait_for_log_lines(&log, 4, "node-a startup address actions").await?;
+    let startup_contents = wait_for_log_contents(
+        &log,
+        &[
+            "address add 10.0.0.10/24 dev lo",
+            "address add fd00::10/64 dev lo",
+        ],
+        "node-a startup address actions",
+    )
+    .await?;
     assert!(startup_contents.contains("address add 10.0.0.10/24 dev lo"));
     assert!(startup_contents.contains("address add fd00::10/64 dev lo"));
 
     stop_node(shutdown_a, task_a).await?;
 
-    let contents = wait_for_log_lines(&log, 6, "node-a shutdown address cleanup").await?;
+    let contents = wait_for_log_contents(
+        &log,
+        &[
+            "address del 10.0.0.10/24 dev lo",
+            "address del fd00::10/64 dev lo",
+        ],
+        "node-a shutdown address cleanup",
+    )
+    .await?;
     assert!(contents.contains("address del 10.0.0.10/24 dev lo"));
     assert!(contents.contains("address del fd00::10/64 dev lo"));
 

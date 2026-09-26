@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Get package name from Cargo.toml
         id: package
@@ -54,9 +54,10 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          cache: false
 
       - run: sudo apt -y install musl-dev musl-tools
         if: matrix.build == 'linux'
