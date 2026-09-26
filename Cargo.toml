@@ -1,6 +1,6 @@
 [package]
 name = "gruezi"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "Service Discovery & Distributed Key-Value Store"
 license = "BSD-3-Clause"
