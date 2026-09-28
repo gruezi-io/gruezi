@@ -1,0 +1,75 @@
+name: Release is latest
+description: >-
+  Whether a tag is the highest promoted release right now: the highest X.Y.Z tag that
+  is a GitHub-verified annotated tag whose commit is on main and carries that version in
+  Cargo.toml. It fails when GitHub cannot be asked. The GitHub release job calls it
+  immediately before it publishes, so a late, re-run or recovered job of an older tag
+  never takes GitHub's Latest flag, and a stray higher tag that was never promoted is
+  ignored.
+inputs:
+  tag:
+    description: The X.Y.Z tag being published.
+    required: true
+  token:
+    description: A token that can read the repository.
+    required: true
+outputs:
+  latest:
+    description: "'true' when the tag is the highest promoted release, otherwise 'false'."
+    value: ${{ steps.check.outputs.latest }}
+  highest:
+    description: The highest promoted release (empty when there is none).
+    value: ${{ steps.check.outputs.highest }}
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        repo="${GITHUB_REPOSITORY}"
+        # A plain assignment, so a failing listing fails the step instead of looking
+        # like "no releases".
+        tags="$(gh api --paginate "repos/${repo}/tags" --jq '.[].name')"
+        highest=""
+        while read -r candidate; do
+          [[ -n "${candidate}" ]] || continue
+          # Every API result is a plain assignment: a GitHub error fails the step, and never
+          # makes a valid higher release look invalid.
+          ref="$(gh api "repos/${repo}/git/ref/tags/${candidate}" --jq '"\(.object.type) \(.object.sha)"')"
+          read -r type object <<<"${ref}"
+          if [[ "${type}" != tag ]]; then
+            echo "Ignoring ${candidate}: a lightweight tag."
+            continue
+          fi
+          verified="$(gh api "repos/${repo}/git/tags/${object}" --jq '.verification.verified')"
+          if [[ "${verified}" != true ]]; then
+            echo "Ignoring ${candidate}: its signature is not verified by GitHub."
+            continue
+          fi
+          commit="$(gh api "repos/${repo}/commits/refs/tags/${candidate}" --jq '.sha')"
+          status="$(gh api "repos/${repo}/compare/${commit}...main" --jq '.status')"
+          if [[ "${status}" != identical && "${status}" != ahead ]]; then
+            echo "Ignoring ${candidate}: ${commit} is not on main (${status})."
+            continue
+          fi
+          version="$(gh api "repos/${repo}/contents/Cargo.toml?ref=${commit}" --jq '.content' | base64 -d | awk -F'"' '/^version = /{print $2; exit}')"
+          if [[ "${version}" != "${candidate}" ]]; then
+            echo "Ignoring ${candidate}: its commit carries version ${version}."
+            continue
+          fi
+          highest="${candidate}"
+          break
+        done < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"${tags}" | sort -rV || true)
+        latest=false
+        if [[ -n "${highest}" && "${highest}" == "${TAG}" ]]; then
+          latest=true
+        fi
+        {
+          echo "latest=${latest}"
+          echo "highest=${highest}"
+        } >> "$GITHUB_OUTPUT"
+        echo "Highest promoted release: ${highest:-none}; ${TAG} is the latest: ${latest}."

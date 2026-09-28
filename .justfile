@@ -131,151 +131,46 @@ check-tag-not-exists version:
 
     echo "✅ No tag exists for version ${version}"
 
-_bump bump_kind: check-develop check-clean clean update test
-    #!/usr/bin/env bash
-    set -euo pipefail
+# Releases run scripts/release: the version bump is staged on the scratch `release`
+# branch, Test & Build and a candidate run of release.yml (every test, build and package,
+# published nowhere) test that exact commit, and only then do develop, main and the
+# signed tag move together in one atomic push; the tag's run publishes exactly what the
+# candidate run built. Every deploy recipe is idempotent: rerunning it resumes the staged
+# candidate, or says there is nothing left to release. See README "Releasing".
 
-    bump_kind="{{bump_kind}}"
-
-    cleanup() {
-        status=$?
-        if [ $status -ne 0 ]; then
-            echo "↩️  Restoring version files after failure..."
-            git checkout -- Cargo.toml Cargo.lock >/dev/null 2>&1 || true
-        fi
-        exit $status
-    }
-    trap cleanup EXIT
-
-    previous_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-    echo "ℹ️  Current version: ${previous_version}"
-
-    echo "🔧 Bumping ${bump_kind} version..."
-    cargo set-version --bump "${bump_kind}"
-    new_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-    echo "📝 New version: ${new_version}"
-
-    validate_bump() {
-        local previous=$1 bump=$2 current=$3
-        IFS=. read -r prev_major prev_minor prev_patch <<<"${previous}"
-        IFS=. read -r new_major new_minor new_patch <<<"${current}"
-
-        case "${bump}" in
-            patch)
-                (( new_major == prev_major && new_minor == prev_minor && new_patch == prev_patch + 1 )) || { echo "❌ Expected patch bump from ${previous}, got ${current}"; exit 1; }
-                ;;
-            minor)
-                (( new_major == prev_major && new_minor == prev_minor + 1 && new_patch == 0 )) || { echo "❌ Expected minor bump from ${previous}, got ${current}"; exit 1; }
-                ;;
-            major)
-                (( new_major == prev_major + 1 && new_minor == 0 && new_patch == 0 )) || { echo "❌ Expected major bump from ${previous}, got ${current}"; exit 1; }
-                ;;
-        esac
-    }
-
-    validate_bump "${previous_version}" "${bump_kind}" "${new_version}"
-
-    echo "🔍 Verifying tag does not exist for ${new_version}..."
-    git fetch --tags --quiet
-    if git rev-parse -q --verify "refs/tags/${new_version}" >/dev/null 2>&1; then
-        echo "❌ Tag ${new_version} already exists!"
-        exit 1
-    fi
-
-    echo "🔄 Updating dependencies..."
-    cargo update
-
-    echo "🧹 Running clean build..."
-    cargo clean
-
-    echo "🧪 Running tests with new version (via just test)..."
-    just test
-
-    git add .
-    git commit -m "bump version to ${new_version}"
-    git push origin develop
-    echo "✅ Version bumped and pushed to develop"
-
-# Bump version and commit (patch level)
-bump:
-    @just _bump patch
-
-# Bump minor version
-bump-minor:
-    @just _bump minor
-
-# Bump major version
-bump-major:
-    @just _bump major
-
-# Internal function to handle the merge and tag process
-_deploy-merge-and-tag:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    new_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-    echo "🚀 Starting deployment for version $new_version..."
-
-    # Double-check tag doesn't exist (safety check)
-    echo "🔍 Verifying tag doesn't exist..."
-    git fetch --tags --quiet
-    if git rev-parse -q --verify "refs/tags/${new_version}" >/dev/null 2>&1; then
-        echo "❌ Tag ${new_version} already exists on remote!"
-        echo "This should not happen. The tag may have been created in a previous run."
-        exit 1
-    fi
-
-    # Ensure develop is up to date
-    echo "🔄 Ensuring develop is up to date..."
-    git pull origin develop
-
-    # Switch to main and merge develop
-    echo "🔄 Switching to main branch..."
-    git checkout main
-    git pull origin main
-
-    echo "🔀 Merging develop into main..."
-    if ! git merge develop --no-edit; then
-        echo "❌ Merge failed! Please resolve conflicts manually."
-        git checkout develop
-        exit 1
-    fi
-
-    # Create signed tag
-    echo "🏷️  Creating signed tag $new_version..."
-    git tag -s "$new_version" -m "Release version $new_version"
-
-    # Push main and tag atomically
-    echo "⬆️  Pushing main branch and tag..."
-    if ! git push origin main "$new_version"; then
-        echo "❌ Push failed! Rolling back..."
-        git tag -d "$new_version"
-        git checkout develop
-        exit 1
-    fi
-
-    # Switch back to develop
-    echo "🔄 Switching back to develop..."
-    git checkout develop
-
-    echo "✅ Deployment complete!"
-    echo "🎉 Version $new_version has been released"
-    echo "📋 Summary:"
-    echo "   - develop branch: bumped and pushed"
-    echo "   - main branch: merged and pushed"
-    echo "   - tag $new_version: created and pushed"
-    echo "🔗 Monitor release: https://github.com/nbari/pg_exporter/actions"
-
-# Deploy: merge to main, tag, and push everything
-deploy: bump _deploy-merge-and-tag
+# Deploy: stage a patch bump, test and package it, then release it
+deploy:
+    @scripts/release deploy patch
 
 # Deploy with minor version bump
-deploy-minor: bump-minor _deploy-merge-and-tag
+deploy-minor:
+    @scripts/release deploy minor
 
 # Deploy with major version bump
-deploy-major: bump-major _deploy-merge-and-tag
+deploy-major:
+    @scripts/release deploy major
 
-# Create & push a test tag like t-YYYYMMDD-HHMMSS (skips publish/release in CI)
+# Release develop's version as is when it has no tag yet (no new bump)
+deploy-current:
+    @scripts/release deploy current
+
+# Show where a release stands: develop, main, the staged candidate and its runs
+release-status:
+    @scripts/release status
+
+# Check everything a release needs; changes nothing apart from fetching
+release-preflight:
+    @scripts/release preflight
+
+# Publish an existing release tag again if its own run cannot (recovery run on main)
+release-republish version:
+    @scripts/release republish {{version}}
+
+# Apply the branch protection the release flow relies on (main requires "CI OK")
+protect-branches:
+    @scripts/release protect
+
+# Create & push a test tag like t-YYYYMMDD-HHMMSS (tests, builds and packages; publishes nothing)
 # Usage:
 #   just t-deploy
 #   just t-deploy "optional tag message"
