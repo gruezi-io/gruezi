@@ -95,27 +95,6 @@ clean:
 version:
     @cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version'
 
-# Check if working directory is clean
-check-clean:
-    #!/usr/bin/env bash
-    if [[ -n $(git status --porcelain) ]]; then
-        echo "❌ Working directory is not clean. Commit or stash your changes first."
-        git status --short
-        exit 1
-    fi
-    echo "✅ Working directory is clean"
-
-# Check if on develop branch
-check-develop:
-    #!/usr/bin/env bash
-    current_branch=$(git branch --show-current)
-    if [[ "$current_branch" != "develop" ]]; then
-        echo "❌ Not on develop branch (currently on: $current_branch)"
-        echo "Switch to develop branch first: git checkout develop"
-        exit 1
-    fi
-    echo "✅ On develop branch"
-
 # Check if tag already exists for a given version
 check-tag-not-exists version:
     #!/usr/bin/env bash
@@ -158,7 +137,7 @@ deploy-current:
 release-status:
     @scripts/release status
 
-# Check everything a release needs; changes nothing apart from fetching
+# Check everything a release needs; changes nothing that lasts
 release-preflight:
     @scripts/release preflight
 
@@ -166,37 +145,13 @@ release-preflight:
 release-republish version:
     @scripts/release republish {{version}}
 
-# Apply the branch protection the release flow relies on (main requires "CI OK")
+# Apply branch protection (main requires "CI OK") and the rule that release tags never move
 protect-branches:
     @scripts/release protect
 
-# Create & push a test tag like t-YYYYMMDD-HHMMSS (tests, builds and packages; publishes nothing)
-# Usage:
-#   just t-deploy
-#   just t-deploy "optional tag message"
-t-deploy message="CI test": check-develop check-clean test
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    message="{{message}}"
-    ts="$(date -u +%Y%m%d-%H%M%S)"
-    tag="t-${ts}"
-
-    echo "🏷️  Creating signed test tag: ${tag}"
-    git fetch --tags --quiet
-
-    if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-        echo "❌ Tag ${tag} already exists. Aborting." >&2
-        exit 1
-    fi
-
-    git tag -s "${tag}" -m "${message}"
-    git push origin "${tag}"
-
-    echo "✅ Pushed ${tag}"
-    echo "🧹 To remove it:"
-    echo "   git push origin :refs/tags/${tag} && git tag -d ${tag}"
-
+# Build and package the current branch like a release candidate; releases nothing, no tag
+release-dry-run:
+    @scripts/release dry-run
 
 # On-demand Jaeger for the devcontainer (compose "observability" profile)
 obs-dev:

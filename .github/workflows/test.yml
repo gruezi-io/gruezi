@@ -4,6 +4,9 @@ name: Test
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -13,11 +16,12 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: llvm-tools-preview
-          cache: false
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -26,25 +30,27 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache: false
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --locked --all-targets --all-features
 
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache: false
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
 
       - name: Check
-        run: cargo check
+        run: cargo check --locked
 
   test:
     name: Test
@@ -61,10 +67,10 @@ jobs:
       - lint
       - check
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache: false
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
 
       - name: test
-        run: cargo test
+        run: cargo test --locked

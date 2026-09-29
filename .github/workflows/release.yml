@@ -1,5 +1,5 @@
 ---
-name: Deploy
+name: Release
 
 on:
   push:
@@ -14,7 +14,9 @@ on:
         required: false
         default: ''
 
-# Read-only by default: only the GitHub release job writes to the repository.
+# Read-only by default. Jobs ask for more only where they need it: the manifest job
+# signs build provenance, the GitHub release job writes the release, and the crates.io
+# job requests a short-lived publish token through OIDC (Trusted Publishing).
 permissions:
   contents: read
 
@@ -32,8 +34,9 @@ jobs:
   #   tagged workflow, or GitHub's 30-day re-run limit). It applies the same checks to
   #   that tag and publishes its candidate artifacts with main's workflow; the tag
   #   itself never changes.
-  # - `test-tag`: any other tag, or a manual run on a tag (e.g. t-* from
-  #   `just t-deploy`): tests and builds only.
+  # - `test-tag`: any other tag, or a manual run on a tag: tests and builds only.
+  # A manual run on main without `publish` is a candidate run too (`just release-dry-run`
+  # starts one on the current branch): it builds and packages, publishing nothing.
   # A tag may only be published when its commit is on main, carries the tag's version
   # and passed Test & Build and its candidate run; a hand-pushed or stray tag stops here.
   guard:
@@ -50,7 +53,9 @@ jobs:
       candidate_run: ${{ steps.release.outputs.candidate_run }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Classify the run
         id: classify
@@ -196,21 +201,22 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Get package name from Cargo.toml
         id: package
         shell: bash
         run: |
           PACKAGE_NAME=$(awk -F '"' '/^name = / {print $2; exit}' Cargo.toml)
-          echo "name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
           echo "Package name: $PACKAGE_NAME"
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
+        uses: ./.github/actions/rust-toolchain
         with:
-          target: ${{ matrix.target }}
-          cache: false
+          targets: ${{ matrix.target }}
 
       # Linux-only prerequisites
       - name: Install system deps (musl)
@@ -219,11 +225,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y musl-dev musl-tools
 
+      # Pinned, so a candidate built later packages the same way; update deliberately.
       - name: Install packaging tools (RPM/DEB)
         if: matrix.build == 'linux'
         run: |
-          cargo install cargo-generate-rpm
-          cargo install cargo-deb --force --locked
+          cargo install cargo-generate-rpm --version 0.21.0 --locked
+          cargo install cargo-deb --version 3.8.0 --locked
 
       # Build once for Linux (musl)
       - name: Build Linux (musl)
@@ -242,7 +249,7 @@ jobs:
         run: |
           cargo generate-rpm --target "${{ matrix.target }}"
           RPM_PATH="$(find "target/${{ matrix.target }}/generate-rpm" -type f -name '*.rpm' -print -quit)"
-          echo "RPM_ASSET=$RPM_PATH" >> $GITHUB_ENV
+          echo "RPM_ASSET=$RPM_PATH" >> "$GITHUB_ENV"
           echo "RPM: $RPM_PATH"
 
       - name: Generate DEB (musl static)
@@ -250,7 +257,7 @@ jobs:
         run: |
           cargo deb --no-build --target "${{ matrix.target }}"
           DEB_PATH="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
-          echo "DEB_ASSET=$DEB_PATH" >> $GITHUB_ENV
+          echo "DEB_ASSET=$DEB_PATH" >> "$GITHUB_ENV"
           echo "DEB: $DEB_PATH"
 
       # Non-Linux builds (macOS)
@@ -267,7 +274,7 @@ jobs:
 
           mv "target/${{ matrix.target }}/release/$binary_name" "$dirname"
           tar -czf "$dirname.tar.gz" "$dirname"
-          echo "ASSET=$dirname.tar.gz" >> $GITHUB_ENV
+          echo "ASSET=$dirname.tar.gz" >> "$GITHUB_ENV"
 
       - name: Collect the release assets
         shell: bash
@@ -281,7 +288,7 @@ jobs:
 
       # The release tag publishes exactly these files, downloaded from this run.
       - name: Upload the release assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
@@ -299,12 +306,12 @@ jobs:
       rust: ${{ steps.package.outputs.rust }}
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          cache: false
+        uses: ./.github/actions/rust-toolchain
 
       # The artifact holds the crate alone: every file the release depends on is in the
       # manifest's checksum lists. The toolchain version travels as a job output.
@@ -320,7 +327,7 @@ jobs:
           echo "rust=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Upload the crate
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: crate
           path: crate/*
@@ -338,15 +345,19 @@ jobs:
       - build
       - crate
     if: needs.guard.outputs.kind == 'candidate'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Download this run's assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dist-*
           path: artifacts
 
       - name: Download this run's crate
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: crate
           path: crate
@@ -405,8 +416,18 @@ jobs:
           { for entry in ${EXPECTED}; do echo "${entry%=*}"; done; echo crate; } > manifest/ARTIFACTS
           cat manifest/*
 
+      # A signed statement that this run built exactly these bytes. The release publishes
+      # the same files, and crates.io receives a crate with the same checksum, so
+      # `gh attestation verify <file> --repo <owner>/<repo>` works on what users download.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*
+            crate/*.crate
+
       - name: Upload the manifest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-manifest
           path: manifest/*
@@ -430,11 +451,16 @@ jobs:
       contents: write
       actions: read
     steps:
+      # Full history and tags: the release notes list the commits since the previous
+      # release.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Download the candidate run's manifest
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           run-id: ${{ needs.guard.outputs.candidate_run }}
           github-token: ${{ github.token }}
@@ -442,7 +468,7 @@ jobs:
           path: ${{ runner.temp }}/manifest
 
       - name: Download the candidate run's assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           run-id: ${{ needs.guard.outputs.candidate_run }}
           github-token: ${{ github.token }}
@@ -473,6 +499,37 @@ jobs:
           (cd dist && sha256sum -c ../manifest/SHA256SUMS)
           cp manifest/SHA256SUMS dist/
 
+      # The notes are the commit subjects since the previous release (the version bump
+      # itself left out), so they need no hand-kept changelog and every re-run writes the
+      # same text.
+      - name: Write the release notes
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          previous="$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' "refs/tags/${TAG}^" 2>/dev/null || true)"
+          range="refs/tags/${TAG}"
+          [[ -z "${previous}" ]] || range="${previous}..refs/tags/${TAG}"
+          changes="$(git log --no-merges --format='- %s (%h)' "${range}" | grep -vE '^- bump version to [0-9]+\.[0-9]+\.[0-9]+ ' || true)"
+          {
+            echo "## Changes"
+            echo
+            echo "${changes:-- Only the version bump.}"
+            if [[ -n "${previous}" ]]; then
+              echo
+              echo "**Full changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${TAG}"
+            fi
+            echo
+            echo "## Verify a download"
+            echo
+            echo '```sh'
+            echo 'sha256sum --check --ignore-missing SHA256SUMS'
+            echo "gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+            echo '```'
+          } > "${RUNNER_TEMP}/notes.md"
+          cat "${RUNNER_TEMP}/notes.md"
+
       - name: Is this the latest release
         id: latest
         uses: ./.github/actions/release-is-latest
@@ -481,12 +538,12 @@ jobs:
           token: ${{ github.token }}
 
       - name: Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.guard.outputs.tag }}
           draft: false
           make_latest: ${{ steps.latest.outputs.latest }}
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/notes.md
           files: ${{ runner.temp }}/dist/*
 
       - name: Keep exactly the manifest's files on the release
@@ -511,10 +568,13 @@ jobs:
           fi
 
   # Upload the crate the candidate run packaged and verified, after the GitHub release,
-  # from a clean checkout of the tag.
-  # The candidate's toolchain repackages it without building (cargo packaging is
-  # reproducible), and it is only uploaded when the checksum matches the manifest.
-  # Safe to re-run: a version crates.io already has is accepted only with that checksum.
+  # from a clean checkout of the tag. cargo cannot upload a prepared .crate, so the
+  # candidate's toolchain repackages the same source without building (cargo packaging
+  # is reproducible), and the crate is uploaded only when its checksum matches the
+  # manifest. The upload token comes from crates.io Trusted Publishing: a short-lived
+  # token minted through OIDC for this workflow, revoked when the job ends; no registry
+  # secret is stored. Safe to re-run: a version crates.io already has is accepted only
+  # with the candidate's checksum.
   publish:
     name: Publish
     runs-on: ubuntu-latest
@@ -525,55 +585,60 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
       - name: Checkout the tag's sources
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ needs.guard.outputs.tag }}
+          persist-credentials: false
 
       # Outside the checkout: cargo refuses to package a working tree with files git
       # does not know about.
       - name: Download the candidate run's manifest
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           run-id: ${{ needs.guard.outputs.candidate_run }}
           github-token: ${{ github.token }}
           name: release-manifest
           path: ${{ runner.temp }}/manifest
 
-      - name: Read the manifest
-        id: manifest
+      # Inline rather than the local rust-toolchain action: this checkout is the tag's,
+      # and tags made before that action existed must still be recoverable.
+      - name: Install the candidate's toolchain
         shell: bash
         run: |
           set -euo pipefail
           . "${RUNNER_TEMP}/manifest/release.env"
-          echo "rust=${RUST}" >> "$GITHUB_OUTPUT"
+          if [[ ! "${RUST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The manifest names no exact toolchain (got '${RUST}')."
+            exit 1
+          fi
+          rustup toolchain install "${RUST}" --profile minimal
+          rustup default "${RUST}"
+          rustc --version
 
-      - name: Install the candidate's toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          toolchain: ${{ steps.manifest.outputs.rust }}
-          cache: false
-
-      - name: Publish to crates.io
+      - name: Compare with crates.io and repackage
+        id: crate
         shell: bash
         env:
-          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
           VERSION: ${{ needs.guard.outputs.version }}
         run: |
           set -euo pipefail
           crate="$(awk -F'"' '/^name = /{print $2; exit}' Cargo.toml)"
           expected="$(awk '{print $1}' "${RUNNER_TEMP}/manifest/CRATE.SHA256")"
-          registry() {
-            curl -sf -A "${crate}-release" "https://crates.io/api/v1/crates/${crate}/${VERSION}" | jq -r '.version.checksum // empty' || true
-          }
-          existing="$(registry)"
+          existing="$(curl -sf -A "${crate}-release" "https://crates.io/api/v1/crates/${crate}/${VERSION}" | jq -r '.version.checksum // empty' || true)"
+          {
+            echo "crate=${crate}"
+            echo "expected=${expected}"
+          } >> "$GITHUB_OUTPUT"
           if [[ -n "${existing}" ]]; then
             if [[ "${existing}" != "${expected}" ]]; then
               echo "::error::crates.io already has ${crate} ${VERSION} with checksum ${existing}, not the candidate's ${expected}."
               exit 1
             fi
             echo "${crate} ${VERSION} is already on crates.io with the candidate's checksum; nothing to publish."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cargo package --no-verify --locked
@@ -582,13 +647,31 @@ jobs:
             echo "::error::Repackaged crate checksum ${actual} differs from the candidate's ${expected}; not publishing."
             exit 1
           fi
-          cargo publish --no-verify --locked --token "${CRATES_TOKEN}"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Get a crates.io token (Trusted Publishing)
+        id: auth
+        if: steps.crate.outputs.needed == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        if: steps.crate.outputs.needed == 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CRATE: ${{ steps.crate.outputs.crate }}
+          EXPECTED: ${{ steps.crate.outputs.expected }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo publish --no-verify --locked
           for _ in $(seq 30); do
-            if [[ "$(registry)" == "${expected}" ]]; then
-              echo "crates.io has ${crate} ${VERSION} with checksum ${expected}."
+            got="$(curl -sf -A "${CRATE}-release" "https://crates.io/api/v1/crates/${CRATE}/${VERSION}" | jq -r '.version.checksum // empty' || true)"
+            if [[ "${got}" == "${EXPECTED}" ]]; then
+              echo "crates.io has ${CRATE} ${VERSION} with checksum ${EXPECTED}."
               exit 0
             fi
             sleep 10
           done
-          echo "::error::crates.io does not report ${crate} ${VERSION} with checksum ${expected} yet."
+          echo "::error::crates.io does not report ${CRATE} ${VERSION} with checksum ${EXPECTED} yet."
           exit 1
