@@ -155,63 +155,53 @@ The packaged systemd unit expects:
 
 ## Releasing
 
-A release follows one rule: **the commit that is tagged and put on `main` is exactly the
-commit CI tested, and the published files are exactly the files CI built.** `just deploy`
-promotes a commit only after every test, build and package passed on it, so a release
-never needs a tag deleted or moved. Branch protection lets onto `main` only commits whose
-**CI OK** check passed, and the Deploy workflow publishes a tag only with the successful
-candidate run the signed tag names. The flow lives in `scripts/release`,
-`.github/workflows/build.yml` (Test & Build) and `.github/workflows/release.yml`
-(Deploy); it is the flow documented in full in the "Releasing" section of
-[cron-when](https://github.com/nbari/cron-when#releasing), which is its template.
+A release is one command, `just deploy`, and follows one rule: **the commit that is
+tagged and put on `main` is exactly the commit CI tested, and everything published is
+exactly what CI built.** The version bump is staged on the scratch `release` branch,
+Test & Build and a candidate run of the Release workflow (`.github/workflows/release.yml`)
+test and package that exact commit, and only then do `develop`, `main` and the signed
+tag move together in one atomic push. The tag's run builds nothing: it publishes the
+candidate's files and crate. A failure before the tag leaves nothing to clean up, and a
+release never needs a tag deleted or moved. The flow comes from
+[cron-when](https://github.com/nbari/cron-when), whose
+[RELEASING.md](https://github.com/nbari/cron-when/blob/main/RELEASING.md) explains it
+in full: the diagrams, every failure and what to do, the guarantees and limits, and how
+to verify a download.
 
 Work, including dependency updates (`just update`), lands on `sandbox`. When its
 **Test & Build** run is green, merge it into `develop` and run `just deploy` from a clean
-`develop`.
+`develop`; you can keep working on `sandbox` meanwhile.
 
 | Command | What it does |
 |---|---|
-| `just deploy` | Release a patch bump (`deploy-minor`, `deploy-major` for the others); when `develop`'s current version has no tag yet, it releases that version as is instead |
+| `just deploy` | Release a patch version (`deploy-minor`, `deploy-major` for the others); when `develop` already carries an untagged version, that version is released as is |
 | `just deploy-current` | Release `develop`'s untagged version as is, explicitly |
-| `just release-status` | Show `develop`, `main`, the staged candidate, its runs and the last tag's publish run |
-| `just release-preflight` | Run only the checks; changes nothing apart from fetching |
+| `just release-status` | Show `develop`, `main`, `sandbox`, the staged candidate and its runs |
+| `just release-preflight` | Run only the checks; changes nothing that lasts |
+| `just release-dry-run` | Build and package the current branch exactly like a candidate, releasing nothing: no bump, no tag |
 | `just release-republish X.Y.Z` | Recovery: publish an existing tag again with `main`'s workflow |
-| `just protect-branches` | Apply the branch protection the flow relies on |
-| `just t-deploy` | Push a `t-*` test tag: tests, builds and packages, publishes nothing |
+| `just protect-branches` | Apply the branch protection and the rule that release tags are never moved or deleted |
 
-`just deploy` checks that `develop` is clean and equal to origin, then bumps the version
-(`Cargo.toml` and `Cargo.lock` only) in a temporary worktree, runs `just test` there,
-and pushes a signed commit "bump version to X" to the scratch `release` branch only. On
-that exact commit, Test & Build runs, and so does a manual run of the Deploy workflow in
-candidate mode: it tests, builds the archive, RPM and DEB for Linux x86_64 and aarch64
-(musl) and the archives for macOS x86_64 and aarch64, packages and verifies the crate, and keeps all of it as artifacts with a
-manifest of their SHA-256 sums, publishing nothing. When both pass, the script downloads
-the manifest and every artifact and checks the commit, the version and every checksum,
-then moves `develop`, `main` and the signed tag X together in one atomic push; the tag
-message names the candidate run. The tag's Deploy run builds nothing: its guard checks
-the tag (GitHub-verified signature, commit on `main`, version, Test & Build, the named
-candidate run), the GitHub release gets exactly the manifest's files with notes GitHub
-generates, and the crate goes
-to crates.io, repackaged from the tag with the candidate's toolchain and uploaded only
-when its checksum matches the manifest. The release is marked Latest only when its tag is
-the highest promoted release at that moment.
+The candidate run builds the archive, RPM and DEB for Linux x86_64 and aarch64 (musl) and the archives for macOS x86_64 and aarch64, packages and verifies the crate, keeps everything
+with a manifest of SHA-256 sums, and attests the build provenance of every file. The tag
+run publishes those files to the GitHub release with notes made from the commit
+subjects since the previous release, marks it Latest only while it is the highest
+release, and uploads the crate with crates.io
+[Trusted Publishing](https://crates.io/docs/trusted-publishing) (no stored token),
+only when the repackaged crate has the tested checksum. To check a download:
 
-If anything fails before the atomic push, nothing moved: no tag, `develop` and `main`
-untouched. Re-run the failed jobs in GitHub (a waiting deploy picks the re-run up within
-15 minutes), or fix it on `sandbox` and merge; then run `just deploy` again, which
-resumes the same candidate and runs, replaces a stale one, or says there is nothing new
-to release. A failed publish step in the tag's run is fixed with "Re-run failed jobs";
-when the tagged workflow itself was wrong, fix it, release as usual, and run
-`just release-republish X.Y.Z`. Recovery needs the candidate's artifacts, which GitHub
-keeps for 90 days.
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify <file> --repo gruezi-io/gruezi --signer-workflow gruezi-io/gruezi/.github/workflows/release.yml
+```
 
-`RELEASE_POLL_SECONDS` (30), `RELEASE_CI_TIMEOUT` (3600, per attempt) and
-`RELEASE_RERUN_WAIT` (900, after a failed attempt) are in seconds, and
-`RELEASE_NO_WAIT=1` stops once the candidate is staged, or while CI still runs; a later
-`just deploy` finishes. Releasing needs `just`, `jq`, `gh` (logged in), `cargo-edit`,
-and a signing key that GitHub knows as a signing key, since commits and tags must be
-signed.
-
+If anything fails before promotion, nothing moved: re-run the failed jobs in GitHub, or
+fix it on `sandbox` and merge, then run `just deploy` again; it resumes the same
+candidate. A failed publish step is finished by "Re-run failed jobs" on the tag run,
+within GitHub's 30-day window, or later with `just release-republish X.Y.Z` while the
+candidate's artifacts are kept (90 days). Releasing needs `just`, `jq`, `gh` (logged
+in), git 2.31 or later, `cargo-edit`, and a signing key that GitHub knows as a signing
+key, since commits and tags must be signed.
 ## Commits and pull requests
 
 Keep commit subjects short, imperative, and scoped to one change.
