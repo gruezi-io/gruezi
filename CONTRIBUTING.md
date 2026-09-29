@@ -180,7 +180,7 @@ Work, including dependency updates (`just update`), lands on `sandbox`. When its
 | `just release-preflight` | Run only the checks; changes nothing that lasts |
 | `just release-dry-run` | Build and package the current branch exactly like a candidate, releasing nothing: no bump, no tag |
 | `just release-republish X.Y.Z` | Recovery: publish an existing tag again with `main`'s workflow |
-| `just protect-branches` | Apply the branch protection and the rule that release tags are never moved or deleted |
+| `just protect-branches` | Apply the branch protection (**CI OK** on `main`, signed commits, linear history and resolved review conversations) and the rule that release tags are never moved or deleted |
 
 The candidate run builds the archive, RPM and DEB for Linux x86_64 and aarch64 (musl) and the archives for macOS x86_64 and aarch64, packages and verifies the crate, keeps everything
 with a manifest of SHA-256 sums, and attests the build provenance of every file. The tag
