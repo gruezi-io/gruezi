@@ -288,7 +288,7 @@ jobs:
 
       # The release tag publishes exactly these files, downloaded from this run.
       - name: Upload the release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
@@ -327,7 +327,7 @@ jobs:
           echo "rust=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Upload the crate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crate
           path: crate/*
@@ -351,13 +351,13 @@ jobs:
       attestations: write
     steps:
       - name: Download this run's assets
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
           path: artifacts
 
       - name: Download this run's crate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: crate
           path: crate
@@ -427,7 +427,7 @@ jobs:
             crate/*.crate
 
       - name: Upload the manifest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-manifest
           path: manifest/*
@@ -460,7 +460,7 @@ jobs:
           persist-credentials: false
 
       - name: Download the candidate run's manifest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           run-id: ${{ needs.guard.outputs.candidate_run }}
           github-token: ${{ github.token }}
@@ -468,7 +468,7 @@ jobs:
           path: ${{ runner.temp }}/manifest
 
       - name: Download the candidate run's assets
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           run-id: ${{ needs.guard.outputs.candidate_run }}
           github-token: ${{ github.token }}
@@ -596,7 +596,7 @@ jobs:
       # Outside the checkout: cargo refuses to package a working tree with files git
       # does not know about.
       - name: Download the candidate run's manifest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           run-id: ${{ needs.guard.outputs.candidate_run }}
           github-token: ${{ github.token }}
