@@ -33,7 +33,7 @@ impl Config {
     ///
     /// Returns an error if the YAML cannot be parsed or the config is invalid.
     pub fn from_yaml_str(input: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(input).context("failed to parse YAML config")?;
+        let config: Self = serde_saphyr::from_str(input).context("failed to parse YAML config")?;
         config.validate()?;
         Ok(config)
     }
