@@ -545,6 +545,25 @@ async fn cleanup_before_exit(
     worker: &mut ResourceWorkerHandle,
     faulted: bool,
 ) {
+    cleanup_before_exit_with_hook(runtime, status_tx, loop_state, worker, faulted, |context| {
+        runtime.hooks.run(HookEvent::Fault, context)
+    })
+    .await;
+}
+
+async fn cleanup_before_exit_with_hook<H, F>(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
+    faulted: bool,
+    fault_hook: H,
+) where
+    H: FnOnce(HookContext) -> F,
+    F: Future<Output = Result<()>>,
+{
+    let cleanup_deadline = tokio::time::Instant::now()
+        + Duration::from_millis(crate::gruezi::addresses::WITHDRAW_TIMEOUT_MS);
     let previous_state = loop_state.state;
     let now = tokio::time::Instant::now().into_std();
     let reason = if faulted {
@@ -577,7 +596,13 @@ async fn cleanup_before_exit(
             loop_state.peer_observation.as_ref(),
             now,
         );
-        if let Err(error) = runtime.hooks.run(HookEvent::Fault, context).await {
+        // Withdrawal owns the budget first. A notification cannot extend it,
+        // even when the configured hook timeout exceeds the remaining budget.
+        if let Err(error) = tokio::time::timeout_at(cleanup_deadline, fault_hook(context))
+            .await
+            .context("fault hook exceeded the remaining withdrawal deadline")
+            .and_then(std::convert::identity)
+        {
             warn!(%error, node_id = %runtime.node_id, "HA fault hook execution failed during shutdown");
         }
     }
@@ -868,6 +893,75 @@ mod tests {
     use crate::config::Config;
     use anyhow::Result;
     use std::time::Instant;
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_fault_hook_does_not_exceed_join_deadline() -> Result<()> {
+        use crate::gruezi::addresses::{
+            CommandGate, CommandRunner, ResourceWorkerHandle, SimulatedKernel,
+        };
+        use anyhow::Context;
+        use tokio::sync::oneshot;
+        let config = Config::from_yaml_str(
+            "mode: ha\nnode:\n  id: node-a\nha:\n  group_id: cluster-ha\n  interface: eth0\n  peer: 127.0.0.1:9\n  addresses: [10.0.0.10/24]\n",
+        )?;
+        let runtime = HaRuntimeConfig::try_from(&config)?;
+        let kernel = SimulatedKernel::new_shared();
+        SimulatedKernel::insert_address(&kernel, "eth0", "10.0.0.10/24", "");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.gate_next_del = Some(CommandGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        }
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            super::address_manager(&runtime),
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut loop_state = super::initialize_loop_state(&runtime, None, &worker);
+        entered_rx
+            .await
+            .context("withdrawal entered the command gate")?;
+        let started = tokio::time::Instant::now();
+        let budget =
+            std::time::Duration::from_millis(crate::gruezi::addresses::WITHDRAW_TIMEOUT_MS);
+        let hook_started = std::cell::Cell::new(false);
+        let cleanup = super::cleanup_before_exit_with_hook(
+            &runtime,
+            None,
+            &mut loop_state,
+            &mut worker,
+            true,
+            |_| {
+                hook_started.set(true);
+                assert_eq!(
+                    SimulatedKernel::table_snapshot(&kernel),
+                    Vec::<String>::new()
+                );
+                std::future::pending()
+            },
+        );
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = release_tx.send(Ok(()));
+        };
+        tokio::join!(cleanup, release);
+        assert!(hook_started.get());
+        assert_eq!(tokio::time::Instant::now() - started, budget);
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        assert!(!loop_state.ownership.owned());
+        println!(
+            "HANGING FAULT HOOK: real worker drained at 2000ms; total cleanup join=5000ms; hook cancelled; kernel table empty"
+        );
+        Ok(())
+    }
 
     #[test]
     fn rejects_packet_with_invalid_auth_tag() -> Result<()> {

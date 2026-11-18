@@ -3,9 +3,94 @@ use super::{
     election::{HaDecisionReason, HaState},
     runtime::HaLoopState,
 };
+use crate::gruezi::ownership::{AuthoritySource, OwnershipController, ResourceState};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceStatus {
+    pub state: String,
+    pub confirmed: bool,
+    pub observed_ago_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityStatus {
+    pub state: String,
+    pub source: Option<AuthoritySource>,
+    pub term: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyLevel {
+    Safe,
+    Uncertain,
+    Assumed,
+}
+
+impl SafetyLevel {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Uncertain => "uncertain",
+            Self::Assumed => "assumed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyStatus {
+    pub level: SafetyLevel,
+    pub why: String,
+}
+
+fn ownership_status(
+    ownership: &OwnershipController,
+    now: Instant,
+) -> (ResourceStatus, AuthorityStatus, SafetyStatus) {
+    let resource = ownership.resource_state();
+    let authority = ownership.authority();
+    let (level, why) = if ownership.owned() && authority.source() == Some(AuthoritySource::Assumed)
+    {
+        (
+            SafetyLevel::Assumed,
+            "ownership relies on local timeout authority",
+        )
+    } else if ownership.owned() || ownership.can_release_handoff() {
+        (SafetyLevel::Safe, "resource and authority are confirmed")
+    } else {
+        (
+            SafetyLevel::Uncertain,
+            "resource or authority is not confirmed",
+        )
+    };
+    (
+        ResourceStatus {
+            state: resource.as_str().to_owned(),
+            confirmed: matches!(
+                resource,
+                ResourceState::Absent | ResourceState::Present { .. } | ResourceState::Unmanaged
+            ),
+            observed_ago_ms: ownership
+                .last_observed_at()
+                .map(|observed| saturating_elapsed_ms(now, observed.into_std())),
+            last_error: ownership.last_error().map(str::to_owned),
+        },
+        AuthorityStatus {
+            state: authority.as_str().to_owned(),
+            source: authority.source(),
+            term: authority.term(),
+        },
+        SafetyStatus {
+            level,
+            why: why.to_owned(),
+        },
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaStatus {
@@ -14,6 +99,10 @@ pub struct HaStatus {
     pub bind: String,
     pub peer: String,
     pub state: HaState,
+    pub owned: bool,
+    pub resource: ResourceStatus,
+    pub authority: AuthorityStatus,
+    pub safety: SafetyStatus,
     pub priority: u8,
     pub advert_interval_ms: u64,
     pub dead_timeout_ms: u64,
@@ -41,12 +130,20 @@ impl HaStatus {
         bind: impl Into<String>,
         peer: impl Into<String>,
     ) -> Self {
+        let (resource, authority, safety) = ownership_status(
+            &OwnershipController::new(crate::gruezi::ownership::ResourceManagement::Managed),
+            Instant::now(),
+        );
         Self {
             node_id: node_id.into(),
             group_id: group_id.into(),
             bind: bind.into(),
             peer: peer.into(),
             state: HaState::Init,
+            owned: false,
+            resource,
+            authority,
+            safety,
             priority: 0,
             advert_interval_ms: 0,
             dead_timeout_ms: 0,
@@ -78,6 +175,7 @@ pub(super) fn publish_loop_status(
 }
 
 fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Instant) -> HaStatus {
+    let (resource, authority, safety) = ownership_status(&loop_state.ownership, now);
     let live_peer = loop_state
         .peer_observation
         .as_ref()
@@ -93,6 +191,10 @@ fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Ins
         bind: runtime.bind.clone(),
         peer: runtime.peer.clone(),
         state: loop_state.state,
+        owned: loop_state.ownership.owned(),
+        resource,
+        authority,
+        safety,
         priority: runtime.priority,
         advert_interval_ms: runtime.advert_interval_ms,
         dead_timeout_ms: duration_millis_u64(runtime.dead_timeout()),

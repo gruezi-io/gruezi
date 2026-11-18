@@ -72,7 +72,26 @@ fn snapshot_lines(status: &gruezi::status::StatusResponse) -> Vec<String> {
     if let Some(ha) = &status.ha {
         lines.push(format!("  Node ID: {}", ha.node_id));
         lines.push(format!("  Group ID: {}", ha.group_id));
-        lines.push(format!("  HA State: {:?}", ha.state));
+        lines.push(format!("  Elected Role: {:?}", ha.state));
+        lines.push(format!("  Owned: {}", ha.owned));
+        lines.push(format!(
+            "  Resource: {} confirmed={} observed_ago_ms={:?} last_error={:?}",
+            ha.resource.state,
+            ha.resource.confirmed,
+            ha.resource.observed_ago_ms,
+            ha.resource.last_error
+        ));
+        lines.push(format!(
+            "  Authority: {} source={} term={}",
+            ha.authority.state,
+            ha.authority.source.map_or("none", |source| source.as_str()),
+            ha.authority.term
+        ));
+        lines.push(format!(
+            "  Safety: {} ({})",
+            ha.safety.level.as_str(),
+            ha.safety.why
+        ));
         lines.push(format!("  Bind: {}", ha.bind));
         lines.push(format!("  Peer: {}", ha.peer));
         lines.push(format!("  Priority: {}", ha.priority));
@@ -130,9 +149,19 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
             .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"));
 
         format!(
-            "[{timestamp}] node={} state={:?} reason={} last_transition_reason={} peer_alive={} peer_node={} peer_state={} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
+            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} safety={} safety_why={:?} reason={} last_transition_reason={} peer_alive={} peer_node={} peer_state={} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
             ha.node_id,
             ha.state,
+            ha.owned,
+            ha.resource.state,
+            ha.resource.confirmed,
+            ha.resource.observed_ago_ms,
+            ha.resource.last_error,
+            ha.authority.state,
+            ha.authority.source.map_or("none", |source| source.as_str()),
+            ha.authority.term,
+            ha.safety.level.as_str(),
+            ha.safety.why,
             ha.decision_reason,
             ha.last_transition_reason
                 .map_or_else(|| "unknown".to_owned(), |reason| reason.to_string()),
@@ -184,6 +213,7 @@ mod tests {
             decision_reason: HaDecisionReason::PeerTimeout,
             last_transition_reason: Some(HaDecisionReason::LocalHigherPriority),
             last_transition_ms_ago: Some(250),
+            ..HaStatus::new("gruezi-a", "lab-ha", "0.0.0.0:9375", "192.0.2.11:9375")
         })
     }
 
@@ -198,6 +228,11 @@ mod tests {
         assert!(output.contains("Duplicate Node ID Packets: 0"));
         assert!(output.contains("Decision Reason: peer_timeout"));
         assert!(output.contains("Last Transition Reason: local_higher_priority"));
+        assert!(output.contains("Elected Role: Active"));
+        assert!(output.contains("Owned: false"));
+        assert!(output.contains("Resource: releasing confirmed=false"));
+        assert!(output.contains("Authority: none source=none term=0"));
+        assert!(output.contains("Safety: uncertain"));
     }
 
     #[test]
@@ -205,7 +240,10 @@ mod tests {
         let line = format_watch_line("2026-03-10T12:00:00+01:00", &sample_status());
         assert!(line.contains("[2026-03-10T12:00:00+01:00]"));
         assert!(line.contains("node=gruezi-a"));
-        assert!(line.contains("state=Active"));
+        assert!(line.contains("elected_role=Active"));
+        assert!(line.contains("owned=false"));
+        assert!(line.contains("resource=releasing"));
+        assert!(line.contains("safety=uncertain"));
         assert!(line.contains("reason=peer_timeout"));
         assert!(line.contains("recv=41"));
         assert!(line.contains("duplicate_node_id_packets=0"));

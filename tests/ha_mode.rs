@@ -1,4 +1,7 @@
+mod common;
+
 use anyhow::{Result, anyhow};
+use common::FakeIp;
 use gruezi::gruezi::{
     api,
     ha::{HaAuth, HaDecisionReason, HaRuntimeConfig, HaState, HaStatus, run_with_status},
@@ -98,9 +101,12 @@ struct NodeWithApi {
     shutdown_tx: oneshot::Sender<()>,
     runtime_task: JoinHandle<Result<()>>,
     api_task: JoinHandle<Result<()>>,
+    api_addr: String,
 }
 
-fn spawn_node_with_api(runtime: HaRuntimeConfig) -> NodeWithApi {
+async fn spawn_node_with_api(runtime: HaRuntimeConfig) -> Result<NodeWithApi> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let api_addr = listener.local_addr()?.to_string();
     let (status_tx, status_rx) = watch::channel(HaStatus::new(
         runtime.node_id.clone(),
         runtime.group_id.clone(),
@@ -125,14 +131,17 @@ fn spawn_node_with_api(runtime: HaRuntimeConfig) -> NodeWithApi {
     };
 
     let api_task =
-        tokio::spawn(async move { api::run_ha_api(status_tx, std::future::pending()).await });
+        tokio::spawn(
+            async move { api::run_ha_api(listener, status_tx, std::future::pending()).await },
+        );
 
-    NodeWithApi {
+    Ok(NodeWithApi {
         status_rx,
         shutdown_tx,
         runtime_task,
         api_task,
-    }
+        api_addr,
+    })
 }
 
 async fn wait_for_status<F>(
@@ -686,32 +695,30 @@ async fn duplicate_node_id_keeps_peers_isolated() -> Result<()> {
 
 #[tokio::test]
 async fn status_api_reflects_live_ha_state() -> Result<()> {
+    let fixture = FakeIp::new()?;
     let port_a = free_udp_port()?;
     let port_b = free_udp_port()?;
-    let runtime_a = runtime_config("node-a", port_a, port_b, 110, true);
+    let runtime_a = HaRuntimeConfig {
+        ip_command: fixture.command("ip").display().to_string(),
+        arping_command: fixture.command("arping").display().to_string(),
+        ndsend_command: fixture.command("ndsend").display().to_string(),
+        ..runtime_config("node-a", port_a, port_b, 110, true)
+    };
 
     let NodeWithApi {
         mut status_rx,
         shutdown_tx,
         runtime_task,
         api_task,
-    } = spawn_node_with_api(runtime_a);
+        api_addr,
+    } = spawn_node_with_api(runtime_a).await?;
 
     wait_for_status(&mut status_rx, "node-a active with api", |status| {
-        status.state == HaState::Active && !status.peer_alive
+        status.state == HaState::Active && !status.peer_alive && status.owned
     })
     .await?;
 
-    let response = timeout(Duration::from_secs(3), async {
-        loop {
-            match fetch_status(Some("127.0.0.1:9376")).await {
-                Ok(response) => return Ok::<_, anyhow::Error>(response),
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("timed out waiting for HA API status response"))??;
+    let response = timeout(Duration::from_secs(3), fetch_status(Some(&api_addr))).await??;
 
     let ha = response
         .ha
@@ -729,7 +736,39 @@ async fn status_api_reflects_live_ha_state() -> Result<()> {
         Some(HaDecisionReason::StartupDeadlineExpired)
     );
     assert!(ha.last_transition_ms_ago.is_some());
+    assert!(ha.owned);
+    assert_eq!(ha.resource.state, "present");
+    assert!(ha.resource.confirmed);
+    assert_eq!(
+        std::fs::read_to_string(fixture.dir.join("state"))?,
+        "lo 10.0.0.10/24\n"
+    );
+    println!(
+        "STATUS API {api_addr}: elected_role={:?} owned={} resource={}",
+        ha.state, ha.owned, ha.resource.state
+    );
+    let cli = timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_gruezi"))
+            .args(["status", "--node", &api_addr])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let output = String::from_utf8(cli.stdout)?;
+    assert!(output.contains("Elected Role: Active"));
+    assert!(output.contains("Owned: true"));
+    assert!(output.contains("Resource: present confirmed=true"));
+    assert!(output.contains("Authority: valid source=assumed term=1"));
+    assert!(output.contains("Safety: assumed"));
+    println!("CLI CONFIRMED OWNERSHIP:\n{output}");
 
     stop_node_with_api(shutdown_tx, runtime_task, api_task).await?;
+    assert_eq!(std::fs::read_to_string(fixture.dir.join("state"))?, "");
     Ok(())
 }
