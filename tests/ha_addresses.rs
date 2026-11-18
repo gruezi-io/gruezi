@@ -1,5 +1,11 @@
+#![cfg(target_os = "linux")]
+
+mod common;
+
 use anyhow::{Result, anyhow};
+use common::FakeIp;
 use gruezi::gruezi::{
+    addresses::{AddressAction, AddressManager},
     ha::{HaAuth, HaRuntimeConfig, HaState, HaStatus, run_with_status},
     hooks::HaHooks,
 };
@@ -157,6 +163,19 @@ fn write_command_script(dir: &Path, name: &str, output_path: &Path) -> Result<St
     Ok(script_path.display().to_string())
 }
 
+fn write_ip_script(dir: &Path, name: &str, output_path: &Path, fixture: &FakeIp) -> Result<String> {
+    let path = write_command_script(dir, name, output_path)?;
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
+            output_path.display(),
+            fixture.command("ip").display()
+        ),
+    )?;
+    Ok(path)
+}
+
 async fn wait_for_log_lines(
     path: &Path,
     expected_lines: usize,
@@ -202,8 +221,10 @@ async fn master_adds_and_backup_removes_addresses() -> Result<()> {
     let dir = temp_dir("ha-addresses-startup")?;
     let log_a = dir.join("node-a.log");
     let log_b = dir.join("node-b.log");
-    let ip_a = write_command_script(&dir, "node-a-ip", &log_a)?;
-    let ip_b = write_command_script(&dir, "node-b-ip", &log_b)?;
+    let fixture_a = FakeIp::new()?;
+    let fixture_b = FakeIp::new()?;
+    let ip_a = write_ip_script(&dir, "node-a-ip", &log_a, &fixture_a)?;
+    let ip_b = write_ip_script(&dir, "node-b-ip", &log_b, &fixture_b)?;
     let arping_a = write_command_script(&dir, "node-a-arping", &log_a)?;
     let arping_b = write_command_script(&dir, "node-b-arping", &log_b)?;
     let ndsend_a = write_command_script(&dir, "node-a-ndsend", &log_a)?;
@@ -248,8 +269,13 @@ async fn master_adds_and_backup_removes_addresses() -> Result<()> {
     })
     .await?;
 
-    let contents_a = wait_for_log_lines(&log_a, 6, "node-a address actions").await?;
-    let contents_b = wait_for_log_lines(&log_b, 2, "node-b address actions").await?;
+    let contents_a = wait_for_log_contents(
+        &log_a,
+        &["-U -I lo -c 1 10.0.0.10", "fd00::10 lo"],
+        "node-a address actions",
+    )
+    .await?;
+    let contents_b = wait_for_log_lines(&log_b, 3, "node-b address actions").await?;
 
     assert!(contents_a.contains("address add 10.0.0.10/24 dev lo"));
     assert!(contents_a.contains("address add fd00::10/64 dev lo"));
@@ -268,7 +294,8 @@ async fn master_adds_and_backup_removes_addresses() -> Result<()> {
 async fn shutdown_removes_master_addresses() -> Result<()> {
     let dir = temp_dir("ha-addresses-shutdown")?;
     let log = dir.join("node-a.log");
-    let ip = write_command_script(&dir, "node-a-ip", &log)?;
+    let fixture = FakeIp::new()?;
+    let ip = write_ip_script(&dir, "node-a-ip", &log, &fixture)?;
     let arping = write_command_script(&dir, "node-a-arping", &log)?;
     let ndsend = write_command_script(&dir, "node-a-ndsend", &log)?;
 
@@ -325,8 +352,10 @@ async fn demotion_removes_addresses_after_preemption() -> Result<()> {
     let dir = temp_dir("ha-addresses-demote")?;
     let log_a = dir.join("node-a.log");
     let log_b = dir.join("node-b.log");
-    let ip_a = write_command_script(&dir, "node-a-ip", &log_a)?;
-    let ip_b = write_command_script(&dir, "node-b-ip", &log_b)?;
+    let fixture_a = FakeIp::new()?;
+    let fixture_b = FakeIp::new()?;
+    let ip_a = write_ip_script(&dir, "node-a-ip", &log_a, &fixture_a)?;
+    let ip_b = write_ip_script(&dir, "node-b-ip", &log_b, &fixture_b)?;
     let arping_a = write_command_script(&dir, "node-a-arping", &log_a)?;
     let arping_b = write_command_script(&dir, "node-b-arping", &log_b)?;
     let ndsend_a = write_command_script(&dir, "node-a-ndsend", &log_a)?;
@@ -376,8 +405,13 @@ async fn demotion_removes_addresses_after_preemption() -> Result<()> {
     })
     .await?;
 
-    let contents_a = wait_for_log_lines(&log_a, 6, "node-a address actions").await?;
-    let contents_b = wait_for_log_lines(&log_b, 6, "node-b address actions").await?;
+    let contents_a = wait_for_log_contents(
+        &log_a,
+        &["-U -I lo -c 1 10.0.0.10", "fd00::10 lo"],
+        "node-a address actions",
+    )
+    .await?;
+    let contents_b = wait_for_log_lines(&log_b, 11, "node-b address actions").await?;
 
     assert!(contents_a.contains("address add 10.0.0.10/24 dev lo"));
     assert!(contents_a.contains("address add fd00::10/64 dev lo"));
@@ -390,5 +424,167 @@ async fn demotion_removes_addresses_after_preemption() -> Result<()> {
     stop_node(shutdown_a, task_a).await?;
     stop_node(shutdown_b, task_b).await?;
     fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+fn address_manager(fixture: &FakeIp) -> AddressManager {
+    AddressManager {
+        ip_command: fixture.command("ip").display().to_string(),
+        arping_command: fixture.command("arping").display().to_string(),
+        ndsend_command: fixture.command("ndsend").display().to_string(),
+        interface: "eth0".to_owned(),
+        addresses: vec![
+            "10.0.0.10/24".to_owned(),
+            "10.0.0.11/24".to_owned(),
+            "fd00::10/64".to_owned(),
+        ],
+    }
+}
+
+async fn read_back(fixture: &FakeIp) -> Result<String> {
+    let output = timeout(
+        Duration::from_secs(4),
+        tokio::process::Command::new(fixture.command("ip"))
+            .args(["-o", "address", "show", "dev", "eth0"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    assert!(output.status.success());
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+#[tokio::test]
+async fn three_addresses_add_and_remove_match_read_back() -> Result<()> {
+    let fixture = FakeIp::new()?;
+    let dir = fixture.dir.clone();
+    let manager = address_manager(&fixture);
+    manager.apply(AddressAction::Add).await?;
+    let table = read_back(&fixture).await?;
+    println!("AFTER ADD:\n{table}");
+    assert_eq!(table.lines().count(), 3);
+    // Duplicate command failures are harmless only with matching read-back.
+    manager.apply(AddressAction::Add).await?;
+    manager.apply(AddressAction::Remove).await?;
+    let table = read_back(&fixture).await?;
+    println!("AFTER REMOVE:\n{table:?}");
+    assert_eq!(table, "");
+    manager.apply(AddressAction::Remove).await?;
+    drop(fixture);
+    assert!(!dir.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_add_failure_still_attempts_every_address() -> Result<()> {
+    let fixture = FakeIp::new()?;
+    fs::write(fixture.dir.join("fail-add"), "1\n")?;
+    let error = address_manager(&fixture)
+        .apply(AddressAction::Add)
+        .await
+        .err()
+        .ok_or_else(|| anyhow!("expected failure"))?;
+    println!("FIRST ADD FAILURE: {error:#}");
+    assert_eq!(fs::read_to_string(fixture.dir.join("count-add"))?, "3\n");
+    assert_eq!(read_back(&fixture).await?.lines().count(), 2);
+    assert!(!fs::read_to_string(fixture.dir.join("commands"))?.contains("arping"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stubborn_remove_reports_failure_and_removes_other_addresses() -> Result<()> {
+    let fixture = FakeIp::new()?;
+    let manager = address_manager(&fixture);
+    manager.apply(AddressAction::Add).await?;
+    fs::write(fixture.dir.join("fail-del"), "1\n")?;
+    let error = manager
+        .apply(AddressAction::Remove)
+        .await
+        .err()
+        .ok_or_else(|| anyhow!("expected failure"))?;
+    println!("STUBBORN REMOVE: {error:#}");
+    let table = read_back(&fixture).await?;
+    assert_eq!(table.lines().count(), 1);
+    assert!(table.contains("10.0.0.10/24"));
+    assert_eq!(fs::read_to_string(fixture.dir.join("count-del"))?, "3\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_exists_on_wrong_interface_and_prefix_does_not_confirm_presence() -> Result<()> {
+    let fixture = FakeIp::new()?;
+    fs::write(
+        fixture.dir.join("state"),
+        "other0 10.0.0.10/24\neth0 10.0.0.10/32\n",
+    )?;
+    let wrapper = fixture.dir.join("duplicate");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/bash\nif [[ \"$1\" == address ]]; then echo 'File exists' >&2; exit 2; fi\nexec \"{}\" \"$@\"\n",
+            fixture.command("ip").display()
+        ),
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+    let mut manager = address_manager(&fixture);
+    manager.addresses.truncate(1);
+    manager.ip_command = wrapper.display().to_string();
+    assert!(manager.apply(AddressAction::Add).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fifo_gated_command_is_killed_after_real_timeout() -> Result<()> {
+    let fixture = FakeIp::new()?;
+    let gate = fixture.dir.join("gate-add");
+    assert!(
+        tokio::process::Command::new("mkfifo")
+            .arg(&gate)
+            .kill_on_drop(true)
+            .status()
+            .await?
+            .success()
+    );
+    let wrapper = fixture.dir.join("tracked-ip");
+    let pid_path = fixture.dir.join("pid");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/bash\nif [[ \"$1\" == address ]]; then echo $$ > \"{}\"; fi\nexec \"{}\" \"$@\"\n",
+            pid_path.display(),
+            fixture.command("ip").display()
+        ),
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+    let mut manager = address_manager(&fixture);
+    manager.addresses.truncate(1);
+    manager.ip_command = wrapper.display().to_string();
+    let start = tokio::time::Instant::now();
+    let result = timeout(Duration::from_secs(6), manager.apply(AddressAction::Add)).await?;
+    let error = result.err().ok_or_else(|| anyhow!("expected timeout"))?;
+    assert!(error.to_string().contains("timed out after 3000 ms"));
+    assert!(start.elapsed() >= Duration::from_millis(3000));
+    let pid = fs::read_to_string(pid_path)?;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if !tokio::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status()
+                .await?
+                .success()
+            {
+                return anyhow::Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    println!("FIFO TIMEOUT: {error:#}; child {} exited", pid.trim());
+    assert_eq!(read_back(&fixture).await?, "");
+    let dir = fixture.dir.clone();
+    drop(fixture);
+    assert!(!dir.exists());
     Ok(())
 }
