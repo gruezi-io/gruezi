@@ -4,6 +4,7 @@ use super::{
     runtime::HaLoopState,
     session::PeerRejections,
 };
+use crate::config::FailurePolicy;
 use crate::gruezi::ownership::{AuthoritySource, OwnershipController, ResourceState};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -22,6 +23,10 @@ pub struct AuthorityStatus {
     pub state: String,
     pub source: Option<AuthoritySource>,
     pub term: u64,
+    /// Conservative remaining lifetime of the current grant, in milliseconds
+    /// (`None` for `assumed` authority, which only ends when the elected role
+    /// or the policy says so).
+    pub expires_in_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,14 +69,57 @@ pub struct SafetyStatus {
     pub why: String,
 }
 
+/// What drove the last recorded transition (design spec section 6): the
+/// election decision, the policy layer (bilateral consent), shutdown or a
+/// runtime fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionTrigger {
+    Election,
+    Consent,
+    Shutdown,
+    Fault,
+}
+
+impl TransitionTrigger {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Election => "election",
+            Self::Consent => "consent",
+            Self::Shutdown => "shutdown",
+            Self::Fault => "fault",
+        }
+    }
+}
+
+/// `last_transition` snapshot (design spec section 6): why the last recorded
+/// transition happened, what triggered it and how long ago.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastTransitionStatus {
+    pub reason: HaDecisionReason,
+    pub trigger: TransitionTrigger,
+    pub ago_ms: u64,
+}
+
+/// Status wire name of the configured failure policy.
+const fn failure_policy_name(policy: &FailurePolicy) -> &'static str {
+    match policy {
+        FailurePolicy::Strict => "strict",
+        FailurePolicy::Available => "available",
+        FailurePolicy::External => "external",
+    }
+}
+
 fn ownership_status(
     ownership: &OwnershipController,
     now: Instant,
 ) -> (ResourceStatus, AuthorityStatus, SafetyStatus) {
     let resource = ownership.resource_state();
     let authority = ownership.authority();
-    let (level, why) = if ownership.owned() && authority.source() == Some(AuthoritySource::Assumed)
-    {
+    let (level, why) = if authority.source() == Some(AuthoritySource::Assumed) {
+        // Exact spec-section-6 mapping: whenever the authority source is
+        // `assumed` the safety level is `assumed`, owned or not.
         (
             SafetyLevel::Assumed,
             "ownership relies on local timeout authority",
@@ -100,6 +148,9 @@ fn ownership_status(
             state: authority.as_str().to_owned(),
             source: authority.source(),
             term: authority.term(),
+            expires_in_ms: authority.expiry().map(|expiry| {
+                duration_millis_u64(expiry.into_std().saturating_duration_since(now))
+            }),
         },
         SafetyStatus {
             level,
@@ -136,6 +187,11 @@ pub struct HaStatus {
     pub decision_reason: HaDecisionReason,
     pub last_transition_reason: Option<HaDecisionReason>,
     pub last_transition_ms_ago: Option<u64>,
+    /// Structured transition record (reason, trigger, age) from the policy
+    /// layer; additive to `last_transition_*`.
+    pub last_transition: Option<LastTransitionStatus>,
+    /// Configured failure policy (`strict | available | external`).
+    pub failure_policy: String,
     pub peer_session: PeerSessionStatus,
 }
 
@@ -178,6 +234,8 @@ impl HaStatus {
             decision_reason: HaDecisionReason::Startup,
             last_transition_reason: None,
             last_transition_ms_ago: None,
+            last_transition: None,
+            failure_policy: String::new(),
             peer_session: PeerSessionStatus::default(),
         }
     }
@@ -237,6 +295,17 @@ fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Ins
         last_transition_ms_ago: loop_state
             .last_transition_at
             .map(|transition_at| saturating_elapsed_ms(now, transition_at)),
+        last_transition: loop_state
+            .last_transition_reason
+            .zip(loop_state.last_transition_at)
+            .map(|(reason, transition_at)| LastTransitionStatus {
+                reason,
+                trigger: loop_state
+                    .last_transition_trigger
+                    .unwrap_or(TransitionTrigger::Election),
+                ago_ms: saturating_elapsed_ms(now, transition_at),
+            }),
+        failure_policy: failure_policy_name(&runtime.failure_policy).to_owned(),
         peer_session: PeerSessionStatus {
             reachable: within_deadline(loop_state.peer.last_authenticated_at()),
             session_established: within_deadline(loop_state.peer.last_fresh_at()),

@@ -1,11 +1,15 @@
-use crate::gruezi::{
-    addresses::{
-        DesiredOwnership, ResourceCommand, ResourceReport, ResourceReportKind, ResourceWorkerHandle,
+use crate::{
+    config::FailurePolicy,
+    gruezi::{
+        addresses::{
+            DesiredOwnership, ResourceCommand, ResourceReport, ResourceReportKind,
+            ResourceWorkerHandle,
+        },
+        ha::{HaDecisionReason, HaState},
     },
-    ha::{HaDecisionReason, HaState},
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 /// Source of ownership authority (`peer | assumed | external`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,10 +145,41 @@ impl ResourceState {
     }
 }
 
-/// Ownership authority provider boundary (`LocalTimeout` wraps the election decision and yields `source = assumed`).
+/// Policy evidence the coordinator feeds into authority evaluation every
+/// iteration. It lives outside the provider because both facts are gathered
+/// by the protocol layer and consumed by the policy layer (spec section 6).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicyInputs {
+    /// Bilateral consent deadline (design spec 4.4): send time of the newest
+    /// own advert the peer acknowledged in its most recent fresh `ack_seq`,
+    /// plus the dead window. `None` until such an ack arrives.
+    pub consent_until: Option<Instant>,
+    /// BOOTSTRAP rule satisfied (design spec 3.1): fresh session, both nodes
+    /// report the resource absent/unmanaged, the peer holds no authority and
+    /// this node wins the rank via `outranks`. Priority alone never grants.
+    pub bootstrap_ok: bool,
+}
+
+/// Ownership authority provider boundary.
+///
+/// `LocalTimeout` is the `assumed` provider: the existing local-timeout
+/// election decision. `PeerConsent` is selected by `failure_policy` and
+/// grants `peer` authority from bilateral consent (design spec 4.4): `strict`
+/// fails closed when consent lapses, `available` falls back to `assumed`
+/// semantics while consent is stale, and `external` stays fail-closed until
+/// its command provider lands. There is no fourth policy, and authority never
+/// survives a restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipAuthority {
-    LocalTimeout { term: u64, active: bool },
+    LocalTimeout {
+        term: u64,
+        active: bool,
+    },
+    PeerConsent {
+        policy: FailurePolicy,
+        term: u64,
+        active: bool,
+    },
 }
 
 impl Default for OwnershipAuthority {
@@ -157,16 +192,24 @@ impl Default for OwnershipAuthority {
 }
 
 impl OwnershipAuthority {
-    /// Evaluate authority from the current elected role and reconciliation readiness.
+    /// Evaluate authority from the current elected role, reconciliation
+    /// readiness and the policy evidence for this iteration.
     #[must_use]
     pub fn evaluate(
         &mut self,
         elected_role: HaState,
         ready_to_authorize: bool,
-        expiry: Option<Instant>,
+        inputs: PolicyInputs,
     ) -> AuthorityState {
         match self {
             Self::LocalTimeout { term, active } => {
+                Self::evaluate_assumed(term, active, elected_role, ready_to_authorize)
+            }
+            Self::PeerConsent {
+                policy,
+                term,
+                active,
+            } => {
                 if elected_role != HaState::Active {
                     *active = false;
                     return AuthorityState::None;
@@ -175,23 +218,100 @@ impl OwnershipAuthority {
                     *active = false;
                     return AuthorityState::Pending;
                 }
-                if !*active {
-                    *active = true;
-                    *term = term.saturating_add(1);
-                }
-                AuthorityState::Valid {
-                    source: AuthoritySource::Assumed,
-                    term: *term,
-                    expiry,
+                let was_active = *active;
+                let consent_fresh = inputs
+                    .consent_until
+                    .is_some_and(|until| until > Instant::now());
+                match policy {
+                    FailurePolicy::Strict => {
+                        // Silence NEVER authorizes: without fresh bilateral
+                        // consent an existing grant lapses (the caller
+                        // revokes and withdraws) and a pending one stays
+                        // pending forever.
+                        if consent_fresh && (was_active || inputs.bootstrap_ok) {
+                            return Self::activate_peer(term, active, inputs.consent_until);
+                        }
+                        *active = false;
+                        if was_active {
+                            AuthorityState::None
+                        } else {
+                            AuthorityState::Pending
+                        }
+                    }
+                    FailurePolicy::Available => {
+                        if consent_fresh {
+                            // Fresh consent proves the session: acquisition
+                            // still needs the bootstrap rule, a continuing
+                            // grant only needs the consent.
+                            if was_active || inputs.bootstrap_ok {
+                                return Self::activate_peer(term, active, inputs.consent_until);
+                            }
+                            *active = false;
+                            return AuthorityState::Pending;
+                        }
+                        // Consent is stale: the assumed provider (today's
+                        // local-timeout election decision) keeps the node
+                        // available. Possible dual ownership is explicitly
+                        // accepted for this policy.
+                        Self::evaluate_assumed(term, active, elected_role, ready_to_authorize)
+                    }
+                    FailurePolicy::External => {
+                        // The command authority (check_command grant with
+                        // confirmed fencing) lands with the external policy
+                        // todo; until then nothing grants, fail closed.
+                        *active = false;
+                        AuthorityState::Pending
+                    }
                 }
             }
+        }
+    }
+
+    fn evaluate_assumed(
+        term: &mut u64,
+        active: &mut bool,
+        elected_role: HaState,
+        ready_to_authorize: bool,
+    ) -> AuthorityState {
+        if elected_role != HaState::Active {
+            *active = false;
+            return AuthorityState::None;
+        }
+        if !ready_to_authorize {
+            *active = false;
+            return AuthorityState::Pending;
+        }
+        if !*active {
+            *active = true;
+            *term = term.saturating_add(1);
+        }
+        AuthorityState::Valid {
+            source: AuthoritySource::Assumed,
+            term: *term,
+            expiry: Option::None,
+        }
+    }
+
+    fn activate_peer(
+        term: &mut u64,
+        active: &mut bool,
+        consent_until: Option<Instant>,
+    ) -> AuthorityState {
+        if !*active {
+            *active = true;
+            *term = term.saturating_add(1);
+        }
+        AuthorityState::Valid {
+            source: AuthoritySource::Peer,
+            term: *term,
+            expiry: consent_until,
         }
     }
 
     /// Explicitly revoke authority.
     pub fn revoke(&mut self) {
         match self {
-            Self::LocalTimeout { active, .. } => {
+            Self::LocalTimeout { active, .. } | Self::PeerConsent { active, .. } => {
                 *active = false;
             }
         }
@@ -261,6 +381,7 @@ pub struct OwnershipController {
     previous_role: HaState,
     authority_provider: OwnershipAuthority,
     authority: AuthorityState,
+    policy_inputs: PolicyInputs,
     resource_state: ResourceState,
     generation: u64,
     lifecycle: LifecyclePhase,
@@ -288,6 +409,7 @@ impl OwnershipController {
             previous_role: HaState::Init,
             authority_provider: OwnershipAuthority::default(),
             authority: AuthorityState::None,
+            policy_inputs: PolicyInputs::default(),
             resource_state,
             generation: 0,
             lifecycle,
@@ -383,6 +505,125 @@ impl OwnershipController {
         !self.authority.is_valid() && self.resource_state.is_confirmed_absent_or_unmanaged()
     }
 
+    /// Select the authority provider for the configured failure policy.
+    /// `strict` and `available` are authorized by bilateral consent (with the
+    /// documented `available` fallback); `external` stays fail-closed until
+    /// its command provider lands.
+    pub fn set_failure_policy(&mut self, policy: FailurePolicy) {
+        self.authority_provider = OwnershipAuthority::PeerConsent {
+            policy,
+            term: 0,
+            active: false,
+        };
+    }
+
+    /// Record bilateral consent evidence (design spec 4.4): a fresh
+    /// authenticated advert acknowledged one of our own sends. Consent is
+    /// anchored at the SEND time of the newest acknowledged own sequence
+    /// number, so loss in either direction stops consent from advancing and a
+    /// delayed or replayed acknowledgement can never extend it past the
+    /// formula. A fresh advert acknowledging none of our sends clears consent:
+    /// a new session never inherits old authority.
+    pub fn observe_consent(&mut self, acked_send_at: Option<Instant>, dead_window: Duration) {
+        self.policy_inputs.consent_until = acked_send_at.map(|sent_at| sent_at + dead_window);
+    }
+
+    /// Feed this iteration's bootstrap-rule verdict (design spec 3.1).
+    pub fn set_bootstrap_allowed(&mut self, bootstrap_ok: bool) {
+        self.policy_inputs.bootstrap_ok = bootstrap_ok;
+    }
+
+    /// Re-evaluate authority for the current elected role under the failure
+    /// policy. The coordinator calls this every iteration and at the
+    /// authority expiry deadline, so a lapsed consent is handled exactly on
+    /// time: `strict` revokes and withdraws, `available` falls back to
+    /// `assumed` without interrupting ownership.
+    pub fn refresh_authority(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        if matches!(self.lifecycle, LifecyclePhase::Booting) {
+            // Startup reconciliation still owes an absence proof; the
+            // authority re-check in `handle_absent_report` runs once it lands.
+            return RoleTransitionEffect::None;
+        }
+        if self.elected_role != HaState::Active {
+            return RoleTransitionEffect::None;
+        }
+        if !matches!(self.lifecycle, LifecyclePhase::Ready) {
+            // Sticky revocation: authority stays pending until withdrawal
+            // confirms absence; a policy grant must never push past it (I7).
+            self.authority =
+                self.authority_provider
+                    .evaluate(HaState::Active, false, self.policy_inputs);
+            return RoleTransitionEffect::None;
+        }
+        let was_valid = self.authority.is_valid();
+        let authority = self
+            .authority_provider
+            .evaluate(HaState::Active, true, self.policy_inputs);
+        if authority.is_valid() {
+            if was_valid {
+                self.authority = authority;
+                return RoleTransitionEffect::None;
+            }
+            let reason = self
+                .pending_promotion
+                .map_or(HaDecisionReason::AlreadyActive, |pending| pending.reason);
+            return self.begin_acquisition(authority, reason, worker);
+        }
+        if was_valid {
+            // Strict consent lapse: authority is revoked and the resource
+            // worker withdraws (invariant I3). The elected role is untouched;
+            // only ownership authority ends.
+            return self.revoke_authority_internal(
+                HaState::Active,
+                HaState::Active,
+                HaDecisionReason::ConsentExpired,
+                worker,
+            );
+        }
+        self.authority = authority;
+        RoleTransitionEffect::None
+    }
+
+    /// Start (or restart) an acquisition for an already-computed authority
+    /// state. Never touches the resource while authority is pending (I1).
+    fn begin_acquisition(
+        &mut self,
+        authority: AuthorityState,
+        reason: HaDecisionReason,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        self.generation = self.generation.saturating_add(1);
+        self.authority = authority;
+        if !self.authority.is_valid() {
+            self.pending_promotion = Some(PendingPromotion {
+                generation: self.generation,
+                previous_state: self.previous_role,
+                reason,
+            });
+            return RoleTransitionEffect::AwaitingConfirmation;
+        }
+        if self.management == ResourceManagement::Unmanaged {
+            self.resource_state = ResourceState::Unmanaged;
+            self.promoted_generation = Some(self.generation);
+            self.pending_promotion = None;
+            return RoleTransitionEffect::PromoteNow {
+                previous_state: self.previous_role,
+                reason,
+            };
+        }
+        self.pending_promotion = Some(PendingPromotion {
+            generation: self.generation,
+            previous_state: self.previous_role,
+            reason,
+        });
+        self.resource_state = ResourceState::Acquiring {
+            generation: self.generation,
+        };
+        worker.set_directive(self.generation, DesiredOwnership::Authorized);
+        worker.send_command(ResourceCommand::Acquire(self.generation));
+        RoleTransitionEffect::AwaitingConfirmation
+    }
+
     /// Set the elected role while holding authority in `Pending` (for testing invariant I1).
     pub fn set_elected_role_pending(&mut self, role: HaState, reason: HaDecisionReason) {
         self.previous_role = self.elected_role;
@@ -421,7 +662,9 @@ impl OwnershipController {
 
         match next_role {
             HaState::Standby if previous_role == HaState::Init => {
-                self.authority = self.authority_provider.evaluate(next_role, true, None);
+                self.authority =
+                    self.authority_provider
+                        .evaluate(next_role, true, self.policy_inputs);
                 RoleTransitionEffect::Backup {
                     previous_state: previous_role,
                     reason,
@@ -429,9 +672,11 @@ impl OwnershipController {
             }
             HaState::Active => {
                 if !matches!(self.lifecycle, LifecyclePhase::Ready) {
-                    self.authority = self
-                        .authority_provider
-                        .evaluate(HaState::Active, false, None);
+                    self.authority = self.authority_provider.evaluate(
+                        HaState::Active,
+                        false,
+                        self.policy_inputs,
+                    );
                     self.pending_promotion = Some(PendingPromotion {
                         generation: self.generation,
                         previous_state: previous_role,
@@ -446,31 +691,10 @@ impl OwnershipController {
                     return RoleTransitionEffect::AwaitingConfirmation;
                 }
 
-                self.generation = self.generation.saturating_add(1);
-                self.authority = self
-                    .authority_provider
-                    .evaluate(HaState::Active, true, None);
-                if self.management == ResourceManagement::Unmanaged {
-                    self.resource_state = ResourceState::Unmanaged;
-                    self.promoted_generation = Some(self.generation);
-                    self.pending_promotion = None;
-                    return RoleTransitionEffect::PromoteNow {
-                        previous_state: previous_role,
-                        reason,
-                    };
-                }
-
-                self.pending_promotion = Some(PendingPromotion {
-                    generation: self.generation,
-                    previous_state: previous_role,
-                    reason,
-                });
-                self.resource_state = ResourceState::Acquiring {
-                    generation: self.generation,
-                };
-                worker.set_directive(self.generation, DesiredOwnership::Authorized);
-                worker.send_command(ResourceCommand::Acquire(self.generation));
-                RoleTransitionEffect::AwaitingConfirmation
+                let authority =
+                    self.authority_provider
+                        .evaluate(HaState::Active, true, self.policy_inputs);
+                self.begin_acquisition(authority, reason, worker)
             }
             HaState::Standby | HaState::Init => {
                 self.revoke_authority_internal(previous_role, next_role, reason, worker)
@@ -547,19 +771,27 @@ impl OwnershipController {
         self.resource_state = ResourceState::Absent;
 
         if was_booting && self.elected_role == HaState::Active {
-            self.generation = self.generation.saturating_add(1);
-            self.authority = self
-                .authority_provider
-                .evaluate(HaState::Active, true, None);
-            if let Some(mut pending) = self.pending_promotion {
-                pending.generation = self.generation;
-                self.pending_promotion = Some(pending);
-            }
-            self.resource_state = ResourceState::Acquiring {
-                generation: self.generation,
+            // Startup reconciliation confirmed absence: acquisition begins
+            // only when the failure policy granted authority (bootstrap rule).
+            let reason = self
+                .pending_promotion
+                .map_or(HaDecisionReason::AlreadyActive, |pending| pending.reason);
+            let authority =
+                self.authority_provider
+                    .evaluate(HaState::Active, true, self.policy_inputs);
+            return match self.begin_acquisition(authority, reason, worker) {
+                RoleTransitionEffect::PromoteNow {
+                    previous_state,
+                    reason,
+                } => ReportEffect::PromoteConfirmed {
+                    previous_state,
+                    reason,
+                },
+                RoleTransitionEffect::None
+                | RoleTransitionEffect::AwaitingConfirmation
+                | RoleTransitionEffect::Demote { .. }
+                | RoleTransitionEffect::Backup { .. } => ReportEffect::None,
             };
-            worker.set_directive(self.generation, DesiredOwnership::Authorized);
-            worker.send_command(ResourceCommand::Acquire(self.generation));
         }
 
         ReportEffect::None

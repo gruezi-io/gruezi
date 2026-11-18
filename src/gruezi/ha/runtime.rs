@@ -1,25 +1,43 @@
 use super::{
     config::HaRuntimeConfig,
-    election::{HaDecisionReason, HaState, PeerObservation, desired_state, has_live_active_peer},
+    election::{
+        HaDecisionReason, HaState, PeerObservation, desired_state, has_live_active_peer, outranks,
+    },
     protocol::{
         AdvertAuthoritySource, AdvertResourceState, HaPacket, PacketRejection, RECEIVE_BUFFER_LEN,
     },
     session::{Admission, AdvertState, PeerTracker, boot_nonce},
-    status::{HaStatus, publish_loop_status, saturating_elapsed_ms},
+    status::{HaStatus, TransitionTrigger, publish_loop_status, saturating_elapsed_ms},
 };
-use crate::gruezi::{
-    addresses::{AddressManager, ResourceReport, ResourceReportKind, ResourceWorkerHandle},
-    hooks::{HookContext, HookEvent, spawn_hook},
-    ownership::{OwnershipController, ReportEffect, ResourceManagement, RoleTransitionEffect},
+use crate::{
+    config::FailurePolicy,
+    gruezi::{
+        addresses::{
+            AddressManager, CommandRunner, ResourceReport, ResourceReportKind, ResourceWorkerHandle,
+        },
+        hooks::{HookContext, HookEvent, spawn_hook},
+        ownership::{OwnershipController, ReportEffect, ResourceManagement, RoleTransitionEffect},
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
+    collections::VecDeque,
     future::Future,
     time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::watch};
 use tracing::{debug, info, warn};
+
+/// Deterministic in-process datagram fabric used by the failure matrix tests
+/// (design spec 8a: an enum seam, never a trait object).
+#[cfg(test)]
+mod in_memory;
+#[cfg(test)]
+mod matrix_tests;
+
+/// Number of own advert send records kept for consent bookkeeping.
+const SENT_ADVERT_HISTORY: usize = 256;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct HaCounters {
@@ -44,9 +62,47 @@ pub(super) struct HaLoopState {
     pub(super) peer_observation: Option<PeerObservation>,
     pub(super) peer: PeerTracker,
     pub(super) counters: HaCounters,
+    // Own advert send records (seq -> send time) for bilateral consent
+    // (design spec 4.4): a fresh ack_seq resolves against this history.
+    pub(super) sent_adverts: VecDeque<(u64, tokio::time::Instant)>,
     pub(super) next_advert_at: tokio::time::Instant,
     pub(super) next_reconcile_at: tokio::time::Instant,
     pub(super) ownership: OwnershipController,
+    pub(super) last_transition_trigger: Option<TransitionTrigger>,
+}
+
+/// Datagram transport seam (design spec 8a: an enum, never a trait object).
+/// `Udp` is the production transport; `InMemory` is the deterministic
+/// two-node network with loss/duplicate/reorder knobs used by the harness
+/// under `tokio::time::pause`.
+pub(super) enum Transport {
+    Udp,
+    #[cfg(test)]
+    InMemory(in_memory::InMemoryEndpoint),
+}
+
+enum DatagramIo {
+    Udp(UdpSocket),
+    #[cfg(test)]
+    InMemory(in_memory::InMemoryEndpoint),
+}
+
+impl DatagramIo {
+    async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<(usize, std::net::SocketAddr)> {
+        match self {
+            Self::Udp(socket) => socket.recv_from(buffer).await,
+            #[cfg(test)]
+            Self::InMemory(endpoint) => endpoint.recv(buffer).await,
+        }
+    }
+
+    async fn send(&self, bytes: &[u8], target: std::net::SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send_to(bytes, target).await,
+            #[cfg(test)]
+            Self::InMemory(endpoint) => Ok(endpoint.send(bytes)),
+        }
+    }
 }
 
 /// Run the HA control loop.
@@ -88,32 +144,62 @@ pub async fn run_with_status<F, T>(
 where
     F: Future<Output = T>,
 {
-    let (socket, local_bind) = bind_ha_socket(&runtime.bind)?;
-    let peer_addr = resolve_peer(&runtime.peer).await?;
+    run_with_transport(
+        runtime,
+        Transport::Udp,
+        CommandRunner::System,
+        status_tx,
+        shutdown,
+    )
+    .await
+}
+
+/// Run the HA control loop over the given transport and command runner.
+///
+/// `Transport::InMemory` and a scripted command runner exist for the
+/// deterministic harness (design spec 8a); production entry points always use
+/// UDP and system commands. No state here survives a restart.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be bound or packet I/O fails.
+pub(super) async fn run_with_transport<F, T>(
+    runtime: HaRuntimeConfig,
+    transport: Transport,
+    command_runner: CommandRunner,
+    status_tx: Option<watch::Sender<HaStatus>>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = T>,
+{
+    let (io, local_bind, peer_addr) = open_transport(&runtime, transport).await?;
     let peer = PeerTracker::new(&runtime, peer_addr.ip(), boot_nonce()?)?;
     let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
-    let mut worker = ResourceWorkerHandle::spawn(address_manager(&runtime));
-    let mut loop_state = initialize_loop_state(&runtime, status_tx.as_ref(), &worker, peer);
+    let (mut worker, mut loop_state) =
+        spawn_worker(&runtime, command_runner, status_tx.as_ref(), peer);
     tokio::pin!(shutdown);
 
     log_runtime_start(&runtime, &local_bind, peer_addr);
 
     loop {
         refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
-        while let Some(report) = worker.try_recv_report() {
-            handle_resource_report(
-                &runtime,
-                status_tx.as_ref(),
-                &mut loop_state,
-                &worker,
-                report,
-            );
-        }
+        drain_reports(&runtime, status_tx.as_ref(), &mut loop_state, &mut worker);
 
         let advert_sleep = tokio::time::sleep_until(loop_state.next_advert_at);
         let reconcile_sleep = tokio::time::sleep_until(loop_state.next_reconcile_at);
+        // Wake exactly at the authority deadline so a lapsed consent is
+        // handled on time instead of at the next advert tick (invariant I3).
+        let authority_expiry = loop_state.ownership.authority().expiry();
+        let authority_sleep = async move {
+            match authority_expiry {
+                Some(expiry) => tokio::time::sleep_until(expiry).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(advert_sleep);
         tokio::pin!(reconcile_sleep);
+        tokio::pin!(authority_sleep);
 
         tokio::select! {
             _ = &mut shutdown => {
@@ -129,15 +215,9 @@ where
                 break;
             }
             Some(report) = worker.recv_report() => {
-                handle_resource_report(
-                    &runtime,
-                    status_tx.as_ref(),
-                    &mut loop_state,
-                    &worker,
-                    report,
-                );
+                handle_resource_report(&runtime, status_tx.as_ref(), &mut loop_state, &worker, report);
             }
-            recv = socket.recv_from(&mut buffer) => {
+            recv = io.recv(&mut buffer) => {
                 if let Err(error) = handle_receive_event(
                     &runtime,
                     status_tx.as_ref(),
@@ -158,7 +238,7 @@ where
             }
             () = &mut advert_sleep => {
                 if let Err(error) = handle_send_event(
-                    &socket,
+                    &io,
                     &runtime,
                     peer_addr,
                     status_tx.as_ref(),
@@ -184,10 +264,63 @@ where
                     loop_state.ownership.request_reconcile(&worker);
                 }
             }
+            () = &mut authority_sleep => {
+                // Authority deadline reached; the next loop iteration
+                // re-evaluates the failure policy against the consent state.
+            }
         }
     }
 
     Ok(())
+}
+
+/// Spawn the single resource worker and build the initial loop state.
+fn spawn_worker(
+    runtime: &HaRuntimeConfig,
+    command_runner: CommandRunner,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    peer: PeerTracker,
+) -> (ResourceWorkerHandle, HaLoopState) {
+    let worker = ResourceWorkerHandle::spawn_with_runner(address_manager(runtime), command_runner);
+    let loop_state = initialize_loop_state(runtime, status_tx, &worker, peer);
+    (worker, loop_state)
+}
+
+/// Apply every resource report that is already queued on the worker.
+fn drain_reports(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
+) {
+    while let Some(report) = worker.try_recv_report() {
+        handle_resource_report(runtime, status_tx, loop_state, worker, report);
+    }
+}
+
+/// Resolve and open the configured transport.
+///
+/// # Errors
+///
+/// Returns an error if the UDP socket cannot be bound or the peer address
+/// does not resolve.
+async fn open_transport(
+    runtime: &HaRuntimeConfig,
+    transport: Transport,
+) -> Result<(DatagramIo, String, std::net::SocketAddr)> {
+    match transport {
+        Transport::Udp => {
+            let (socket, local_bind) = bind_ha_socket(&runtime.bind)?;
+            let peer_addr = resolve_peer(&runtime.peer).await?;
+            Ok((DatagramIo::Udp(socket), local_bind, peer_addr))
+        }
+        #[cfg(test)]
+        Transport::InMemory(endpoint) => {
+            let local_bind = format_socket_addr(endpoint.local_addr());
+            let peer_addr = endpoint.peer_addr();
+            Ok((DatagramIo::InMemory(endpoint), local_bind, peer_addr))
+        }
+    }
 }
 
 fn next_reconcile_deadline(
@@ -226,6 +359,7 @@ fn initialize_loop_state(
         ResourceManagement::Managed
     };
     let mut ownership = OwnershipController::new(management);
+    ownership.set_failure_policy(runtime.failure_policy.clone());
     ownership.start_reconciliation(worker);
 
     let loop_state = HaLoopState {
@@ -238,9 +372,11 @@ fn initialize_loop_state(
         peer_observation: None,
         peer,
         counters: HaCounters::default(),
+        sent_adverts: VecDeque::new(),
         next_advert_at: now_tokio + runtime.next_advert_delay(1),
         next_reconcile_at: next_reconcile_deadline(runtime, HaDecisionReason::Startup, now_tokio),
         ownership,
+        last_transition_trigger: None,
     };
 
     publish_loop_status(runtime, status_tx, &loop_state, startup_at);
@@ -249,6 +385,12 @@ fn initialize_loop_state(
 }
 
 fn log_runtime_start(runtime: &HaRuntimeConfig, local_bind: &str, peer_addr: std::net::SocketAddr) {
+    if matches!(runtime.failure_policy, FailurePolicy::Available) {
+        warn!(
+            node_id = %runtime.node_id,
+            "failure_policy available can dual-own during partitions; assumed authority is not split-brain safe"
+        );
+    }
     info!(
         node_id = %runtime.node_id,
         bind = %local_bind,
@@ -308,6 +450,37 @@ fn refresh_local_state(
         loop_state.state = decision.state;
         loop_state.last_transition_reason = Some(decision.reason);
         loop_state.last_transition_at = Some(now);
+        loop_state.last_transition_trigger = Some(TransitionTrigger::Election);
+    }
+
+    // Policy layer: feed the bootstrap verdict and re-evaluate authority for
+    // the current role. A grant starts the acquisition; a lapsed strict
+    // consent revokes authority and withdraws (invariants I1, I3).
+    let bootstrap_ok = bootstrap_rule_satisfied(runtime, loop_state, now);
+    loop_state.ownership.set_bootstrap_allowed(bootstrap_ok);
+    let authority_effect = loop_state.ownership.refresh_authority(worker);
+    if !matches!(
+        authority_effect,
+        RoleTransitionEffect::None | RoleTransitionEffect::AwaitingConfirmation
+    ) {
+        dispatch_role_hook(
+            runtime,
+            authority_effect,
+            loop_state.peer_observation.as_ref(),
+            now,
+        );
+        if let RoleTransitionEffect::Demote { reason, .. } = authority_effect {
+            // Authority transitions are policy-layer facts: the trigger says
+            // consent (not the election) drove this transition.
+            loop_state.last_transition_reason = Some(reason);
+            loop_state.last_transition_at = Some(now);
+            loop_state.last_transition_trigger = Some(TransitionTrigger::Consent);
+            info!(
+                node_id = %runtime.node_id,
+                reason = %reason,
+                "HA authority revoked by the failure policy; withdrawing"
+            );
+        }
     }
 
     publish_loop_status(runtime, status_tx, loop_state, now);
@@ -454,6 +627,7 @@ fn handle_receive_event(
             match admission {
                 Admission::Fresh(packet) => {
                     observe_peer(&mut loop_state.peer_observation, &packet, observed_at);
+                    update_consent(runtime, loop_state, &packet);
                     debug!(
                         node_id = %runtime.node_id,
                         peer = %from,
@@ -508,7 +682,71 @@ fn observe_peer(
                 Some(previous_state) if previous_state != HaState::Active
             ),
         observed_at,
+        resource_state: packet.resource_state,
+        authority_source: packet.authority_source,
     });
+}
+
+/// Advance bilateral consent from one fresh authenticated advert (design spec
+/// 4.4): `ack_seq` resolves against our own send history, and the deadline is
+/// anchored at the SEND time of the newest acknowledged own sequence number.
+/// A fresh advert that acknowledges none of our sends clears consent: a new
+/// session never inherits old authority.
+fn update_consent(runtime: &HaRuntimeConfig, loop_state: &mut HaLoopState, packet: &HaPacket) {
+    let acked_send_at = loop_state
+        .sent_adverts
+        .iter()
+        .rev()
+        .find(|(seq, _)| *seq <= packet.ack_seq)
+        .map(|(_, sent_at)| *sent_at);
+    loop_state
+        .ownership
+        .observe_consent(acked_send_at, runtime.dead_timeout());
+}
+
+/// BOOTSTRAP rule (design spec 3.1): a fresh session, both nodes reporting
+/// the resource absent/unmanaged, the peer holding no authority, and this
+/// node winning the rank via `outranks`. Priority alone never authorizes.
+fn bootstrap_rule_satisfied(
+    runtime: &HaRuntimeConfig,
+    loop_state: &HaLoopState,
+    now: Instant,
+) -> bool {
+    let Some(peer) = loop_state.peer_observation.as_ref() else {
+        return false;
+    };
+    if runtime.follower_deadline(peer.observed_at) <= now {
+        return false;
+    }
+    if loop_state
+        .peer
+        .last_fresh_at()
+        .is_none_or(|seen| runtime.follower_deadline(seen) <= now)
+    {
+        return false;
+    }
+    if !loop_state
+        .ownership
+        .resource_state()
+        .is_confirmed_absent_or_unmanaged()
+    {
+        return false;
+    }
+    if !matches!(
+        peer.resource_state,
+        AdvertResourceState::Absent | AdvertResourceState::Unmanaged
+    ) {
+        return false;
+    }
+    if peer.authority_source != AdvertAuthoritySource::None {
+        return false;
+    }
+    outranks(
+        runtime.priority,
+        &runtime.node_id,
+        peer.priority,
+        &peer.node_id,
+    )
 }
 
 /// Count a rejected datagram. Rejections change counters and nothing else.
@@ -540,7 +778,7 @@ fn record_rejection(
 }
 
 async fn handle_send_event(
-    socket: &UdpSocket,
+    io: &DatagramIo,
     runtime: &HaRuntimeConfig,
     peer_addr: std::net::SocketAddr,
     status_tx: Option<&watch::Sender<HaStatus>>,
@@ -550,7 +788,8 @@ async fn handle_send_event(
     // Sequence exhaustion is fatal on purpose: the runtime exits and restarts
     // with a new nonce instead of ever reusing a sequence number.
     let (seq, encoded) = loop_state.peer.next_advert(advert)?;
-    match send_advertisement(socket, runtime, peer_addr, &encoded, seq, advert.role).await {
+    record_sent_advert(loop_state, seq);
+    match send_advertisement(io, runtime, peer_addr, &encoded, seq, advert.role).await {
         Ok(()) => {
             loop_state.counters.packets_sent = loop_state.counters.packets_sent.saturating_add(1);
         }
@@ -575,6 +814,19 @@ async fn handle_send_event(
         tokio::time::Instant::now().into_std(),
     );
     Ok(())
+}
+
+/// Remember when a given own sequence number was handed to the transport
+/// (design spec 4.4: consent is anchored at these send times).
+fn record_sent_advert(loop_state: &mut HaLoopState, seq: u64) {
+    loop_state
+        .sent_adverts
+        .push_back((seq, tokio::time::Instant::now()));
+    while loop_state.sent_adverts.len() > SENT_ADVERT_HISTORY {
+        if loop_state.sent_adverts.pop_front().is_none() {
+            break;
+        }
+    }
 }
 
 fn hook_context(
@@ -692,6 +944,11 @@ async fn cleanup_before_exit_with_hook<H, F>(
         );
         loop_state.last_transition_reason = Some(reason);
         loop_state.last_transition_at = Some(now);
+        loop_state.last_transition_trigger = Some(if faulted {
+            TransitionTrigger::Fault
+        } else {
+            TransitionTrigger::Shutdown
+        });
     }
 
     loop_state.state = HaState::Init;
@@ -712,15 +969,14 @@ fn advert_state(ownership: &OwnershipController) -> AdvertState {
 }
 
 async fn send_advertisement(
-    socket: &UdpSocket,
+    io: &DatagramIo,
     runtime: &HaRuntimeConfig,
     peer_addr: std::net::SocketAddr,
     encoded: &[u8],
     seq: u64,
     state: HaState,
 ) -> Result<()> {
-    socket
-        .send_to(encoded, peer_addr)
+    io.send(encoded, peer_addr)
         .await
         .with_context(|| format!("failed to send HA packet to {peer_addr}"))?;
 

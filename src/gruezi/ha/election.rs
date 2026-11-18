@@ -1,4 +1,7 @@
-use super::config::HaRuntimeConfig;
+use super::{
+    config::HaRuntimeConfig,
+    protocol::{AdvertAuthoritySource, AdvertResourceState},
+};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, time::Instant};
@@ -24,6 +27,9 @@ pub enum HaDecisionReason {
     PeerNodeIdTiebreak,
     PeerActiveNoPreempt,
     PeerBecameActiveConflict,
+    /// Authority was revoked because bilateral consent lapsed (policy layer,
+    /// not an election outcome; design spec 4.4).
+    ConsentExpired,
     PreemptHigherPriority,
     PreemptNodeIdTiebreak,
     GracefulShutdown,
@@ -46,6 +52,7 @@ impl HaDecisionReason {
             Self::PeerNodeIdTiebreak => "peer_node_id_tiebreak",
             Self::PeerActiveNoPreempt => "peer_active_no_preempt",
             Self::PeerBecameActiveConflict => "peer_became_active_conflict",
+            Self::ConsentExpired => "consent_expired",
             Self::PreemptHigherPriority => "preempt_higher_priority",
             Self::PreemptNodeIdTiebreak => "preempt_node_id_tiebreak",
             Self::GracefulShutdown => "graceful_shutdown",
@@ -94,6 +101,11 @@ pub(super) struct PeerObservation {
     // just yielded does not immediately preempt back on the next packet.
     pub(super) became_active: bool,
     pub(super) observed_at: Instant,
+    // Resource and authority as the peer reported them in this advert: the
+    // BOOTSTRAP rule (design spec 3.1) needs both to decide whether the rank
+    // winner may acquire.
+    pub(super) resource_state: AdvertResourceState,
+    pub(super) authority_source: AdvertAuthoritySource,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +224,24 @@ fn desired_state_with_active_peer(
         &peer.node_id,
     );
 
+    // A peer that advertises Active without holding authority is an
+    // elected-but-unauthorized claimant, not an incumbent: it cannot hold the
+    // seat against the rank rules. Design spec 3.1 has the rank winner
+    // acquire when neither side holds authority; without this carve-out a
+    // healed partition could lock the rank winner out of its own bootstrap
+    // (the claimant keeps the seat while the winner keeps yielding).
+    if local_wins && peer.authority_source == AdvertAuthoritySource::None {
+        return HaDecision {
+            state: HaState::Active,
+            reason: local_win_reason(
+                runtime.priority,
+                peer.priority,
+                HaDecisionReason::LocalHigherPriority,
+                HaDecisionReason::LocalNodeIdTiebreak,
+            ),
+        };
+    }
+
     if local_wins && (peer.became_active || active_peer_conflict) {
         return HaDecision {
             state: HaState::Standby,
@@ -247,7 +277,11 @@ fn desired_state_with_active_peer(
     }
 }
 
-fn outranks(
+/// Whether the local node outranks the peer (priority, then node id).
+///
+/// Rank decides WHO may acquire under the bootstrap rule; priority alone
+/// never authorizes anything (design spec 3.1).
+pub(super) fn outranks(
     local_priority: u8,
     local_node_id: &str,
     peer_priority: u8,
@@ -297,6 +331,7 @@ fn peer_win_reason(
 #[cfg(test)]
 mod tests {
     use super::{HaDecisionReason, HaState, PeerObservation, desired_state};
+    use crate::gruezi::ha::protocol::{AdvertAuthoritySource, AdvertResourceState};
     use crate::{config::Config, gruezi::ha::HaRuntimeConfig};
     use anyhow::Result;
     use std::time::{Duration, Instant};
@@ -362,6 +397,8 @@ ha:
             state: HaState::Standby,
             priority: 100,
             became_active: false,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
 
@@ -412,6 +449,8 @@ ha:
             state: HaState::Active,
             priority: 110,
             became_active: false,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
 
@@ -557,6 +596,8 @@ ha:
             state: HaState::Active,
             priority: 100,
             became_active: false,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
 
@@ -607,6 +648,8 @@ ha:
             state: HaState::Active,
             priority: 110,
             became_active: false,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: startup_at,
         };
         let now =
@@ -643,6 +686,8 @@ ha:
                 priority: 110,
                 became_active: false,
                 observed_at,
+                resource_state: AdvertResourceState::Absent,
+                authority_source: AdvertAuthoritySource::Peer,
             };
             let deadline = runtime.dead_timeout() + runtime.hold_down();
 
@@ -706,6 +751,8 @@ ha:
             state: HaState::Standby,
             priority: 110,
             became_active: false,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
         let decision = desired_state(
@@ -755,6 +802,8 @@ ha:
             state: HaState::Active,
             priority: 100,
             became_active: true,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
         let decision = desired_state(
@@ -804,6 +853,8 @@ ha:
             state: HaState::Active,
             priority: 100,
             became_active: true,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
         let decision = desired_state(
@@ -853,6 +904,8 @@ ha:
             state: HaState::Active,
             priority: 100,
             became_active: false,
+            resource_state: AdvertResourceState::Absent,
+            authority_source: AdvertAuthoritySource::Peer,
             observed_at: Instant::now(),
         };
         let decision = desired_state(
