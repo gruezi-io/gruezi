@@ -66,7 +66,7 @@ require_root() {
 
 require_commands() {
     local command
-    for command in ip tc curl grep sed tail; do
+    for command in ip tc curl grep sed tail awk; do
         if ! command -v "$command" >/dev/null 2>&1; then
             echo "Missing required command: $command" >&2
             exit 1
@@ -131,6 +131,56 @@ status_json() {
     ns_exec "$1" curl -fsS --max-time 1 http://127.0.0.1:9376/status
 }
 
+vip_present() {
+    local namespace="$1"
+    local interface addresses
+
+    case "$namespace" in
+        "$NS_A") interface="$IF_A" ;;
+        "$NS_B") interface="$IF_B" ;;
+        *) echo "Unknown namespace: $namespace" >&2; return 2 ;;
+    esac
+    addresses="$(ns_exec "$namespace" ip -o addr show dev "$interface")" || return 2
+    printf '%s\n' "$addresses" | awk -v vip="$VIP_CIDR" '
+        ($3 == "inet" || $3 == "inet6") && $4 == vip { found = 1 }
+        END { exit !found }
+    '
+}
+
+assert_vip_owner() {
+    local expected="$1"
+    local namespace present wanted json state
+
+    case "$expected" in
+        "$NS_A"|"$NS_B"|none|both) ;;
+        *) echo "Unknown expected VIP owner: $expected" >&2; return 1 ;;
+    esac
+    for namespace in "$NS_A" "$NS_B"; do
+        present=false
+        if vip_present "$namespace"; then
+            present=true
+        elif [[ "$?" -ne 1 ]]; then
+            echo "Cannot inspect kernel VIP in $namespace" >&2
+            return 1
+        fi
+        wanted=false
+        if [[ "$expected" == both || "$expected" == "$namespace" ]]; then
+            wanted=true
+        fi
+        if [[ "$present" != "$wanted" ]]; then
+            echo "Kernel VIP mismatch: $namespace present=$present expected=$wanted (owner=$expected)" >&2
+            return 1
+        fi
+        json="$(status_json "$namespace")" || return 1
+        state="$(json_string_field "$json" state)"
+        if [[ ( "$present" == true && "$state" != Active ) ||
+              ( "$present" == false && "$state" != Standby ) ]]; then
+            echo "Kernel/status mismatch: $namespace VIP=$present state=$state" >&2
+            return 1
+        fi
+    done
+}
+
 status_summary() {
     local namespace="$1"
     local json state peer_alive decision_reason transition_reason
@@ -192,9 +242,6 @@ on_error() {
     show_statuses || true
     show_logs || true
 }
-
-trap on_error ERR
-trap cleanup_all EXIT
 
 write_config() {
     local path="$1"
@@ -270,7 +317,17 @@ wait_for_state() {
             peer_alive="$(json_bool_field "$json" peer_alive)"
 
             if [[ "$state" == "$expected_state" && "$peer_alive" == "$expected_peer_alive" ]]; then
-                return 0
+                # Election status can precede the detached address operation.
+                # Wait for the matching kernel observation within this deadline.
+                if [[ "$state" == Active ]] && vip_present "$namespace"; then
+                    return 0
+                elif [[ "$state" == Standby ]]; then
+                    if vip_present "$namespace"; then
+                        :
+                    elif [[ "$?" == 1 ]]; then
+                        return 0
+                    fi
+                fi
             fi
         fi
 
@@ -337,6 +394,7 @@ setup_cluster() {
     wait_for_api "$NS_B"
     wait_for_state "$NS_A" "Active" "true"
     wait_for_state "$NS_B" "Standby" "true"
+    assert_vip_owner "$NS_A"
     show_statuses
 }
 
@@ -366,6 +424,7 @@ scenario_baseline() {
     setup_cluster "baseline"
     assert_state "$NS_A" "Active" "true"
     assert_state "$NS_B" "Standby" "true"
+    assert_vip_owner "$NS_A"
     log "baseline passed: node-a stayed Active and node-b stayed Standby"
 }
 
@@ -375,6 +434,7 @@ scenario_delay_jitter() {
     sleep 3
     assert_state "$NS_A" "Active" "true"
     assert_state "$NS_B" "Standby" "true"
+    assert_vip_owner "$NS_A"
     log "delay-jitter passed: bounded delay did not cause a failover"
 }
 
@@ -383,6 +443,7 @@ scenario_one_way_loss() {
     apply_one_way_loss
     wait_for_state "$NS_A" "Standby" "true" 8
     wait_for_state "$NS_B" "Active" "false" 8
+    assert_vip_owner "$NS_B"
     show_statuses
     log "one-way-loss passed: node-b promoted after losing inbound heartbeats"
 }
@@ -392,6 +453,7 @@ scenario_full_partition() {
     apply_full_partition
     wait_for_state "$NS_A" "Active" "false" 8
     wait_for_state "$NS_B" "Active" "false" 8
+    assert_vip_owner both
     show_statuses
     log "full-partition passed: both nodes became Active during total isolation"
 }
@@ -401,10 +463,12 @@ scenario_heal_after_partition() {
     apply_full_partition
     wait_for_state "$NS_A" "Active" "false" 8
     wait_for_state "$NS_B" "Active" "false" 8
+    assert_vip_owner both
     log "healing the partition"
     clear_netem
     wait_for_state "$NS_A" "Active" "true" 8
     wait_for_state "$NS_B" "Standby" "true" 8
+    assert_vip_owner "$NS_A"
     show_statuses
     log "heal-after-partition passed: the pair converged back to a single Active node"
 }
@@ -419,6 +483,9 @@ run_all() {
 
 main() {
     local command="${1:-all}"
+
+    trap on_error ERR
+    trap cleanup_all EXIT
 
     case "$command" in
         -h|--help|help)
@@ -461,4 +528,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
