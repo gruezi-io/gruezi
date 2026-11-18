@@ -3,6 +3,7 @@ pub mod api;
 pub mod ha;
 pub mod hooks;
 pub mod net;
+pub mod ownership;
 pub mod peers;
 pub mod signal;
 pub mod start;

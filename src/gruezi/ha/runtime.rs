@@ -5,8 +5,9 @@ use super::{
     status::{HaStatus, publish_loop_status, saturating_elapsed_ms},
 };
 use crate::gruezi::{
-    addresses::{AddressAction, AddressManager, spawn_address_action},
+    addresses::{AddressManager, ResourceReport, ResourceReportKind, ResourceWorkerHandle},
     hooks::{HookContext, HookEvent, spawn_hook},
+    ownership::{OwnershipController, ReportEffect, ResourceManagement, RoleTransitionEffect},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -40,6 +41,8 @@ pub(super) struct HaLoopState {
     pub(super) peer_observation: Option<PeerObservation>,
     pub(super) counters: HaCounters,
     pub(super) next_advert_at: tokio::time::Instant,
+    pub(super) next_reconcile_at: tokio::time::Instant,
+    pub(super) ownership: OwnershipController,
 }
 
 /// Run the HA control loop.
@@ -87,21 +90,50 @@ where
         .parse::<std::net::SocketAddr>()
         .with_context(|| format!("invalid HA peer address {}", runtime.peer))?;
     let mut buffer = [0_u8; 1_024];
-    let mut loop_state = initialize_loop_state(&runtime, status_tx.as_ref());
+    let mut worker = ResourceWorkerHandle::spawn(address_manager(&runtime));
+    let mut loop_state = initialize_loop_state(&runtime, status_tx.as_ref(), &worker);
     tokio::pin!(shutdown);
 
     log_runtime_start(&runtime, &local_bind, peer_addr);
 
     loop {
-        refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state);
-        let sleep = tokio::time::sleep_until(loop_state.next_advert_at);
-        tokio::pin!(sleep);
+        refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
+        while let Some(report) = worker.try_recv_report() {
+            handle_resource_report(
+                &runtime,
+                status_tx.as_ref(),
+                &mut loop_state,
+                &worker,
+                report,
+            );
+        }
+
+        let advert_sleep = tokio::time::sleep_until(loop_state.next_advert_at);
+        let reconcile_sleep = tokio::time::sleep_until(loop_state.next_reconcile_at);
+        tokio::pin!(advert_sleep);
+        tokio::pin!(reconcile_sleep);
 
         tokio::select! {
             _ = &mut shutdown => {
                 info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
-                cleanup_before_exit(&runtime, status_tx.as_ref(), &mut loop_state, false).await;
+                cleanup_before_exit(
+                    &runtime,
+                    status_tx.as_ref(),
+                    &mut loop_state,
+                    &mut worker,
+                    false,
+                )
+                .await;
                 break;
+            }
+            Some(report) = worker.recv_report() => {
+                handle_resource_report(
+                    &runtime,
+                    status_tx.as_ref(),
+                    &mut loop_state,
+                    &worker,
+                    report,
+                );
             }
             recv = socket.recv_from(&mut buffer) => {
                 if let Err(error) = handle_receive_event(
@@ -111,11 +143,18 @@ where
                     recv,
                     &buffer,
                 ) {
-                    cleanup_before_exit(&runtime, status_tx.as_ref(), &mut loop_state, true).await;
+                    cleanup_before_exit(
+                        &runtime,
+                        status_tx.as_ref(),
+                        &mut loop_state,
+                        &mut worker,
+                        true,
+                    )
+                    .await;
                     return Err(error);
                 }
             }
-            () = &mut sleep => {
+            () = &mut advert_sleep => {
                 if let Err(error) = handle_send_event(
                     &socket,
                     &runtime,
@@ -125,8 +164,22 @@ where
                 )
                 .await
                 {
-                    cleanup_before_exit(&runtime, status_tx.as_ref(), &mut loop_state, true).await;
+                    cleanup_before_exit(
+                        &runtime,
+                        status_tx.as_ref(),
+                        &mut loop_state,
+                        &mut worker,
+                        true,
+                    )
+                    .await;
                     return Err(error);
+                }
+            }
+            () = &mut reconcile_sleep => {
+                loop_state.next_reconcile_at =
+                    tokio::time::Instant::now() + runtime.dead_timeout();
+                if loop_state.ownership.is_startup_reconciled() {
+                    loop_state.ownership.request_reconcile(&worker);
                 }
             }
         }
@@ -135,11 +188,33 @@ where
     Ok(())
 }
 
+fn next_reconcile_deadline(
+    runtime: &HaRuntimeConfig,
+    reason: HaDecisionReason,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if reason == HaDecisionReason::StartupHold || reason == HaDecisionReason::Startup {
+        now + runtime.dead_timeout() + runtime.hold_down()
+    } else {
+        now + runtime.dead_timeout()
+    }
+}
+
 fn initialize_loop_state(
     runtime: &HaRuntimeConfig,
     status_tx: Option<&watch::Sender<HaStatus>>,
+    worker: &ResourceWorkerHandle,
 ) -> HaLoopState {
-    let startup_at = Instant::now();
+    let now_tokio = tokio::time::Instant::now();
+    let startup_at = now_tokio.into_std();
+    let management = if runtime.addresses.is_empty() {
+        ResourceManagement::Unmanaged
+    } else {
+        ResourceManagement::Managed
+    };
+    let mut ownership = OwnershipController::new(management);
+    ownership.start_reconciliation(worker);
+
     let loop_state = HaLoopState {
         startup_at,
         sequence: 0,
@@ -150,7 +225,9 @@ fn initialize_loop_state(
         last_transition_at: None,
         peer_observation: None,
         counters: HaCounters::default(),
-        next_advert_at: tokio::time::Instant::now() + runtime.next_advert_delay(1),
+        next_advert_at: now_tokio + runtime.next_advert_delay(1),
+        next_reconcile_at: next_reconcile_deadline(runtime, HaDecisionReason::Startup, now_tokio),
+        ownership,
     };
 
     publish_loop_status(runtime, status_tx, &loop_state, startup_at);
@@ -172,8 +249,10 @@ fn refresh_local_state(
     runtime: &HaRuntimeConfig,
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
 ) {
-    let now = Instant::now();
+    let now_tokio = tokio::time::Instant::now();
+    let now = now_tokio.into_std();
     let decision = desired_state(
         runtime,
         loop_state.state,
@@ -197,16 +276,15 @@ fn refresh_local_state(
             "HA state decision evaluated"
         );
     } else {
-        trigger_state_hooks(
-            runtime,
-            loop_state.state,
-            decision.state,
-            decision.reason,
-            loop_state.peer_observation.as_ref(),
-            now,
-        );
+        let previous_state = loop_state.state;
+        let effect =
+            loop_state
+                .ownership
+                .apply_role_decision(decision.state, decision.reason, worker);
+        loop_state.next_reconcile_at = next_reconcile_deadline(runtime, decision.reason, now_tokio);
+        dispatch_role_hook(runtime, effect, loop_state.peer_observation.as_ref(), now);
         log_state_change(
-            loop_state.state,
+            previous_state,
             decision.state,
             decision.reason,
             &runtime.node_id,
@@ -217,6 +295,108 @@ fn refresh_local_state(
         loop_state.state = decision.state;
         loop_state.last_transition_reason = Some(decision.reason);
         loop_state.last_transition_at = Some(now);
+    }
+
+    publish_loop_status(runtime, status_tx, loop_state, now);
+}
+
+fn dispatch_role_hook(
+    runtime: &HaRuntimeConfig,
+    effect: RoleTransitionEffect,
+    peer_observation: Option<&PeerObservation>,
+    now: Instant,
+) {
+    match effect {
+        RoleTransitionEffect::PromoteNow {
+            previous_state,
+            reason,
+        } => {
+            let context = hook_context(
+                runtime,
+                HaState::Active,
+                previous_state,
+                Some(reason),
+                peer_observation,
+                now,
+            );
+            spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
+        }
+        RoleTransitionEffect::Demote {
+            previous_state,
+            current_state,
+            reason,
+        } => {
+            let context = hook_context(
+                runtime,
+                current_state,
+                previous_state,
+                Some(reason),
+                peer_observation,
+                now,
+            );
+            spawn_hook(runtime.hooks.clone(), HookEvent::Demote, context);
+        }
+        RoleTransitionEffect::Backup {
+            previous_state,
+            reason,
+        } => {
+            let context = hook_context(
+                runtime,
+                HaState::Standby,
+                previous_state,
+                Some(reason),
+                peer_observation,
+                now,
+            );
+            spawn_hook(runtime.hooks.clone(), HookEvent::Backup, context);
+        }
+        RoleTransitionEffect::None | RoleTransitionEffect::AwaitingConfirmation => {}
+    }
+}
+
+fn handle_resource_report(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
+    report: ResourceReport,
+) {
+    let now_tokio = tokio::time::Instant::now();
+    let now = now_tokio.into_std();
+    loop_state.next_reconcile_at =
+        next_reconcile_deadline(runtime, loop_state.decision_reason, now_tokio);
+    let effect = loop_state.ownership.apply_worker_report(report, worker);
+
+    match effect {
+        ReportEffect::PromoteConfirmed {
+            previous_state,
+            reason,
+        } => {
+            let context = hook_context(
+                runtime,
+                HaState::Active,
+                previous_state,
+                Some(reason),
+                loop_state.peer_observation.as_ref(),
+                now,
+            );
+            spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
+        }
+        ReportEffect::Fault {
+            state,
+            previous_state,
+        } => {
+            let context = hook_context(
+                runtime,
+                state,
+                previous_state,
+                Some(HaDecisionReason::AddressActionFailed),
+                loop_state.peer_observation.as_ref(),
+                now,
+            );
+            spawn_hook(runtime.hooks.clone(), HookEvent::Fault, context);
+        }
+        ReportEffect::None => {}
     }
 
     publish_loop_status(runtime, status_tx, loop_state, now);
@@ -249,7 +429,7 @@ fn handle_receive_event(
             return Err(anyhow::Error::new(error)).context("failed to receive HA packet");
         }
     };
-    let observed_at = Instant::now();
+    let observed_at = tokio::time::Instant::now().into_std();
     let payload = buffer
         .get(..len)
         .ok_or_else(|| anyhow!("received invalid HA payload length"))?;
@@ -287,11 +467,12 @@ async fn handle_send_event(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
 ) -> Result<()> {
+    let advertised_state = loop_state.ownership.advertised_role();
     match send_advertisement(
         socket,
         runtime,
         peer_addr,
-        loop_state.state,
+        advertised_state,
         loop_state.sequence,
     )
     .await
@@ -305,7 +486,7 @@ async fn handle_send_event(
                 %error,
                 node_id = %runtime.node_id,
                 peer = %peer_addr,
-                state = ?loop_state.state,
+                state = ?advertised_state,
                 "HA advertisement send failed; continuing"
             );
         }
@@ -314,56 +495,13 @@ async fn handle_send_event(
 
     loop_state.next_advert_at =
         tokio::time::Instant::now() + runtime.next_advert_delay(loop_state.sequence + 1);
-    publish_loop_status(runtime, status_tx, loop_state, Instant::now());
-    Ok(())
-}
-
-fn trigger_state_hooks(
-    runtime: &HaRuntimeConfig,
-    previous_state: HaState,
-    current_state: HaState,
-    reason: HaDecisionReason,
-    peer_observation: Option<&PeerObservation>,
-    now: Instant,
-) {
-    if previous_state == current_state {
-        return;
-    }
-
-    let context = hook_context(
+    publish_loop_status(
         runtime,
-        current_state,
-        previous_state,
-        Some(reason),
-        peer_observation,
-        now,
+        status_tx,
+        loop_state,
+        tokio::time::Instant::now().into_std(),
     );
-    let address_manager = address_manager(runtime);
-
-    match current_state {
-        HaState::Active => {
-            spawn_address_action(
-                address_manager,
-                AddressAction::Add,
-                Some((runtime.hooks.clone(), context.clone())),
-            );
-            spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
-        }
-        HaState::Standby => {
-            spawn_address_action(
-                address_manager,
-                AddressAction::Remove,
-                Some((runtime.hooks.clone(), context.clone())),
-            );
-            let event = if previous_state == HaState::Active {
-                HookEvent::Demote
-            } else {
-                HookEvent::Backup
-            };
-            spawn_hook(runtime.hooks.clone(), event, context);
-        }
-        HaState::Init => {}
-    }
+    Ok(())
 }
 
 fn hook_context(
@@ -404,30 +542,44 @@ async fn cleanup_before_exit(
     runtime: &HaRuntimeConfig,
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
     faulted: bool,
 ) {
     let previous_state = loop_state.state;
-    let now = Instant::now();
+    let now = tokio::time::Instant::now().into_std();
     let reason = if faulted {
         HaDecisionReason::RuntimeFault
     } else {
         HaDecisionReason::GracefulShutdown
     };
-    let context = hook_context(
-        runtime,
-        HaState::Init,
-        previous_state,
-        Some(reason),
-        loop_state.peer_observation.as_ref(),
-        now,
-    );
 
-    if let Err(error) = address_manager(runtime).apply(AddressAction::Remove).await {
-        warn!(%error, node_id = %runtime.node_id, "HA shutdown address cleanup failed");
+    let withdraw_report = loop_state.ownership.shutdown(worker).await;
+    let withdrawal_failed = withdraw_report.kind == ResourceReportKind::Fault;
+    if withdrawal_failed {
+        warn!(
+            error = ?withdraw_report.error,
+            node_id = %runtime.node_id,
+            "HA shutdown address cleanup failed"
+        );
     }
 
-    if faulted && let Err(error) = runtime.hooks.run(HookEvent::Fault, context).await {
-        warn!(%error, node_id = %runtime.node_id, "HA fault hook execution failed during shutdown");
+    if faulted || withdrawal_failed {
+        let fault_reason = if faulted {
+            reason
+        } else {
+            HaDecisionReason::AddressActionFailed
+        };
+        let context = hook_context(
+            runtime,
+            HaState::Init,
+            previous_state,
+            Some(fault_reason),
+            loop_state.peer_observation.as_ref(),
+            now,
+        );
+        if let Err(error) = runtime.hooks.run(HookEvent::Fault, context).await {
+            warn!(%error, node_id = %runtime.node_id, "HA fault hook execution failed during shutdown");
+        }
     }
 
     if previous_state != HaState::Init {

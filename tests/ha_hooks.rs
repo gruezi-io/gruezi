@@ -1,4 +1,7 @@
+mod common;
+
 use anyhow::{Result, anyhow};
+use common::FakeIp;
 use gruezi::gruezi::{
     ha::{HaAuth, HaRuntimeConfig, HaState, HaStatus, run_with_status},
     hooks::HaHooks,
@@ -22,6 +25,7 @@ fn runtime_config(
     priority: u8,
     preempt: bool,
     hooks: HaHooks,
+    fixture: &FakeIp,
 ) -> HaRuntimeConfig {
     HaRuntimeConfig {
         node_id: node_id.to_owned(),
@@ -41,9 +45,9 @@ fn runtime_config(
             key: "shared-secret".to_owned(),
         },
         hooks,
-        ip_command: "true".to_owned(),
-        arping_command: "true".to_owned(),
-        ndsend_command: "true".to_owned(),
+        ip_command: fixture.command("ip").display().to_string(),
+        arping_command: fixture.command("arping").display().to_string(),
+        ndsend_command: fixture.command("ndsend").display().to_string(),
     }
 }
 
@@ -190,6 +194,8 @@ async fn wait_for_hook_contents(
 #[tokio::test]
 async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
     let dir = temp_dir("ha-hooks-promote")?;
+    let fixture_a = FakeIp::new()?;
+    let fixture_b = FakeIp::new()?;
     let promote_output = dir.join("promote.log");
     let backup_output = dir.join("backup.log");
     let promote_hook = write_hook_script(&dir, "promote", &promote_output)?;
@@ -207,6 +213,7 @@ async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
             on_promote: Some(promote_hook),
             ..HaHooks::default()
         },
+        &fixture_a,
     );
     let runtime_b = runtime_config(
         "node-b",
@@ -218,6 +225,7 @@ async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
             on_backup: Some(backup_hook),
             ..HaHooks::default()
         },
+        &fixture_b,
     );
 
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
@@ -240,6 +248,10 @@ async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
             .starts_with("promote|ACTIVE|STANDBY|LOCAL_HIGHER_PRIORITY|110|node-b|STANDBY|100")
     );
     assert!(backup_line.starts_with("backup|STANDBY|INIT|STARTUP_HOLD|100|||"));
+    assert_eq!(
+        fs::read_to_string(fixture_a.dir.join("state"))?,
+        "lo 10.0.0.10/24\n"
+    );
 
     stop_node(shutdown_a, task_a).await?;
     stop_node(shutdown_b, task_b).await?;
@@ -250,6 +262,8 @@ async fn promote_and_backup_hooks_record_transition_context() -> Result<()> {
 #[tokio::test]
 async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
     let dir = temp_dir("ha-hooks-demote")?;
+    let fixture_a = FakeIp::new()?;
+    let fixture_b = FakeIp::new()?;
     let demote_output = dir.join("demote.log");
     let demote_hook = write_hook_script(&dir, "demote", &demote_output)?;
 
@@ -265,6 +279,7 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
             on_demote: Some(demote_hook),
             ..HaHooks::default()
         },
+        &fixture_b,
     );
 
     let (mut status_b, shutdown_b, task_b) = spawn_node(runtime_b);
@@ -273,7 +288,15 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
     })
     .await?;
 
-    let runtime_a = runtime_config("node-a", port_a, port_b, 110, true, HaHooks::default());
+    let runtime_a = runtime_config(
+        "node-a",
+        port_a,
+        port_b,
+        110,
+        true,
+        HaHooks::default(),
+        &fixture_a,
+    );
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
 
     wait_for_status(&mut status_a, "node-a master after preemption", |status| {
@@ -299,20 +322,32 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
 #[tokio::test]
 async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
     let dir = temp_dir("ha-hooks-fault")?;
+    let fixture_a = FakeIp::new()?;
     let fault_output = dir.join("fault.log");
+    let promote_output = dir.join("promote.log");
     let fault_hook = write_hook_script(&dir, "fault", &fault_output)?;
+    let promote_hook = write_hook_script(&dir, "promote", &promote_output)?;
 
     let port_a = free_udp_port()?;
     let port_b = free_udp_port()?;
     let runtime_a = HaRuntimeConfig {
         hooks: HaHooks {
+            on_promote: Some(promote_hook),
             on_fault: Some(fault_hook),
             ..HaHooks::default()
         },
         ip_command: "false".to_owned(),
         arping_command: "true".to_owned(),
         ndsend_command: "true".to_owned(),
-        ..runtime_config("node-a", port_a, port_b, 110, true, HaHooks::default())
+        ..runtime_config(
+            "node-a",
+            port_a,
+            port_b,
+            110,
+            true,
+            HaHooks::default(),
+            &fixture_a,
+        )
     };
 
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
@@ -325,6 +360,8 @@ async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
     let fault_contents = wait_for_hook_contents(&fault_output, 2, "fault hook output").await?;
     assert!(fault_contents.contains("fault|STANDBY|INIT|ADDRESS_ACTION_FAILED|110|||"));
     assert!(fault_contents.contains("fault|ACTIVE|STANDBY|ADDRESS_ACTION_FAILED|110|||"));
+    // Under the confirmed-ownership contract, on_promote must never fire when read-back fails.
+    assert!(!promote_output.exists());
 
     stop_node(shutdown_a, task_a).await?;
     fs::remove_dir_all(dir)?;

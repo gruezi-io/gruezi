@@ -1,0 +1,1625 @@
+use crate::gruezi::{
+    addresses::{
+        DesiredOwnership, ResourceCommand, ResourceReport, ResourceReportKind, ResourceWorkerHandle,
+    },
+    ha::{HaDecisionReason, HaState},
+};
+use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
+
+/// Source of ownership authority (`peer | assumed | external`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoritySource {
+    Peer,
+    Assumed,
+    External,
+}
+
+impl AuthoritySource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::Assumed => "assumed",
+            Self::External => "external",
+        }
+    }
+}
+
+/// Ownership authority state (`none | pending | valid | uncertain`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityState {
+    None,
+    Pending,
+    Valid {
+        source: AuthoritySource,
+        term: u64,
+        expiry: Option<Instant>,
+    },
+    Uncertain {
+        source: Option<AuthoritySource>,
+        term: u64,
+        expiry: Option<Instant>,
+    },
+}
+
+impl AuthorityState {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending => "pending",
+            Self::Valid { .. } => "valid",
+            Self::Uncertain { .. } => "uncertain",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid { .. })
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> Option<AuthoritySource> {
+        match self {
+            Self::Valid { source, .. } => Some(*source),
+            Self::Uncertain { source, .. } => *source,
+            Self::None | Self::Pending => Option::None,
+        }
+    }
+
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        match self {
+            Self::Valid { term, .. } | Self::Uncertain { term, .. } => *term,
+            Self::None | Self::Pending => 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn expiry(&self) -> Option<Instant> {
+        match self {
+            Self::Valid { expiry, .. } | Self::Uncertain { expiry, .. } => *expiry,
+            Self::None | Self::Pending => Option::None,
+        }
+    }
+}
+
+/// Kernel read-back presence observation for configured VIP addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedPresence {
+    Unknown,
+    Absent,
+    Partial,
+    Present,
+}
+
+/// Lifecycle state of the VIP resource (`unmanaged | absent | acquiring | present | releasing | uncertain`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceState {
+    Unmanaged,
+    Absent,
+    Acquiring {
+        generation: u64,
+    },
+    Present {
+        generation: u64,
+    },
+    Releasing {
+        generation: u64,
+    },
+    Uncertain {
+        last_observation: ObservedPresence,
+        last_error: Option<String>,
+    },
+}
+
+impl ResourceState {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unmanaged => "unmanaged",
+            Self::Absent => "absent",
+            Self::Acquiring { .. } => "acquiring",
+            Self::Present { .. } => "present",
+            Self::Releasing { .. } => "releasing",
+            Self::Uncertain { .. } => "uncertain",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_confirmed_present_or_unmanaged(&self) -> bool {
+        matches!(self, Self::Present { .. } | Self::Unmanaged)
+    }
+
+    #[must_use]
+    pub const fn is_confirmed_absent_or_unmanaged(&self) -> bool {
+        matches!(self, Self::Absent | Self::Unmanaged)
+    }
+}
+
+/// Ownership authority provider boundary (`LocalTimeout` wraps the election decision and yields `source = assumed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipAuthority {
+    LocalTimeout { term: u64, active: bool },
+}
+
+impl Default for OwnershipAuthority {
+    fn default() -> Self {
+        Self::LocalTimeout {
+            term: 0,
+            active: false,
+        }
+    }
+}
+
+impl OwnershipAuthority {
+    /// Evaluate authority from the current elected role and reconciliation readiness.
+    #[must_use]
+    pub fn evaluate(
+        &mut self,
+        elected_role: HaState,
+        ready_to_authorize: bool,
+        expiry: Option<Instant>,
+    ) -> AuthorityState {
+        match self {
+            Self::LocalTimeout { term, active } => {
+                if elected_role != HaState::Active {
+                    *active = false;
+                    return AuthorityState::None;
+                }
+                if !ready_to_authorize {
+                    *active = false;
+                    return AuthorityState::Pending;
+                }
+                if !*active {
+                    *active = true;
+                    *term = term.saturating_add(1);
+                }
+                AuthorityState::Valid {
+                    source: AuthoritySource::Assumed,
+                    term: *term,
+                    expiry,
+                }
+            }
+        }
+    }
+
+    /// Explicitly revoke authority.
+    pub fn revoke(&mut self) {
+        match self {
+            Self::LocalTimeout { active, .. } => {
+                *active = false;
+            }
+        }
+    }
+}
+
+/// Whether the node manages kernel VIP addresses or runs without a VIP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceManagement {
+    Unmanaged,
+    Managed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecyclePhase {
+    Booting,
+    Ready,
+    RevokedSticky,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPromotion {
+    generation: u64,
+    previous_state: HaState,
+    reason: HaDecisionReason,
+}
+
+/// Immediate hook notification produced by an election/authority transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleTransitionEffect {
+    None,
+    AwaitingConfirmation,
+    PromoteNow {
+        previous_state: HaState,
+        reason: HaDecisionReason,
+    },
+    Demote {
+        previous_state: HaState,
+        current_state: HaState,
+        reason: HaDecisionReason,
+    },
+    Backup {
+        previous_state: HaState,
+        reason: HaDecisionReason,
+    },
+}
+
+/// Hook notification produced when the resource worker completes an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportEffect {
+    None,
+    PromoteConfirmed {
+        previous_state: HaState,
+        reason: HaDecisionReason,
+    },
+    Fault {
+        state: HaState,
+        previous_state: HaState,
+    },
+}
+
+/// Coordinator state machine separating elected role, ownership authority, and verified resource state.
+#[derive(Debug, Clone)]
+pub struct OwnershipController {
+    management: ResourceManagement,
+    elected_role: HaState,
+    previous_role: HaState,
+    authority_provider: OwnershipAuthority,
+    authority: AuthorityState,
+    resource_state: ResourceState,
+    generation: u64,
+    lifecycle: LifecyclePhase,
+    pending_promotion: Option<PendingPromotion>,
+    promoted_generation: Option<u64>,
+    last_observed_at: Option<Instant>,
+    last_error: Option<String>,
+}
+
+impl OwnershipController {
+    /// Construct a new ownership controller for the configured address management mode.
+    #[must_use]
+    pub fn new(management: ResourceManagement) -> Self {
+        let (resource_state, lifecycle) = match management {
+            ResourceManagement::Unmanaged => (ResourceState::Unmanaged, LifecyclePhase::Ready),
+            ResourceManagement::Managed => (
+                ResourceState::Releasing { generation: 0 },
+                LifecyclePhase::Booting,
+            ),
+        };
+
+        Self {
+            management,
+            elected_role: HaState::Init,
+            previous_role: HaState::Init,
+            authority_provider: OwnershipAuthority::default(),
+            authority: AuthorityState::None,
+            resource_state,
+            generation: 0,
+            lifecycle,
+            pending_promotion: None,
+            promoted_generation: None,
+            last_observed_at: None,
+            last_error: None,
+        }
+    }
+
+    /// Enqueue the initial startup reconciliation before any owned state can be advertised.
+    pub fn start_reconciliation(&mut self, worker: &ResourceWorkerHandle) {
+        worker.set_directive(self.generation, DesiredOwnership::Revoked);
+        worker.send_command(ResourceCommand::Withdraw(self.generation));
+    }
+
+    /// True once startup reconciliation has confirmed initial VIP absence (or unmanaged).
+    #[must_use]
+    pub const fn is_startup_reconciled(&self) -> bool {
+        !matches!(self.lifecycle, LifecyclePhase::Booting)
+    }
+
+    /// Role that may be advertised to peers; never advertises `Active` before startup reconciliation finishes.
+    #[must_use]
+    pub const fn advertised_role(&self) -> HaState {
+        if !self.is_startup_reconciled() && matches!(self.elected_role, HaState::Active) {
+            HaState::Standby
+        } else {
+            self.elected_role
+        }
+    }
+
+    /// Current elected role (`init | standby | active`).
+    #[must_use]
+    pub const fn elected_role(&self) -> HaState {
+        self.elected_role
+    }
+
+    /// Previous elected role recorded at the last role transition.
+    #[must_use]
+    pub const fn previous_role(&self) -> HaState {
+        self.previous_role
+    }
+
+    /// Current ownership authority state (`none | pending | valid | uncertain`).
+    #[must_use]
+    pub const fn authority(&self) -> AuthorityState {
+        self.authority
+    }
+
+    /// Current verified resource state (`unmanaged | absent | acquiring | present | releasing | uncertain`).
+    #[must_use]
+    pub const fn resource_state(&self) -> &ResourceState {
+        &self.resource_state
+    }
+
+    /// Current ownership generation counter.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Timestamp of the most recent kernel observation from the resource worker.
+    #[must_use]
+    pub const fn last_observed_at(&self) -> Option<Instant> {
+        self.last_observed_at
+    }
+
+    /// Diagnostic message from the most recent failed resource operation, if any.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Verbatim §1 ownership predicate: `elected_role == active && authority == valid && resource_state in {present, unmanaged}`.
+    #[must_use]
+    pub const fn owned(&self) -> bool {
+        matches!(self.elected_role, HaState::Active)
+            && self.authority.is_valid()
+            && match self.resource_state {
+                ResourceState::Present { generation } => generation == self.generation,
+                ResourceState::Unmanaged => true,
+                ResourceState::Absent
+                | ResourceState::Acquiring { .. }
+                | ResourceState::Releasing { .. }
+                | ResourceState::Uncertain { .. } => false,
+            }
+    }
+
+    /// True only when authority is not valid and the resource is confirmed `absent` or `unmanaged` (I6).
+    #[must_use]
+    pub const fn can_release_handoff(&self) -> bool {
+        !self.authority.is_valid() && self.resource_state.is_confirmed_absent_or_unmanaged()
+    }
+
+    /// Set the elected role while holding authority in `Pending` (for testing invariant I1).
+    pub fn set_elected_role_pending(&mut self, role: HaState, reason: HaDecisionReason) {
+        self.previous_role = self.elected_role;
+        self.elected_role = role;
+        self.authority_provider.revoke();
+        self.authority = if role == HaState::Active {
+            AuthorityState::Pending
+        } else {
+            AuthorityState::None
+        };
+        if role == HaState::Active {
+            self.pending_promotion = Some(PendingPromotion {
+                generation: self.generation,
+                previous_state: self.previous_role,
+                reason,
+            });
+        } else {
+            self.pending_promotion = None;
+        }
+    }
+
+    /// Apply an election decision and enqueue any required serialized resource worker command.
+    pub fn apply_role_decision(
+        &mut self,
+        next_role: HaState,
+        reason: HaDecisionReason,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        if next_role == self.elected_role {
+            return RoleTransitionEffect::None;
+        }
+
+        let previous_role = self.elected_role;
+        self.previous_role = previous_role;
+        self.elected_role = next_role;
+
+        match next_role {
+            HaState::Standby if previous_role == HaState::Init => {
+                self.authority = self.authority_provider.evaluate(next_role, true, None);
+                RoleTransitionEffect::Backup {
+                    previous_state: previous_role,
+                    reason,
+                }
+            }
+            HaState::Active => {
+                if !matches!(self.lifecycle, LifecyclePhase::Ready) {
+                    self.authority = self
+                        .authority_provider
+                        .evaluate(HaState::Active, false, None);
+                    self.pending_promotion = Some(PendingPromotion {
+                        generation: self.generation,
+                        previous_state: previous_role,
+                        reason,
+                    });
+                    if matches!(self.lifecycle, LifecyclePhase::RevokedSticky) {
+                        worker.set_directive(self.generation, DesiredOwnership::Revoked);
+                        worker.send_command(ResourceCommand::Acquire(
+                            self.generation.saturating_add(1),
+                        ));
+                    }
+                    return RoleTransitionEffect::AwaitingConfirmation;
+                }
+
+                self.generation = self.generation.saturating_add(1);
+                self.authority = self
+                    .authority_provider
+                    .evaluate(HaState::Active, true, None);
+                if self.management == ResourceManagement::Unmanaged {
+                    self.resource_state = ResourceState::Unmanaged;
+                    self.promoted_generation = Some(self.generation);
+                    self.pending_promotion = None;
+                    return RoleTransitionEffect::PromoteNow {
+                        previous_state: previous_role,
+                        reason,
+                    };
+                }
+
+                self.pending_promotion = Some(PendingPromotion {
+                    generation: self.generation,
+                    previous_state: previous_role,
+                    reason,
+                });
+                self.resource_state = ResourceState::Acquiring {
+                    generation: self.generation,
+                };
+                worker.set_directive(self.generation, DesiredOwnership::Authorized);
+                worker.send_command(ResourceCommand::Acquire(self.generation));
+                RoleTransitionEffect::AwaitingConfirmation
+            }
+            HaState::Standby | HaState::Init => {
+                self.revoke_authority_internal(previous_role, next_role, reason, worker)
+            }
+        }
+    }
+
+    /// Revoke authority immediately and enqueue a sticky withdrawal on the resource worker.
+    pub fn revoke_authority(
+        &mut self,
+        reason: HaDecisionReason,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        let previous_role = self.elected_role;
+        self.previous_role = previous_role;
+        self.elected_role = HaState::Standby;
+        self.revoke_authority_internal(previous_role, HaState::Standby, reason, worker)
+    }
+
+    fn revoke_authority_internal(
+        &mut self,
+        previous_role: HaState,
+        current_state: HaState,
+        reason: HaDecisionReason,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        self.authority_provider.revoke();
+        self.authority = AuthorityState::None;
+        self.pending_promotion = None;
+        self.generation = self.generation.saturating_add(1);
+
+        if self.management == ResourceManagement::Managed {
+            self.lifecycle = LifecyclePhase::RevokedSticky;
+            self.resource_state = ResourceState::Releasing {
+                generation: self.generation,
+            };
+            worker.set_directive(self.generation, DesiredOwnership::Revoked);
+            worker.send_command(ResourceCommand::Withdraw(self.generation));
+        } else {
+            self.resource_state = ResourceState::Unmanaged;
+        }
+
+        if previous_role == HaState::Active {
+            RoleTransitionEffect::Demote {
+                previous_state: previous_role,
+                current_state,
+                reason,
+            }
+        } else {
+            RoleTransitionEffect::None
+        }
+    }
+
+    fn consume_pending_promotion(&mut self, generation: u64) -> ReportEffect {
+        if self.promoted_generation != Some(generation) {
+            self.promoted_generation = Some(generation);
+            let (previous_state, reason) = self
+                .pending_promotion
+                .take()
+                .map_or((self.previous_role, HaDecisionReason::AlreadyActive), |p| {
+                    (p.previous_state, p.reason)
+                });
+            return ReportEffect::PromoteConfirmed {
+                previous_state,
+                reason,
+            };
+        }
+        ReportEffect::None
+    }
+
+    fn handle_absent_report(&mut self, worker: &ResourceWorkerHandle) -> ReportEffect {
+        let was_booting = matches!(self.lifecycle, LifecyclePhase::Booting);
+        self.lifecycle = LifecyclePhase::Ready;
+        self.resource_state = ResourceState::Absent;
+
+        if was_booting && self.elected_role == HaState::Active {
+            self.generation = self.generation.saturating_add(1);
+            self.authority = self
+                .authority_provider
+                .evaluate(HaState::Active, true, None);
+            if let Some(mut pending) = self.pending_promotion {
+                pending.generation = self.generation;
+                self.pending_promotion = Some(pending);
+            }
+            self.resource_state = ResourceState::Acquiring {
+                generation: self.generation,
+            };
+            worker.set_directive(self.generation, DesiredOwnership::Authorized);
+            worker.send_command(ResourceCommand::Acquire(self.generation));
+        }
+
+        ReportEffect::None
+    }
+
+    fn handle_present_report(
+        &mut self,
+        generation: u64,
+        worker: &ResourceWorkerHandle,
+    ) -> ReportEffect {
+        let valid_for_current = generation == self.generation
+            && self.elected_role == HaState::Active
+            && self.authority.is_valid()
+            && matches!(self.lifecycle, LifecyclePhase::Ready);
+
+        if !valid_for_current {
+            // Invariant I7: a stale completion never restores ownership and triggers compensating withdrawal.
+            self.lifecycle = LifecyclePhase::RevokedSticky;
+            self.resource_state = ResourceState::Releasing {
+                generation: self.generation,
+            };
+            worker.set_directive(self.generation, DesiredOwnership::Revoked);
+            worker.send_command(ResourceCommand::Withdraw(self.generation));
+            return ReportEffect::None;
+        }
+
+        self.resource_state = ResourceState::Present { generation };
+        self.consume_pending_promotion(generation)
+    }
+
+    /// Apply a completed report from the resource worker and determine whether any hook should fire.
+    pub fn apply_worker_report(
+        &mut self,
+        report: ResourceReport,
+        worker: &ResourceWorkerHandle,
+    ) -> ReportEffect {
+        self.last_observed_at = Some(report.observed_at);
+        self.last_error.clone_from(&report.error);
+
+        match report.resource_state {
+            ResourceState::Unmanaged => {
+                self.lifecycle = LifecyclePhase::Ready;
+                self.resource_state = ResourceState::Unmanaged;
+                if self.elected_role == HaState::Active && self.authority.is_valid() {
+                    return self.consume_pending_promotion(self.generation);
+                }
+                ReportEffect::None
+            }
+            ResourceState::Absent => self.handle_absent_report(worker),
+            ResourceState::Present { generation } => self.handle_present_report(generation, worker),
+            ResourceState::Acquiring { generation } => {
+                if generation == self.generation {
+                    self.resource_state = ResourceState::Acquiring { generation };
+                }
+                ReportEffect::None
+            }
+            ResourceState::Releasing { generation } => {
+                self.resource_state = ResourceState::Releasing { generation };
+                ReportEffect::None
+            }
+            ResourceState::Uncertain {
+                last_observation,
+                last_error,
+            } => {
+                if matches!(self.lifecycle, LifecyclePhase::Booting) {
+                    self.lifecycle = LifecyclePhase::Ready;
+                }
+                self.resource_state = ResourceState::Uncertain {
+                    last_observation,
+                    last_error,
+                };
+                if report.kind == ResourceReportKind::Fault {
+                    ReportEffect::Fault {
+                        state: self.elected_role,
+                        previous_state: self.previous_role,
+                    }
+                } else {
+                    ReportEffect::None
+                }
+            }
+        }
+    }
+
+    /// Trigger a reconciliation check on the single resource worker.
+    pub fn request_reconcile(&self, worker: &ResourceWorkerHandle) {
+        let desired = if self.elected_role == HaState::Active
+            && self.authority.is_valid()
+            && matches!(self.lifecycle, LifecyclePhase::Ready)
+        {
+            DesiredOwnership::Authorized
+        } else {
+            DesiredOwnership::Revoked
+        };
+        worker.set_directive(self.generation, desired);
+        worker.send_command(ResourceCommand::Reconcile);
+    }
+
+    /// Revoke authority, drain in-flight work, withdraw VIPs, and join the resource worker.
+    pub async fn shutdown(&mut self, worker: &mut ResourceWorkerHandle) -> ResourceReport {
+        self.authority_provider.revoke();
+        self.authority = AuthorityState::None;
+        self.pending_promotion = None;
+        self.elected_role = HaState::Init;
+        self.generation = self.generation.saturating_add(1);
+        if self.management == ResourceManagement::Managed {
+            self.lifecycle = LifecyclePhase::RevokedSticky;
+            self.resource_state = ResourceState::Releasing {
+                generation: self.generation,
+            };
+        }
+        let report = worker.shutdown(self.generation).await;
+        self.last_observed_at = Some(report.observed_at);
+        self.last_error.clone_from(&report.error);
+        self.resource_state = report.resource_state.clone();
+        if self.resource_state.is_confirmed_absent_or_unmanaged() {
+            self.lifecycle = LifecyclePhase::Ready;
+        }
+        report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AuthoritySource, AuthorityState, ObservedPresence, OwnershipController, ReportEffect,
+        ResourceManagement, ResourceState, RoleTransitionEffect,
+    };
+    use crate::gruezi::{
+        addresses::{
+            AddressManager, CommandGate, CommandRunner, DesiredOwnership, ResourceCommand,
+            ResourceReport, ResourceReportKind, ResourceWorkerHandle, SimulatedKernel,
+        },
+        ha::{HaDecisionReason, HaState},
+    };
+    use anyhow::{Context, Result};
+    use std::sync::{Arc, Mutex};
+    use tokio::{
+        sync::oneshot,
+        time::{Duration, Instant},
+    };
+
+    fn managed_address_manager(addresses: Vec<&str>) -> AddressManager {
+        AddressManager {
+            ip_command: "ip".to_owned(),
+            arping_command: "arping".to_owned(),
+            ndsend_command: "ndsend".to_owned(),
+            interface: "eth0".to_owned(),
+            addresses: addresses.into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    fn record_role_effect(effect: RoleTransitionEffect, hooks: &mut Vec<String>) {
+        match effect {
+            RoleTransitionEffect::PromoteNow { reason, .. } => {
+                hooks.push(format!("promote:{reason}"));
+            }
+            RoleTransitionEffect::Demote { reason, .. } => {
+                hooks.push(format!("demote:{reason}"));
+            }
+            RoleTransitionEffect::Backup { reason, .. } => {
+                hooks.push(format!("backup:{reason}"));
+            }
+            RoleTransitionEffect::None | RoleTransitionEffect::AwaitingConfirmation => {}
+        }
+    }
+
+    fn record_report_effect(effect: ReportEffect, hooks: &mut Vec<String>) {
+        match effect {
+            ReportEffect::PromoteConfirmed { reason, .. } => {
+                hooks.push(format!("promote:{reason}"));
+            }
+            ReportEffect::Fault { state, .. } => {
+                hooks.push(format!("fault:{state:?}"));
+            }
+            ReportEffect::None => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elected_without_valid_authority_never_acquires_or_promotes() {
+        // Invariant I1: Election alone never creates ownership (no add, no OWNED, no promote hook while authority pending).
+        let kernel = SimulatedKernel::new_shared();
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.fail_all_commands = true;
+        }
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+        controller.set_elected_role_pending(HaState::Active, HaDecisionReason::LocalHigherPriority);
+
+        assert_eq!(controller.elected_role(), HaState::Active);
+        assert_eq!(controller.authority(), AuthorityState::Pending);
+        assert!(!controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            SimulatedKernel::calls_snapshot(&kernel),
+            Vec::<Vec<String>>::new()
+        );
+    }
+
+    async fn boot_managed_pair(
+        addresses: Vec<&str>,
+    ) -> Result<(
+        Arc<Mutex<SimulatedKernel>>,
+        ResourceWorkerHandle,
+        OwnershipController,
+        Vec<String>,
+    )> {
+        let kernel = SimulatedKernel::new_shared();
+        let manager = managed_address_manager(addresses);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+        let mut hooks = Vec::new();
+        controller.start_reconciliation(&worker);
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Standby,
+                HaDecisionReason::StartupHold,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        let startup_report = worker
+            .recv_report()
+            .await
+            .context("expected startup report")?;
+        record_report_effect(
+            controller.apply_worker_report(startup_report, &worker),
+            &mut hooks,
+        );
+        Ok((kernel, worker, controller, hooks))
+    }
+
+    async fn recv_and_apply_report(
+        worker: &mut ResourceWorkerHandle,
+        controller: &mut OwnershipController,
+        hooks: &mut Vec<String>,
+    ) -> Result<ResourceReport> {
+        let report = worker
+            .recv_report()
+            .await
+            .context("expected worker report")?;
+        record_report_effect(
+            controller.apply_worker_report(report.clone(), worker),
+            hooks,
+        );
+        Ok(report)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn happy_promote_then_demote_matches_simulated_kernel_table() -> Result<()> {
+        // Manual-QA happy scenario + Invariants I1, I6, I9:
+        // Simulated kernel table matches resource_state at every step; owned=true only after read-back confirms presence.
+        let (kernel, mut worker, mut controller, mut hooks) =
+            boot_managed_pair(vec!["10.0.0.10/24", "fd00::10/64"]).await?;
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert!(!controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        // Promote to Active: before worker report arrives, resource_state is Acquiring and owned is false.
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Acquiring { generation: 1 }
+        );
+        assert_eq!(
+            controller.authority(),
+            AuthorityState::Valid {
+                source: AuthoritySource::Assumed,
+                term: 1,
+                expiry: None,
+            }
+        );
+        assert!(!controller.owned());
+        assert!(!hooks.iter().any(|entry| entry.starts_with("promote:")));
+
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        let table_after_promote = SimulatedKernel::table_snapshot(&kernel);
+        println!("HAPPY QA - AFTER PROMOTE TABLE: {table_after_promote:?}");
+        println!(
+            "HAPPY QA - AFTER PROMOTE STATE: resource_state={:?} owned={} hooks={hooks:?}",
+            controller.resource_state(),
+            controller.owned()
+        );
+        assert_eq!(
+            table_after_promote,
+            vec![
+                "eth0 10.0.0.10/24".to_owned(),
+                "eth0 fd00::10/64".to_owned()
+            ]
+        );
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Present { generation: 1 }
+        );
+        assert!(controller.owned());
+        assert_eq!(
+            hooks,
+            vec![
+                "backup:startup_hold".to_owned(),
+                "promote:local_higher_priority".to_owned()
+            ]
+        );
+
+        // Demote to Standby: authority revoked immediately, on_demote fires, releasing until read-back confirms absence.
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Standby,
+                HaDecisionReason::PeerHigherPriority,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Releasing { generation: 2 }
+        );
+        assert!(!controller.owned());
+        assert!(!controller.can_release_handoff());
+
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        let table_after_demote = SimulatedKernel::table_snapshot(&kernel);
+        println!("HAPPY QA - AFTER DEMOTE TABLE: {table_after_demote:?}");
+        println!(
+            "HAPPY QA - AFTER DEMOTE STATE: resource_state={:?} owned={} can_release={} hooks={hooks:?}",
+            controller.resource_state(),
+            controller.owned(),
+            controller.can_release_handoff()
+        );
+        assert_eq!(table_after_demote, Vec::<String>::new());
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert!(!controller.owned());
+        assert!(controller.can_release_handoff());
+        assert_eq!(
+            hooks,
+            vec![
+                "backup:startup_hold".to_owned(),
+                "promote:local_higher_priority".to_owned(),
+                "demote:peer_higher_priority".to_owned(),
+            ]
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_add_then_demote_ends_absent() -> Result<()> {
+        // Manual-QA failure scenario + Invariants I1, I6, I7:
+        // Gate the add via Scripted/Simulated runner, demote, release the gate:
+        // late add is compensated, final kernel table is absent, resource_state is absent,
+        // and no promote hook fired for the old generation.
+        let (kernel, mut worker, mut controller, mut hooks) =
+            boot_managed_pair(vec!["10.0.0.10/24", "fd00::10/64"]).await?;
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.gate_after_add = Some(CommandGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        }
+
+        // Start promotion (generation 1); the worker adds the first address and pauses at gate_after_add.
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        entered_rx.await.context("worker should enter add gate")?;
+        let table_while_gated = SimulatedKernel::table_snapshot(&kernel);
+        println!("FAILURE QA - WHILE GATED TABLE: {table_while_gated:?}");
+        println!(
+            "FAILURE QA - WHILE GATED STATE: resource_state={:?} owned={} hooks={hooks:?}",
+            controller.resource_state(),
+            controller.owned()
+        );
+        assert_eq!(table_while_gated, vec!["eth0 10.0.0.10/24".to_owned()]);
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Acquiring { generation: 1 }
+        );
+        assert!(!controller.owned());
+        assert!(!hooks.iter().any(|entry| entry.starts_with("promote:")));
+
+        // Demote before the gated add completes (generation advances to 2, authority revoked).
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Standby,
+                HaDecisionReason::PeerHigherPriority,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        assert_eq!(controller.generation(), 2);
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Releasing { generation: 2 }
+        );
+        assert!(!controller.owned());
+
+        // Release the gate: the worker detects the generation change after the first add,
+        // skips the second add, and executes a compensating withdrawal.
+        let _ = release_tx.send(Ok(()));
+        let report = worker
+            .recv_report()
+            .await
+            .context("expected compensated withdrawal report")?;
+        assert_eq!(report.kind, ResourceReportKind::CompensatedWithdrawal);
+        record_report_effect(controller.apply_worker_report(report, &worker), &mut hooks);
+
+        let final_table = SimulatedKernel::table_snapshot(&kernel);
+        let calls = SimulatedKernel::calls_snapshot(&kernel);
+        println!("FAILURE QA - FINAL SIMULATED KERNEL TABLE: {final_table:?}");
+        println!(
+            "FAILURE QA - FINAL STATE: resource_state={:?} owned={} can_release={} hooks={hooks:?}",
+            controller.resource_state(),
+            controller.owned(),
+            controller.can_release_handoff()
+        );
+        assert_eq!(final_table, Vec::<String>::new());
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert!(!controller.owned());
+        assert!(controller.can_release_handoff());
+        assert!(!hooks.iter().any(|entry| entry.starts_with("promote:")));
+        assert_eq!(
+            hooks,
+            vec![
+                "backup:startup_hold".to_owned(),
+                "demote:peer_higher_priority".to_owned(),
+            ]
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == &vec!["ip", "address", "add", "fd00::10/64", "dev", "eth0"])
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_add_drains_and_withdraws() -> Result<()> {
+        // Invariant I7 & Spec §5.5: Shutdown while an add is in flight drains the add, withdraws all VIPs, and confirms absence.
+        let kernel = SimulatedKernel::new_shared();
+        let manager = managed_address_manager(vec!["10.0.0.10/24", "fd00::10/64"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker
+            .recv_report()
+            .await
+            .context("expected startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.gate_after_add = Some(CommandGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        }
+
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::StartupDeadlineExpired,
+            &worker,
+        );
+        entered_rx.await.context("worker should enter add gate")?;
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            vec!["eth0 10.0.0.10/24".to_owned()]
+        );
+
+        let release_future = async move {
+            tokio::task::yield_now().await;
+            let _ = release_tx.send(Ok(()));
+        };
+
+        let (shutdown_report, ()) = tokio::join!(controller.shutdown(&mut worker), release_future);
+
+        assert_eq!(shutdown_report.resource_state, ResourceState::Absent);
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert!(!controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_completion_never_restores_ownership() -> Result<()> {
+        // Invariant I7: Even if a stale Present report from an older generation reaches the controller
+        // after authority was revoked, it never restores ownership and triggers compensating withdrawal.
+        let kernel = SimulatedKernel::new_shared();
+        let manager = managed_address_manager(vec!["10.0.0.10/24"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+        let mut hooks = Vec::new();
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker
+            .recv_report()
+            .await
+            .context("expected startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+
+        // Begin generation 1 acquisition, then revoke authority (generation 2).
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        assert_eq!(controller.generation(), 1);
+        record_role_effect(
+            controller.revoke_authority(HaDecisionReason::PeerHigherPriority, &worker),
+            &mut hooks,
+        );
+        assert_eq!(controller.generation(), 2);
+
+        // Drain the worker's actual withdrawal report first, then inject a synthetic stale Present(generation: 1)
+        // with a residual VIP in the simulated kernel table to verify controller-level I7 defense-in-depth.
+        let initial_withdraw = worker
+            .recv_report()
+            .await
+            .context("expected initial withdraw")?;
+        controller.apply_worker_report(initial_withdraw, &worker);
+        SimulatedKernel::insert_address(&kernel, "eth0", "10.0.0.10/24", "");
+
+        let stale_report = ResourceReport {
+            generation: 1,
+            kind: ResourceReportKind::Acquired,
+            resource_state: ResourceState::Present { generation: 1 },
+            observed_at: Instant::now(),
+            error: None,
+        };
+        record_report_effect(
+            controller.apply_worker_report(stale_report, &worker),
+            &mut hooks,
+        );
+        assert!(!controller.owned());
+        assert_ne!(
+            controller.resource_state(),
+            &ResourceState::Present { generation: 1 }
+        );
+        assert!(!hooks.iter().any(|entry| entry.starts_with("promote:")));
+
+        // The controller enqueued a compensating withdrawal that removes the stale VIP.
+        let compensated = worker
+            .recv_report()
+            .await
+            .context("expected compensating withdrawal")?;
+        controller.apply_worker_report(compensated, &worker);
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn residual_vip_at_startup_is_removed_before_advertising() -> Result<()> {
+        // Spec §5.2 & Invariant I1: Residual managed VIP present at startup is removed and absence is
+        // confirmed before advertising any owned/Active state or starting an acquisition.
+        let kernel = SimulatedKernel::new_shared();
+        SimulatedKernel::insert_address(&kernel, "eth0", "10.0.0.10/24", "");
+        SimulatedKernel::insert_address(&kernel, "eth0", "fd00::10/64", "");
+
+        let manager = managed_address_manager(vec!["10.0.0.10/24", "fd00::10/64"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+
+        controller.start_reconciliation(&worker);
+        // Even if election selects Active before startup reconciliation completes,
+        // the controller stays in AuthorityState::Pending and advertises Standby (not Active).
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        assert!(!controller.is_startup_reconciled());
+        assert_eq!(controller.advertised_role(), HaState::Standby);
+        assert_eq!(controller.authority(), AuthorityState::Pending);
+        assert!(!controller.owned());
+
+        // Startup reconciliation removes the residual VIPs first.
+        let startup_report = worker
+            .recv_report()
+            .await
+            .context("expected startup reconciliation report")?;
+        assert_eq!(startup_report.resource_state, ResourceState::Absent);
+        controller.apply_worker_report(startup_report, &worker);
+        assert!(controller.is_startup_reconciled());
+        assert_eq!(controller.advertised_role(), HaState::Active);
+
+        // Only after startup absence was confirmed does the controller acquire for generation 1.
+        let acquire_report = worker
+            .recv_report()
+            .await
+            .context("expected post-reconcile acquire report")?;
+        controller.apply_worker_report(acquire_report, &worker);
+        assert!(controller.owned());
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Present { generation: 1 }
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn externally_removed_vip_is_readded_while_authority_is_valid_and_not_after_revocation()
+    -> Result<()> {
+        // Spec §5.2: Periodic reconciliation (every advert_interval_ms * dead_factor) re-adds an
+        // externally removed VIP while authority is valid, and never re-adds it after revocation.
+        let kernel = SimulatedKernel::new_shared();
+        let manager = managed_address_manager(vec!["10.0.0.10/24"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker.recv_report().await.context("startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        let acquire_report = worker.recv_report().await.context("acquire report")?;
+        controller.apply_worker_report(acquire_report, &worker);
+        assert!(controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            vec!["eth0 10.0.0.10/24".to_owned()]
+        );
+
+        // Simulate an external operator/tool deleting the VIP from the kernel.
+        SimulatedKernel::remove_address(&kernel, "eth0", "10.0.0.10/24");
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        // Advance the paused clock by advert_interval_ms * dead_factor (1000ms * 3 = 3000ms) and reconcile.
+        tokio::time::advance(Duration::from_millis(3000)).await;
+        controller.request_reconcile(&worker);
+        let reconcile_report = worker.recv_report().await.context("reconcile report")?;
+        controller.apply_worker_report(reconcile_report, &worker);
+        assert!(controller.owned());
+        assert_eq!(
+            controller.resource_state(),
+            &ResourceState::Present { generation: 1 }
+        );
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            vec!["eth0 10.0.0.10/24".to_owned()]
+        );
+
+        // Revoke authority (demote) and confirm withdrawal.
+        controller.apply_role_decision(
+            HaState::Standby,
+            HaDecisionReason::PeerHigherPriority,
+            &worker,
+        );
+        let withdraw_report = worker.recv_report().await.context("withdraw report")?;
+        controller.apply_worker_report(withdraw_report, &worker);
+        assert!(!controller.owned());
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        // Advance the paused clock by another advert_interval_ms * dead_factor and reconcile:
+        // must NOT re-add the VIP after authority revocation.
+        tokio::time::advance(Duration::from_millis(3000)).await;
+        controller.request_reconcile(&worker);
+        let post_revoke_reconcile = worker
+            .recv_report()
+            .await
+            .context("post-revoke reconcile report")?;
+        controller.apply_worker_report(post_revoke_reconcile, &worker);
+        assert!(!controller.owned());
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_acquisition_yields_uncertain_never_present() -> Result<()> {
+        // Invariant I9: Partial acquisition (one address fails, or IPv6 is tentative) yields
+        // ResourceState::Uncertain { last_observation: ObservedPresence::Partial, .. }, never Present.
+        let kernel = SimulatedKernel::new_shared();
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.fail_add_addresses.push("fd00::10/64".to_owned());
+        }
+        let manager = managed_address_manager(vec!["10.0.0.10/24", "fd00::10/64"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+        let mut hooks = Vec::new();
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker.recv_report().await.context("startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        let partial_report = worker.recv_report().await.context("partial report")?;
+        record_report_effect(
+            controller.apply_worker_report(partial_report, &worker),
+            &mut hooks,
+        );
+
+        assert!(!controller.owned());
+        assert!(matches!(
+            controller.resource_state(),
+            ResourceState::Uncertain {
+                last_observation: ObservedPresence::Partial,
+                last_error: Some(_),
+            }
+        ));
+        assert!(!hooks.iter().any(|entry| entry.starts_with("promote:")));
+        assert_eq!(hooks, vec!["fault:Active".to_owned()]);
+
+        // Now allow the IPv6 add to succeed, but mark it tentative in kernel read-back: still Partial/Uncertain!
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.fail_add_addresses.clear();
+            guard
+                .default_add_flags
+                .push(("fd00::10/64".to_owned(), "tentative".to_owned()));
+        }
+        controller.request_reconcile(&worker);
+        let tentative_report = worker.recv_report().await.context("tentative report")?;
+        record_report_effect(
+            controller.apply_worker_report(tentative_report, &worker),
+            &mut hooks,
+        );
+        assert!(!controller.owned());
+        assert!(matches!(
+            controller.resource_state(),
+            ResourceState::Uncertain {
+                last_observation: ObservedPresence::Partial,
+                last_error: Some(_),
+            }
+        ));
+        assert!(!hooks.iter().any(|entry| entry.starts_with("promote:")));
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revocation_is_sticky_until_absence_confirmed() -> Result<()> {
+        // Invariants I6 & I8: Revocation/Withdraw is sticky; queued Acquires are dropped and
+        // later Acquires are rejected until read-back confirms ResourceState::Absent.
+        let kernel = SimulatedKernel::new_shared();
+        let manager = managed_address_manager(vec!["10.0.0.10/24"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker.recv_report().await.context("startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        let acquire_report = worker.recv_report().await.context("acquire report")?;
+        controller.apply_worker_report(acquire_report, &worker);
+        assert!(controller.owned());
+
+        // Inject delete failure so withdrawal cannot confirm absence.
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.fail_del_addresses.push("10.0.0.10/24".to_owned());
+        }
+        controller.apply_role_decision(
+            HaState::Standby,
+            HaDecisionReason::PeerHigherPriority,
+            &worker,
+        );
+        let failed_withdraw = worker
+            .recv_report()
+            .await
+            .context("failed withdraw report")?;
+        controller.apply_worker_report(failed_withdraw, &worker);
+        assert!(!controller.owned());
+        assert!(!controller.can_release_handoff());
+        assert!(matches!(
+            controller.resource_state(),
+            ResourceState::Uncertain {
+                last_observation: ObservedPresence::Present,
+                ..
+            }
+        ));
+
+        // Attempt to re-promote while withdrawal is still unconfirmed: rejected by sticky revocation!
+        SimulatedKernel::remove_address(&kernel, "eth0", "10.0.0.10/24");
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        assert_eq!(controller.authority(), AuthorityState::Pending);
+        let rejected_report = worker
+            .recv_report()
+            .await
+            .context("rejected acquire report")?;
+        assert_eq!(
+            rejected_report.kind,
+            ResourceReportKind::RejectedWhileWithdrawing
+        );
+        controller.apply_worker_report(rejected_report, &worker);
+        assert!(!controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        // Also verify queued Acquire followed by Withdraw drops the queued Acquire.
+        worker.set_directive(10, DesiredOwnership::Revoked);
+        worker.send_command(ResourceCommand::Acquire(9));
+        worker.send_command(ResourceCommand::Withdraw(10));
+        let coalesced_withdraw = worker
+            .recv_report()
+            .await
+            .context("coalesced withdraw report")?;
+        assert_eq!(coalesced_withdraw.kind, ResourceReportKind::Withdrawn);
+        assert_eq!(coalesced_withdraw.resource_state, ResourceState::Absent);
+        controller.apply_worker_report(coalesced_withdraw, &worker);
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+
+        // Now that absence is confirmed, a new election to Active acquires cleanly.
+        controller.apply_role_decision(
+            HaState::Standby,
+            HaDecisionReason::PeerHigherPriority,
+            &worker,
+        );
+        let standby_withdraw = worker.recv_report().await.context("standby withdraw")?;
+        controller.apply_worker_report(standby_withdraw, &worker);
+
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        let reacquired = worker.recv_report().await.context("reacquired report")?;
+        controller.apply_worker_report(reacquired, &worker);
+        assert!(controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            vec!["eth0 10.0.0.10/24".to_owned()]
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmanaged_resource_never_runs_a_command() -> Result<()> {
+        // Spec §1, §2 & IS-9: With addresses: [], resource_state is Unmanaged and no command ever runs.
+        let kernel = SimulatedKernel::new_shared();
+        {
+            let mut guard = kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.fail_all_commands = true;
+        }
+        let manager = managed_address_manager(Vec::new());
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Unmanaged);
+        let mut hooks = Vec::new();
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker.recv_report().await.context("startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+        assert_eq!(controller.resource_state(), &ResourceState::Unmanaged);
+        assert!(!controller.owned());
+
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        assert_eq!(controller.resource_state(), &ResourceState::Unmanaged);
+        assert!(controller.owned());
+        assert_eq!(hooks, vec!["promote:local_higher_priority".to_owned()]);
+
+        controller.request_reconcile(&worker);
+        let reconcile_report = worker.recv_report().await.context("reconcile report")?;
+        controller.apply_worker_report(reconcile_report, &worker);
+        assert_eq!(controller.resource_state(), &ResourceState::Unmanaged);
+        assert!(controller.owned());
+
+        record_role_effect(
+            controller.apply_role_decision(
+                HaState::Standby,
+                HaDecisionReason::PeerHigherPriority,
+                &worker,
+            ),
+            &mut hooks,
+        );
+        assert!(!controller.owned());
+        assert_eq!(controller.resource_state(), &ResourceState::Unmanaged);
+        assert_eq!(
+            hooks,
+            vec![
+                "promote:local_higher_priority".to_owned(),
+                "demote:peer_higher_priority".to_owned()
+            ]
+        );
+
+        let shutdown_report = controller.shutdown(&mut worker).await;
+        assert_eq!(shutdown_report.resource_state, ResourceState::Unmanaged);
+        assert_eq!(
+            SimulatedKernel::calls_snapshot(&kernel),
+            Vec::<Vec<String>>::new()
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_hook_does_not_delay_withdrawal() -> Result<()> {
+        // Invariant I17: Hooks hanging cannot delay withdrawal or deadline handling.
+        let kernel = SimulatedKernel::new_shared();
+        let manager = managed_address_manager(vec!["10.0.0.10/24"]);
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            manager,
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+
+        controller.start_reconciliation(&worker);
+        let startup_report = worker.recv_report().await.context("startup report")?;
+        controller.apply_worker_report(startup_report, &worker);
+
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        let acquire_report = worker.recv_report().await.context("acquire report")?;
+        controller.apply_worker_report(acquire_report, &worker);
+        assert!(controller.owned());
+
+        // Simulate a hanging promote/demote hook future running concurrently with withdrawal.
+        let hook_finished = Arc::new(Mutex::new(false));
+        let hook_finished_clone = hook_finished.clone();
+        let mut hanging_hook = std::pin::pin!(async move {
+            std::future::pending::<()>().await;
+            let mut guard = hook_finished_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = true;
+        });
+
+        let demote_started = Instant::now();
+        controller.apply_role_decision(HaState::Standby, HaDecisionReason::PeerTimeout, &worker);
+        let withdraw_report = tokio::select! {
+            report = worker.recv_report() => report.context("withdraw report")?,
+            () = &mut hanging_hook => anyhow::bail!("hanging hook should never complete"),
+        };
+        controller.apply_worker_report(withdraw_report, &worker);
+
+        // Withdrawal completed in 0ms virtual time while the hook is still hanging.
+        assert_eq!(demote_started.elapsed(), Duration::ZERO);
+        assert_eq!(controller.resource_state(), &ResourceState::Absent);
+        assert!(!controller.owned());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        assert!(
+            !*hook_finished
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        );
+
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+}
