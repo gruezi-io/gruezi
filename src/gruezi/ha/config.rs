@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, HaAuthMode, Mode},
+    config::{AuthorityConfig, Config, FailurePolicy, Mode, WatchdogConfig},
     gruezi::hooks::HaHooks,
 };
 use anyhow::{Result, bail};
@@ -17,9 +17,14 @@ pub struct HaRuntimeConfig {
     pub group_id: String,
     pub bind: String,
     pub peer: String,
+    pub peer_id: String,
     pub interface: String,
     pub addresses: Vec<String>,
-    pub protocol_version: u8,
+    pub failure_policy: FailurePolicy,
+    pub withdraw_timeout_ms: u64,
+    pub command_timeout_ms: u64,
+    pub watchdog: WatchdogConfig,
+    pub authority: Option<AuthorityConfig>,
     pub priority: u8,
     pub preempt: bool,
     pub advert_interval_ms: u64,
@@ -78,6 +83,7 @@ impl TryFrom<&Config> for HaRuntimeConfig {
         if config.mode != Mode::Ha {
             bail!("HA runtime config requires mode 'ha'");
         }
+        config.validate()?;
 
         let node_id = config
             .node
@@ -95,36 +101,45 @@ impl TryFrom<&Config> for HaRuntimeConfig {
             .filter(|peer| !peer.is_empty())
             .ok_or_else(|| anyhow::anyhow!("mode 'ha' requires ha.peer"))?;
 
-        let auth = match config.ha.auth.mode {
-            HaAuthMode::None => HaAuth::None,
-            HaAuthMode::SharedKey => {
-                let key = config
-                    .ha
-                    .auth
-                    .key
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "mode 'ha' requires ha.auth.key when ha.auth.mode is 'shared_key'"
-                        )
-                    })?;
-
-                HaAuth::SharedKey {
-                    key: key.to_owned(),
-                }
-            }
+        // Keys are raw UTF-8 bytes: trimming would silently change authentication.
+        let auth = HaAuth::SharedKey {
+            key: config
+                .ha
+                .auth
+                .key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("ha.auth.key is required"))?,
         };
+        let mut authority = config.ha.authority.clone();
+        if let Some(authority) = &mut authority {
+            authority.interval_ms = Some(
+                authority
+                    .interval_ms
+                    .unwrap_or(config.ha.advert_interval_ms),
+            );
+        }
 
         Ok(Self {
             node_id: node_id.to_owned(),
             group_id: config.ha.group_id.clone(),
             bind: config.ha.bind.clone(),
             peer: peer.to_owned(),
+            peer_id: config
+                .ha
+                .peer_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("ha.peer_id is required"))?,
             interface: config.ha.interface.clone(),
             addresses: config.ha.addresses.clone(),
-            protocol_version: config.ha.protocol_version,
+            failure_policy: config
+                .ha
+                .failure_policy
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("ha.failure_policy is required"))?,
+            withdraw_timeout_ms: config.ha.withdraw_timeout_ms,
+            command_timeout_ms: config.ha.command_timeout_ms,
+            watchdog: config.ha.watchdog.clone(),
+            authority,
             priority: config.ha.priority,
             preempt: config.ha.preempt,
             advert_interval_ms: config.ha.advert_interval_ms,
@@ -161,21 +176,21 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   bind: 0.0.0.0:9375
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: shared_key
-    key: super-secret
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -197,12 +212,13 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   preempt: true
   advert_interval_ms: 1000
@@ -210,7 +226,7 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 

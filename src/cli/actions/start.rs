@@ -29,7 +29,11 @@ pub async fn run(
                     println!("Interface: {}", config.ha.interface);
                     println!("Group ID: {}", config.ha.group_id);
                     println!("Peer: {}", config.ha.peer.as_deref().unwrap_or("unknown"));
-                    println!("Protocol version: {}", config.ha.protocol_version);
+                    println!("Failure policy: {:?}", config.ha.failure_policy);
+                    println!(
+                        "Peer ID: {}",
+                        config.ha.peer_id.as_deref().unwrap_or("unknown")
+                    );
                     println!("Advert interval: {}ms", config.ha.advert_interval_ms);
                     println!("Dead factor: {}", config.ha.dead_factor);
                 }

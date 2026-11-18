@@ -4,13 +4,14 @@ node:
   id: {{ gruezi_node_id }}
 
 ha:
+  failure_policy: {{ gruezi_failure_policy }}
+  peer_id: {{ gruezi_peer_id }}
   bind: {{ gruezi_bind }}
   interface: {{ gruezi_interface }}
   group_id: {{ gruezi_group_id }}
   addresses:
     - {{ gruezi_vip }}
   peer: {{ gruezi_peer_ip }}:9375
-  protocol_version: {{ gruezi_protocol_version }}
   priority: {{ gruezi_priority }}
   preempt: {{ gruezi_preempt | lower }}
   advert_interval_ms: {{ gruezi_advert_interval_ms }}
@@ -18,5 +19,4 @@ ha:
   hold_down_ms: {{ gruezi_hold_down_ms }}
   jitter_ms: {{ gruezi_jitter_ms }}
   auth:
-    mode: shared_key
     key: {{ gruezi_shared_key }}

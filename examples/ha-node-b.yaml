@@ -3,12 +3,13 @@ mode: ha
 node:
   id: node-b
 ha:
+  failure_policy: strict
+  peer_id: node-a
   bind: 0.0.0.0:9375
   interface: eth0
   group_id: cluster-ha
   addresses: [172.31.21.10/24, fd00::10/64]
   peer: 172.31.21.11:9375
-  protocol_version: 1
   priority: 100
   preempt: false
   advert_interval_ms: 1000
@@ -16,5 +17,4 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: shared_key
-    key: change-me
+    key: replace-with-a-private-shared-key

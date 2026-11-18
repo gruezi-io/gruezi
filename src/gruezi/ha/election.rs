@@ -312,19 +312,20 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: {advert_interval_ms}
   dead_factor: {dead_factor}
   hold_down_ms: {hold_down_ms}
   jitter_ms: 0
   auth:
-    mode: none
+    key: shared-secret-for-tests
 "
         ))
         .and_then(|config| HaRuntimeConfig::try_from(&config))
@@ -338,19 +339,20 @@ mode: ha
 node:
   id: node-b
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 110
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -386,12 +388,13 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   preempt: true
   advert_interval_ms: 1000
@@ -399,7 +402,7 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -435,19 +438,20 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -529,12 +533,13 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 110
   preempt: false
   advert_interval_ms: 1000
@@ -542,7 +547,7 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -578,19 +583,20 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -677,19 +683,20 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -724,12 +731,13 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 110
   preempt: true
   advert_interval_ms: 1000
@@ -737,7 +745,7 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -772,12 +780,13 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 110
   preempt: true
   advert_interval_ms: 1000
@@ -785,7 +794,7 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -820,12 +829,13 @@ mode: ha
 node:
   id: node-b
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 10.0.0.2:9375
-  protocol_version: 1
   priority: 100
   preempt: true
   advert_interval_ms: 1000
@@ -833,7 +843,7 @@ ha:
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: none
+    key: shared-secret-for-tests
 ",
         )?;
 

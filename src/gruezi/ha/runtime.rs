@@ -1,7 +1,7 @@
 use super::{
     config::HaRuntimeConfig,
     election::{HaDecisionReason, HaState, PeerObservation, desired_state, has_live_active_peer},
-    protocol::{HaPacket, auth_tag, verify_auth_tag},
+    protocol::{HaPacket, WIRE_VERSION, auth_tag, verify_auth_tag},
     status::{HaStatus, publish_loop_status, saturating_elapsed_ms},
 };
 use crate::gruezi::{
@@ -638,10 +638,10 @@ fn handle_incoming_packet(
         (observation.node_id == packet.node_id).then_some(observation.state)
     });
 
-    if packet.protocol_version != runtime.protocol_version {
+    if packet.version != WIRE_VERSION {
         bail!(
             "unexpected HA protocol version {} from {}",
-            packet.protocol_version,
+            packet.version,
             from
         );
     }
@@ -685,7 +685,7 @@ fn build_packet(runtime: &HaRuntimeConfig, state: HaState, sequence: u64) -> Res
     let advert_interval_ms = u32::try_from(runtime.advert_interval_ms)
         .map_err(|_| anyhow!("HA advert interval exceeds u32"))?;
     let mut packet = HaPacket {
-        protocol_version: runtime.protocol_version,
+        version: WIRE_VERSION,
         state,
         priority: runtime.priority,
         dead_factor: runtime.dead_factor,
@@ -902,7 +902,7 @@ mod tests {
         use anyhow::Context;
         use tokio::sync::oneshot;
         let config = Config::from_yaml_str(
-            "mode: ha\nnode:\n  id: node-a\nha:\n  group_id: cluster-ha\n  interface: eth0\n  peer: 127.0.0.1:9\n  addresses: [10.0.0.10/24]\n",
+            "mode: ha\nnode:\n  id: node-a\nha:\n  failure_policy: available\n  peer_id: node-b\n  auth: {key: shared-secret-for-tests}\n  group_id: cluster-ha\n  interface: eth0\n  peer: 127.0.0.1:9\n  addresses: [10.0.0.10/24]\n",
         )?;
         let runtime = HaRuntimeConfig::try_from(&config)?;
         let kernel = SimulatedKernel::new_shared();
@@ -971,20 +971,20 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 127.0.0.1:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: shared_key
-    key: shared-secret
+    key: shared-secret-for-tests
 ",
         )?;
 
@@ -1018,20 +1018,20 @@ mode: ha
 node:
   id: node-a
 ha:
+  failure_policy: available
+  peer_id: peer-node
   interface: eth0
   group_id: cluster-ha
   addresses:
     - 10.0.0.10/24
   peer: 127.0.0.1:9375
-  protocol_version: 1
   priority: 100
   advert_interval_ms: 1000
   dead_factor: 3
   hold_down_ms: 3000
   jitter_ms: 100
   auth:
-    mode: shared_key
-    key: shared-secret
+    key: shared-secret-for-tests
 ",
         )?;
 

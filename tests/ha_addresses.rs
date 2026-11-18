@@ -42,7 +42,17 @@ fn runtime_config(
         peer: format!("127.0.0.1:{peer_port}"),
         interface: "lo".to_owned(),
         addresses: vec!["10.0.0.10/24".to_owned(), "fd00::10/64".to_owned()],
-        protocol_version: 1,
+        peer_id: if node_id == "node-a" {
+            "node-b"
+        } else {
+            "node-a"
+        }
+        .to_owned(),
+        failure_policy: gruezi::config::FailurePolicy::Available,
+        withdraw_timeout_ms: 5_000,
+        command_timeout_ms: 3_000,
+        watchdog: gruezi::config::WatchdogConfig::default(),
+        authority: None,
         priority,
         preempt,
         advert_interval_ms: 40,
@@ -50,7 +60,7 @@ fn runtime_config(
         hold_down_ms: 40,
         jitter_ms: 0,
         auth: HaAuth::SharedKey {
-            key: "shared-secret".to_owned(),
+            key: "shared-secret-for-tests".to_owned(),
         },
         hooks: HaHooks::default(),
         ip_command: commands.ip,

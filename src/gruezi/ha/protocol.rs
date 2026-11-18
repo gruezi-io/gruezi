@@ -8,13 +8,15 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+pub(super) const WIRE_VERSION: u8 = 1;
+
 const PACKET_MAGIC: &[u8; 4] = b"GRHZ";
 const MAX_ID_LEN: usize = 64;
 const MAX_AUTH_TAG_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaPacket {
-    pub protocol_version: u8,
+    pub version: u8,
     pub state: HaState,
     pub priority: u8,
     pub dead_factor: u8,
@@ -63,7 +65,7 @@ impl HaPacket {
         );
 
         bytes.extend_from_slice(PACKET_MAGIC);
-        bytes.push(self.protocol_version);
+        bytes.push(self.version);
         bytes.push(self.state.as_u8());
         bytes.push(self.priority);
         bytes.push(self.dead_factor);
@@ -91,7 +93,7 @@ impl HaPacket {
             bail!("invalid packet magic");
         }
 
-        let protocol_version = cursor.read_u8()?;
+        let version = cursor.read_u8()?;
         let state = HaState::try_from(cursor.read_u8()?)?;
         let priority = cursor.read_u8()?;
         let dead_factor = cursor.read_u8()?;
@@ -116,7 +118,7 @@ impl HaPacket {
         }
 
         Ok(Self {
-            protocol_version,
+            version,
             state,
             priority,
             dead_factor,
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn encodes_and_decodes_packet() -> Result<()> {
         let packet = HaPacket {
-            protocol_version: 1,
+            version: 1,
             state: HaState::Standby,
             priority: 110,
             dead_factor: 3,
@@ -266,7 +268,7 @@ mod tests {
     #[test]
     fn rejects_truncated_packet() -> Result<()> {
         let packet = HaPacket {
-            protocol_version: 1,
+            version: 1,
             state: HaState::Standby,
             priority: 100,
             dead_factor: 3,
