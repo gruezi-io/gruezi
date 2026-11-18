@@ -49,7 +49,11 @@ fn runtime_config(
         preempt,
         advert_interval_ms: 40,
         dead_factor: 2,
-        hold_down_ms: 40,
+        // A peer counts only after a fresh session: its nonce is learned from one
+        // advert and our nonce must come back in the next (~2 advert intervals).
+        // The startup deadline (dead timeout + hold-down) keeps a wide margin over
+        // that so the lower-priority node never promotes while still connecting.
+        hold_down_ms: 200,
         jitter_ms: 0,
         auth: HaAuth::SharedKey {
             key: "shared-secret-for-tests".to_owned(),

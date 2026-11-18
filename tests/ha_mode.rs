@@ -4,10 +4,14 @@ use anyhow::{Result, anyhow};
 use common::FakeIp;
 use gruezi::gruezi::{
     api,
-    ha::{HaAuth, HaDecisionReason, HaRuntimeConfig, HaState, HaStatus, run_with_status},
+    ha::{
+        HaAuth, HaDecisionReason, HaPacket, HaRuntimeConfig, HaState, HaStatus, PacketKey,
+        run_with_status,
+    },
     hooks::HaHooks,
     status::fetch_status,
 };
+use std::sync::Arc;
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
@@ -43,7 +47,11 @@ fn runtime_config(
         preempt,
         advert_interval_ms: 40,
         dead_factor: 2,
-        hold_down_ms: 40,
+        // A peer counts only after a fresh session: its nonce is learned from one
+        // advert and our nonce must come back in the next (~2 advert intervals).
+        // The startup deadline (dead timeout + hold-down) keeps a wide margin over
+        // that so the lower-priority node never promotes while still connecting.
+        hold_down_ms: 200,
         jitter_ms: 0,
         auth: HaAuth::SharedKey {
             key: "shared-secret-for-tests".to_owned(),
@@ -780,5 +788,180 @@ async fn status_api_reflects_live_ha_state() -> Result<()> {
 
     stop_node_with_api(shutdown_tx, runtime_task, api_task).await?;
     assert_eq!(std::fs::read_to_string(fixture.dir.join("state"))?, "");
+    Ok(())
+}
+
+async fn status_json(api_addr: &str) -> Result<String> {
+    Ok(timeout(
+        Duration::from_secs(3),
+        reqwest::get(format!("http://{api_addr}/status")),
+    )
+    .await??
+    .error_for_status()?
+    .text()
+    .await?)
+}
+
+/// Every datagram the proxy forwarded, in order.
+type CapturedAdverts = JoinHandle<Result<Vec<Vec<u8>>>>;
+
+/// Third UDP socket between node-a and node-b: forwards and records every
+/// advert until stopped, then returns everything it forwarded.
+fn spawn_capturing_proxy(
+    proxy: Arc<tokio::net::UdpSocket>,
+    target: std::net::SocketAddr,
+) -> (oneshot::Sender<()>, CapturedAdverts) {
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut buffer = [0_u8; 1_500];
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => return Ok(captured),
+                recv = proxy.recv_from(&mut buffer) => {
+                    let (len, _) = recv?;
+                    let packet = buffer
+                        .get(..len)
+                        .ok_or_else(|| anyhow!("invalid datagram length"))?
+                        .to_vec();
+                    proxy.send_to(&packet, target).await?;
+                    captured.push(packet);
+                }
+            }
+        }
+    });
+    (stop_tx, task)
+}
+
+async fn assert_fresh_session_via_api(name: &str, api_addr: &str) -> Result<()> {
+    let json = status_json(api_addr).await?;
+    println!("QA HAPPY {name} GET http://{api_addr}/status -> {json}");
+    assert!(
+        json.contains(r#""session_established":true"#),
+        "{name}: {json}"
+    );
+    let typed = fetch_status(Some(api_addr))
+        .await?
+        .ha
+        .ok_or_else(|| anyhow!("{name}: missing ha status"))?;
+    assert!(typed.peer_session.reachable);
+    assert!(typed.peer_session.session_established);
+    assert_eq!(typed.peer_session.rejections.total(), 0);
+    Ok(())
+}
+
+fn print_rejection_counters(label: &str, status: &HaStatus) {
+    println!(
+        "QA FAILURE node-b {label}: packets_received={} invalid_packets={} auth_failures={} last_peer_seen_ms_ago={:?} rejections={:?}",
+        status.packets_received,
+        status.invalid_packets,
+        status.auth_failures,
+        status.last_peer_seen_ms_ago,
+        status.peer_session.rejections
+    );
+}
+
+/// Manual-QA channel for packet authentication: two unmanaged nodes on
+/// loopback establish a fresh session; node-a reaches node-b through a third
+/// UDP socket that captures node-a's adverts. Once forwarding stops, that
+/// socket replays a captured advert and sends a forged one (a would-be-fresh
+/// advert signed with the wrong key). Both must only increment rejection
+/// counters on node-b: no liveness refresh, no state change.
+#[tokio::test]
+async fn replayed_and_forged_adverts_change_only_rejection_counters() -> Result<()> {
+    let port_a = free_udp_port()?;
+    let port_b = free_udp_port()?;
+    let proxy = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let proxy_addr = proxy.local_addr()?;
+    let node_b_addr: std::net::SocketAddr = format!("127.0.0.1:{port_b}").parse()?;
+
+    let runtime_a = HaRuntimeConfig {
+        peer: proxy_addr.to_string(),
+        addresses: Vec::new(),
+        ..runtime_config("node-a", port_a, port_b, 110, true)
+    };
+    // A long hold-down keeps node-b's follower deadline far beyond the test,
+    // so silencing node-a cannot legitimately change node-b's state either.
+    let runtime_b = HaRuntimeConfig {
+        addresses: Vec::new(),
+        hold_down_ms: 5_000,
+        ..runtime_config("node-b", port_b, port_a, 100, true)
+    };
+
+    let (stop_proxy, proxy_task) = spawn_capturing_proxy(proxy.clone(), node_b_addr);
+
+    let node_a = spawn_node_with_api(runtime_a).await?;
+    let mut node_b = spawn_node_with_api(runtime_b).await?;
+    let mut status_a = node_a.status_rx.clone();
+
+    // Happy path: both sides echo each other's nonce.
+    wait_for_status(&mut status_a, "node-a fresh session", |status| {
+        status.state == HaState::Active
+            && status.owned
+            && status.resource.state == "unmanaged"
+            && status.peer_session.session_established
+    })
+    .await?;
+    wait_for_status(&mut node_b.status_rx, "node-b fresh session", |status| {
+        status.state == HaState::Standby
+            && status.peer_alive
+            && status.peer_session.session_established
+    })
+    .await?;
+    for (name, api_addr) in [("node-a", &node_a.api_addr), ("node-b", &node_b.api_addr)] {
+        assert_fresh_session_via_api(name, api_addr).await?;
+    }
+
+    // Silence node-a -> node-b; the proxy returns every advert it forwarded.
+    let _ = stop_proxy.send(());
+    let captured = proxy_task.await.map_err(|error| anyhow!(error))??;
+    let forwarded = u64::try_from(captured.len())?;
+    let before = wait_for_status(
+        &mut node_b.status_rx,
+        "node-b processed every forwarded advert",
+        |status| status.packets_received == forwarded,
+    )
+    .await?;
+    let replay = captured
+        .last()
+        .ok_or_else(|| anyhow!("no advert captured"))?
+        .clone();
+    let mut forged = HaPacket::decode(&replay, &PacketKey::new(b"shared-secret-for-tests")?)
+        .map_err(|cause| anyhow!("captured advert does not decode: {cause}"))?;
+    // With the right key this advert would be fresh (newest seq, echoes
+    // node-b's nonce); only the key is wrong.
+    forged.seq += 1_000;
+    let forged = forged.encode(&PacketKey::new(b"attacker-guessed-wrong-key")?)?;
+
+    proxy.send_to(&replay, node_b_addr).await?;
+    proxy.send_to(&forged, node_b_addr).await?;
+    let after = wait_for_status(
+        &mut node_b.status_rx,
+        "node-b rejected the replay and the forgery",
+        |status| {
+            status.peer_session.rejections.total() == before.peer_session.rejections.total() + 2
+        },
+    )
+    .await?;
+
+    print_rejection_counters("BEFORE", &before);
+    print_rejection_counters("AFTER", &after);
+
+    let mut expected = before.peer_session.rejections;
+    expected.duplicate += 1;
+    expected.bad_tag += 1;
+    assert_eq!(after.peer_session.rejections, expected);
+    assert_eq!(after.invalid_packets, before.invalid_packets + 2);
+    assert_eq!(after.auth_failures, before.auth_failures + 1);
+    // Liveness was not refreshed and nothing else moved.
+    assert_eq!(after.packets_received, before.packets_received);
+    assert!(after.last_peer_seen_ms_ago >= before.last_peer_seen_ms_ago);
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.peer_state, before.peer_state);
+    assert_eq!(after.peer_node_id, before.peer_node_id);
+    assert_eq!(after.decision_reason, before.decision_reason);
+
+    stop_node_with_api(node_a.shutdown_tx, node_a.runtime_task, node_a.api_task).await?;
+    stop_node_with_api(node_b.shutdown_tx, node_b.runtime_task, node_b.api_task).await?;
     Ok(())
 }

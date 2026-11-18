@@ -1,7 +1,28 @@
 use crate::gruezi;
+use crate::gruezi::ha::PeerRejections;
 use anyhow::Result;
 use chrono::Local;
 use tokio::time::{Duration, sleep};
+
+/// Render the peer session rejection counters as one `key=value` run so both
+/// the table and the compact watch line can carry them unchanged.
+fn rejection_pairs(rejections: &PeerRejections) -> String {
+    format!(
+        "wrong_source={} malformed={} unsupported={} bad_tag={} wrong_group={} duplicate_node_id={} wrong_sender={} wrong_receiver={} retired_nonce={} nonce_limit={} duplicate={} too_old={}",
+        rejections.wrong_source,
+        rejections.malformed,
+        rejections.unsupported,
+        rejections.bad_tag,
+        rejections.wrong_group,
+        rejections.duplicate_node_id,
+        rejections.wrong_sender,
+        rejections.wrong_receiver,
+        rejections.retired_nonce,
+        rejections.nonce_limit,
+        rejections.duplicate,
+        rejections.too_old
+    )
+}
 
 /// Execute the status action.
 ///
@@ -122,6 +143,14 @@ fn snapshot_lines(status: &gruezi::status::StatusResponse) -> Vec<String> {
             "  Duplicate Node ID Packets: {}",
             ha.duplicate_node_id_packets
         ));
+        lines.push(format!(
+            "  Peer Session: reachable={} session_established={}",
+            ha.peer_session.reachable, ha.peer_session.session_established
+        ));
+        lines.push(format!(
+            "  Session Rejections: {}",
+            rejection_pairs(&ha.peer_session.rejections)
+        ));
         lines.push(format!("  Decision Reason: {}", ha.decision_reason));
         lines.push(format!(
             "  Last Transition Reason: {}",
@@ -147,9 +176,10 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
         let last_peer_seen = ha
             .last_peer_seen_ms_ago
             .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"));
+        let session_rejections = rejection_pairs(&ha.peer_session.rejections);
 
         format!(
-            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} safety={} safety_why={:?} reason={} last_transition_reason={} peer_alive={} peer_node={} peer_state={} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
+            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} safety={} safety_why={:?} reason={} last_transition_reason={} peer_alive={} peer_node={} peer_state={} peer_reachable={} session_established={} session_rejections={:?} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
             ha.node_id,
             ha.state,
             ha.owned,
@@ -168,6 +198,9 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
             ha.peer_alive,
             peer_node_id,
             peer_state,
+            ha.peer_session.reachable,
+            ha.peer_session.session_established,
+            session_rejections,
             ha.sequence,
             ha.packets_sent,
             ha.packets_received,
@@ -186,7 +219,9 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
 #[cfg(test)]
 mod tests {
     use super::{format_watch_line, snapshot_lines};
-    use crate::gruezi::ha::{HaDecisionReason, HaState, HaStatus};
+    use crate::gruezi::ha::{
+        HaDecisionReason, HaState, HaStatus, PeerRejections, PeerSessionStatus,
+    };
     use crate::gruezi::status::StatusResponse;
 
     fn sample_status() -> StatusResponse {
@@ -213,6 +248,15 @@ mod tests {
             decision_reason: HaDecisionReason::PeerTimeout,
             last_transition_reason: Some(HaDecisionReason::LocalHigherPriority),
             last_transition_ms_ago: Some(250),
+            peer_session: PeerSessionStatus {
+                reachable: true,
+                session_established: true,
+                rejections: PeerRejections {
+                    bad_tag: 2,
+                    duplicate: 1,
+                    ..PeerRejections::default()
+                },
+            },
             ..HaStatus::new("gruezi-a", "lab-ha", "0.0.0.0:9375", "192.0.2.11:9375")
         })
     }
@@ -233,6 +277,10 @@ mod tests {
         assert!(output.contains("Resource: releasing confirmed=false"));
         assert!(output.contains("Authority: none source=none term=0"));
         assert!(output.contains("Safety: uncertain"));
+        assert!(output.contains("Peer Session: reachable=true session_established=true"));
+        assert!(output.contains("Session Rejections: wrong_source=0"));
+        assert!(output.contains("bad_tag=2"));
+        assert!(output.contains("too_old=0"));
     }
 
     #[test]
@@ -247,6 +295,10 @@ mod tests {
         assert!(line.contains("reason=peer_timeout"));
         assert!(line.contains("recv=41"));
         assert!(line.contains("duplicate_node_id_packets=0"));
+        assert!(line.contains("peer_reachable=true"));
+        assert!(line.contains("session_established=true"));
+        assert!(line.contains("session_rejections=\"wrong_source=0"));
+        assert!(line.contains("bad_tag=2"));
         assert!(line.contains("last_peer_seen=17ms"));
         assert!(line.contains("last_transition=250ms"));
     }

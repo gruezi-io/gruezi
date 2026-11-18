@@ -126,7 +126,11 @@ mod tests {
                     r#""sequence":7,"peer_node_id":"node-b","peer_state":"Standby","peer_alive":true,"#,
                     r#""last_peer_seen_ms_ago":3,"packets_sent":7,"packets_received":6,"invalid_packets":5,"#,
                     r#""auth_failures":4,"duplicate_node_id_packets":2,"decision_reason":"already_active","#,
-                    r#""last_transition_reason":"local_higher_priority","last_transition_ms_ago":10}}"#,
+                    r#""last_transition_reason":"local_higher_priority","last_transition_ms_ago":10,"#,
+                    r#""peer_session":{"reachable":false,"session_established":false,"#,
+                    r#""rejections":{"wrong_source":0,"malformed":0,"unsupported":0,"bad_tag":0,"#,
+                    r#""wrong_group":0,"duplicate_node_id":0,"wrong_sender":0,"wrong_receiver":0,"#,
+                    r#""retired_nonce":0,"nonce_limit":0,"duplicate":0,"too_old":0}}}}"#,
                 )
             );
         }

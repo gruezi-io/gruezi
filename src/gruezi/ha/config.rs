@@ -5,10 +5,23 @@ use crate::{
 use anyhow::{Result, bail};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Packet authentication: HMAC-SHA-256 keyed with the raw `ha.auth.key`
+/// bytes. There is no unauthenticated mode.
+#[derive(Clone, PartialEq, Eq)]
 pub enum HaAuth {
-    None,
     SharedKey { key: String },
+}
+
+// The key must never reach logs or status output through `{:?}`.
+impl std::fmt::Debug for HaAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SharedKey { .. } => formatter
+                .debug_struct("SharedKey")
+                .field("key", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +213,9 @@ ha:
         assert_eq!(runtime.group_id, "cluster-ha");
         assert_eq!(runtime.peer, "10.0.0.2:9375");
         assert!(matches!(runtime.auth, HaAuth::SharedKey { .. }));
+        let rendered = format!("{runtime:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("shared-secret-for-tests"));
 
         Ok(())
     }

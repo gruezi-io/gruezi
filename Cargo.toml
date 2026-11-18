@@ -57,12 +57,15 @@ axum = "0.8"
 base64 = { version = "0.23", optional = true }
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive"] }
+getrandom = "0.3"
+hmac = "0.13.0"
 opentelemetry = { version = "0.33.1", optional = true }
 opentelemetry-otlp = { version = "0.33.1", features = ["grpc-tonic", "gzip-tonic", "tls-ring", "tls-roots", "trace"], optional = true }
 opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
+sha2 = "0.11.1"
 socket2 = "0.6"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14.9", features = ["tls-native-roots"], optional = true }

@@ -1,7 +1,10 @@
 use super::{
     config::HaRuntimeConfig,
     election::{HaDecisionReason, HaState, PeerObservation, desired_state, has_live_active_peer},
-    protocol::{HaPacket, WIRE_VERSION, auth_tag, verify_auth_tag},
+    protocol::{
+        AdvertAuthoritySource, AdvertResourceState, HaPacket, PacketRejection, RECEIVE_BUFFER_LEN,
+    },
+    session::{Admission, AdvertState, PeerTracker, boot_nonce},
     status::{HaStatus, publish_loop_status, saturating_elapsed_ms},
 };
 use crate::gruezi::{
@@ -9,7 +12,7 @@ use crate::gruezi::{
     hooks::{HookContext, HookEvent, spawn_hook},
     ownership::{OwnershipController, ReportEffect, ResourceManagement, RoleTransitionEffect},
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     future::Future,
@@ -30,7 +33,6 @@ pub(super) struct HaCounters {
 #[derive(Debug)]
 pub(super) struct HaLoopState {
     pub(super) startup_at: Instant,
-    pub(super) sequence: u64,
     pub(super) state: HaState,
     // Keep this sticky while a live peer remains Active so an asymmetric-loss
     // demotion does not immediately flip back on the next advertisement.
@@ -38,7 +40,9 @@ pub(super) struct HaLoopState {
     pub(super) decision_reason: HaDecisionReason,
     pub(super) last_transition_reason: Option<HaDecisionReason>,
     pub(super) last_transition_at: Option<Instant>,
+    // Fed only with adverts the peer tracker classified as fresh.
     pub(super) peer_observation: Option<PeerObservation>,
+    pub(super) peer: PeerTracker,
     pub(super) counters: HaCounters,
     pub(super) next_advert_at: tokio::time::Instant,
     pub(super) next_reconcile_at: tokio::time::Instant,
@@ -85,13 +89,11 @@ where
     F: Future<Output = T>,
 {
     let (socket, local_bind) = bind_ha_socket(&runtime.bind)?;
-    let peer_addr = runtime
-        .peer
-        .parse::<std::net::SocketAddr>()
-        .with_context(|| format!("invalid HA peer address {}", runtime.peer))?;
-    let mut buffer = [0_u8; 1_024];
+    let peer_addr = resolve_peer(&runtime.peer).await?;
+    let peer = PeerTracker::new(&runtime, peer_addr.ip(), boot_nonce()?)?;
+    let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
     let mut worker = ResourceWorkerHandle::spawn(address_manager(&runtime));
-    let mut loop_state = initialize_loop_state(&runtime, status_tx.as_ref(), &worker);
+    let mut loop_state = initialize_loop_state(&runtime, status_tx.as_ref(), &worker, peer);
     tokio::pin!(shutdown);
 
     log_runtime_start(&runtime, &local_bind, peer_addr);
@@ -200,10 +202,21 @@ fn next_reconcile_deadline(
     }
 }
 
+/// Resolve the `ha.peer` host once at startup. The source-IP check pins every
+/// received datagram to this address for the lifetime of the process.
+async fn resolve_peer(peer: &str) -> Result<std::net::SocketAddr> {
+    tokio::net::lookup_host(peer)
+        .await
+        .with_context(|| format!("invalid HA peer address {peer}"))?
+        .next()
+        .ok_or_else(|| anyhow!("HA peer address {peer} did not resolve"))
+}
+
 fn initialize_loop_state(
     runtime: &HaRuntimeConfig,
     status_tx: Option<&watch::Sender<HaStatus>>,
     worker: &ResourceWorkerHandle,
+    peer: PeerTracker,
 ) -> HaLoopState {
     let now_tokio = tokio::time::Instant::now();
     let startup_at = now_tokio.into_std();
@@ -217,13 +230,13 @@ fn initialize_loop_state(
 
     let loop_state = HaLoopState {
         startup_at,
-        sequence: 0,
         state: HaState::Init,
         active_peer_conflict: false,
         decision_reason: HaDecisionReason::Startup,
         last_transition_reason: None,
         last_transition_at: None,
         peer_observation: None,
+        peer,
         counters: HaCounters::default(),
         next_advert_at: now_tokio + runtime.next_advert_delay(1),
         next_reconcile_at: next_reconcile_deadline(runtime, HaDecisionReason::Startup, now_tokio),
@@ -407,7 +420,7 @@ fn handle_receive_event(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
     recv: std::io::Result<(usize, std::net::SocketAddr)>,
-    buffer: &[u8; 1_024],
+    buffer: &[u8],
 ) -> Result<()> {
     let (len, from) = match recv {
         Ok(value) => value,
@@ -434,30 +447,96 @@ fn handle_receive_event(
         .get(..len)
         .ok_or_else(|| anyhow!("received invalid HA payload length"))?;
 
-    if let Err(error) = handle_incoming_packet(
-        runtime,
-        payload,
-        from,
-        observed_at,
-        &mut loop_state.peer_observation,
-    ) {
-        loop_state.counters.invalid_packets = loop_state.counters.invalid_packets.saturating_add(1);
-        if is_auth_failure(&error) {
-            loop_state.counters.auth_failures = loop_state.counters.auth_failures.saturating_add(1);
+    match loop_state.peer.receive(payload, from, observed_at) {
+        Ok(admission) => {
+            loop_state.counters.packets_received =
+                loop_state.counters.packets_received.saturating_add(1);
+            match admission {
+                Admission::Fresh(packet) => {
+                    observe_peer(&mut loop_state.peer_observation, &packet, observed_at);
+                    debug!(
+                        node_id = %runtime.node_id,
+                        peer = %from,
+                        peer_state = ?packet.role,
+                        peer_priority = packet.priority,
+                        seq = packet.seq,
+                        "received fresh HA advertisement"
+                    );
+                }
+                Admission::Unconfirmed { candidate: true } => {
+                    info!(
+                        node_id = %runtime.node_id,
+                        peer = %from,
+                        "recorded an HA peer nonce as establishment candidate; waiting for it to echo our nonce"
+                    );
+                }
+                Admission::Unconfirmed { candidate: false } | Admission::Reordered => {
+                    debug!(
+                        node_id = %runtime.node_id,
+                        peer = %from,
+                        ?admission,
+                        "HA advertisement accepted without refreshing liveness"
+                    );
+                }
+            }
         }
-        if is_duplicate_node_id_failure(&error) {
-            loop_state.counters.duplicate_node_id_packets = loop_state
-                .counters
-                .duplicate_node_id_packets
-                .saturating_add(1);
+        Err((cause, count)) => {
+            record_rejection(runtime, &mut loop_state.counters, cause, count, from);
         }
-        warn!(%error, from = %from, "ignoring invalid HA packet");
-        return Ok(());
     }
 
-    loop_state.counters.packets_received = loop_state.counters.packets_received.saturating_add(1);
     publish_loop_status(runtime, status_tx, loop_state, observed_at);
     Ok(())
+}
+
+/// Feed one fresh, validated advert to election.
+fn observe_peer(
+    peer_observation: &mut Option<PeerObservation>,
+    packet: &HaPacket,
+    observed_at: Instant,
+) {
+    let previous_peer_state = peer_observation.as_ref().and_then(|observation| {
+        (observation.node_id == packet.sender_id).then_some(observation.state)
+    });
+    *peer_observation = Some(PeerObservation {
+        node_id: packet.sender_id.clone(),
+        state: packet.role,
+        priority: packet.priority,
+        became_active: matches!(packet.role, HaState::Active)
+            && matches!(
+                previous_peer_state,
+                Some(previous_state) if previous_state != HaState::Active
+            ),
+        observed_at,
+    });
+}
+
+/// Count a rejected datagram. Rejections change counters and nothing else.
+fn record_rejection(
+    runtime: &HaRuntimeConfig,
+    counters: &mut HaCounters,
+    cause: PacketRejection,
+    count: u64,
+    from: std::net::SocketAddr,
+) {
+    counters.invalid_packets = counters.invalid_packets.saturating_add(1);
+    match cause {
+        PacketRejection::BadTag => {
+            counters.auth_failures = counters.auth_failures.saturating_add(1);
+        }
+        PacketRejection::DuplicateNodeId => {
+            counters.duplicate_node_id_packets =
+                counters.duplicate_node_id_packets.saturating_add(1);
+        }
+        _ => {}
+    }
+    // Warn on the 1st, 2nd, 4th, 8th... rejection per cause so a flood of
+    // spoofed datagrams cannot flood the log; the counters stay exact.
+    if count.is_power_of_two() {
+        warn!(node_id = %runtime.node_id, from = %from, %cause, count, "rejected HA packet");
+    } else {
+        debug!(node_id = %runtime.node_id, from = %from, %cause, count, "rejected HA packet");
+    }
 }
 
 async fn handle_send_event(
@@ -467,18 +546,12 @@ async fn handle_send_event(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
 ) -> Result<()> {
-    let advertised_state = loop_state.ownership.advertised_role();
-    match send_advertisement(
-        socket,
-        runtime,
-        peer_addr,
-        advertised_state,
-        loop_state.sequence,
-    )
-    .await
-    {
-        Ok(sequence) => {
-            loop_state.sequence = sequence;
+    let advert = advert_state(&loop_state.ownership);
+    // Sequence exhaustion is fatal on purpose: the runtime exits and restarts
+    // with a new nonce instead of ever reusing a sequence number.
+    let (seq, encoded) = loop_state.peer.next_advert(advert)?;
+    match send_advertisement(socket, runtime, peer_addr, &encoded, seq, advert.role).await {
+        Ok(()) => {
             loop_state.counters.packets_sent = loop_state.counters.packets_sent.saturating_add(1);
         }
         Err(error) if is_transient_send_failure(&error) => {
@@ -486,7 +559,7 @@ async fn handle_send_event(
                 %error,
                 node_id = %runtime.node_id,
                 peer = %peer_addr,
-                state = ?advertised_state,
+                state = ?advert.role,
                 "HA advertisement send failed; continuing"
             );
         }
@@ -494,7 +567,7 @@ async fn handle_send_event(
     }
 
     loop_state.next_advert_at =
-        tokio::time::Instant::now() + runtime.next_advert_delay(loop_state.sequence + 1);
+        tokio::time::Instant::now() + runtime.next_advert_delay(seq.saturating_add(1));
     publish_loop_status(
         runtime,
         status_tx,
@@ -626,112 +699,40 @@ async fn cleanup_before_exit_with_hook<H, F>(
     publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
-fn handle_incoming_packet(
-    runtime: &HaRuntimeConfig,
-    payload: &[u8],
-    from: std::net::SocketAddr,
-    observed_at: Instant,
-    peer_observation: &mut Option<PeerObservation>,
-) -> Result<()> {
-    let packet = HaPacket::decode(payload)?;
-    let previous_peer_state = peer_observation.as_ref().and_then(|observation| {
-        (observation.node_id == packet.node_id).then_some(observation.state)
-    });
-
-    if packet.version != WIRE_VERSION {
-        bail!(
-            "unexpected HA protocol version {} from {}",
-            packet.version,
-            from
-        );
+/// Advert fields owned by the coordinator: elected role plus the ownership
+/// controller's authority and resource view.
+fn advert_state(ownership: &OwnershipController) -> AdvertState {
+    let authority = ownership.authority();
+    AdvertState {
+        role: ownership.advertised_role(),
+        authority_source: AdvertAuthoritySource::from_authority(&authority),
+        resource_state: AdvertResourceState::from(ownership.resource_state()),
+        term: authority.term(),
     }
-
-    if packet.group_id != runtime.group_id {
-        bail!("unexpected HA group {}", packet.group_id);
-    }
-
-    if packet.node_id == runtime.node_id {
-        bail!("received HA packet with duplicate node.id");
-    }
-
-    if !verify_auth_tag(runtime, &packet) {
-        bail!("HA packet authentication failed");
-    }
-
-    *peer_observation = Some(PeerObservation {
-        node_id: packet.node_id,
-        state: packet.state,
-        priority: packet.priority,
-        became_active: matches!(packet.state, HaState::Active)
-            && matches!(
-                previous_peer_state,
-                Some(previous_state) if previous_state != HaState::Active
-            ),
-        observed_at,
-    });
-
-    debug!(
-        node_id = %runtime.node_id,
-        peer = %from,
-        peer_state = ?packet.state,
-        peer_priority = packet.priority,
-        "received HA advertisement"
-    );
-
-    Ok(())
-}
-
-fn build_packet(runtime: &HaRuntimeConfig, state: HaState, sequence: u64) -> Result<HaPacket> {
-    let advert_interval_ms = u32::try_from(runtime.advert_interval_ms)
-        .map_err(|_| anyhow!("HA advert interval exceeds u32"))?;
-    let mut packet = HaPacket {
-        version: WIRE_VERSION,
-        state,
-        priority: runtime.priority,
-        dead_factor: runtime.dead_factor,
-        advert_interval_ms,
-        sequence,
-        node_id: runtime.node_id.clone(),
-        group_id: runtime.group_id.clone(),
-        auth_tag: Vec::new(),
-    };
-    packet.auth_tag = auth_tag(&runtime.auth, &packet);
-
-    Ok(packet)
 }
 
 async fn send_advertisement(
     socket: &UdpSocket,
     runtime: &HaRuntimeConfig,
     peer_addr: std::net::SocketAddr,
+    encoded: &[u8],
+    seq: u64,
     state: HaState,
-    sequence: u64,
-) -> Result<u64> {
-    let next_sequence = sequence.saturating_add(1);
-    let packet = build_packet(runtime, state, next_sequence)?;
-    let encoded = packet.encode()?;
+) -> Result<()> {
     socket
-        .send_to(&encoded, peer_addr)
+        .send_to(encoded, peer_addr)
         .await
         .with_context(|| format!("failed to send HA packet to {peer_addr}"))?;
 
     debug!(
         node_id = %runtime.node_id,
         state = ?state,
-        sequence = next_sequence,
+        sequence = seq,
         peer = %peer_addr,
         "sent HA advertisement"
     );
 
-    Ok(next_sequence)
-}
-
-fn is_auth_failure(error: &anyhow::Error) -> bool {
-    error.to_string().contains("authentication failed")
-}
-
-fn is_duplicate_node_id_failure(error: &anyhow::Error) -> bool {
-    error.to_string().contains("duplicate node.id")
+    Ok(())
 }
 
 fn is_transient_io_error(io_error: &std::io::Error) -> bool {
@@ -886,19 +887,32 @@ fn format_socket_addr(addr: std::net::SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HaRuntimeConfig, HaState, build_packet, handle_incoming_packet,
-        is_duplicate_node_id_failure, is_transient_io_error, is_transient_send_failure,
-        verify_auth_tag,
+        HaRuntimeConfig, HaState, handle_receive_event, is_transient_io_error,
+        is_transient_send_failure,
     };
-    use crate::config::Config;
-    use anyhow::Result;
-    use std::time::Instant;
+    use crate::{
+        config::Config,
+        gruezi::{
+            addresses::{CommandRunner, ResourceWorkerHandle, SimulatedKernel},
+            ha::{
+                protocol::{
+                    AdvertAuthoritySource, AdvertResourceState, HaPacket, Nonce, PacketKey,
+                    TransferPhase, ZERO_NONCE,
+                    tests::{TEST_KEY, sample_packet},
+                },
+                session::PeerTracker,
+            },
+        },
+    };
+    use anyhow::{Result, anyhow};
+    use std::net::SocketAddr;
+
+    const LOCAL_NONCE: Nonce = [0xa5; 16];
+    const PEER_NONCE: Nonce = [0xb5; 16];
 
     #[tokio::test(start_paused = true)]
     async fn hanging_fault_hook_does_not_exceed_join_deadline() -> Result<()> {
-        use crate::gruezi::addresses::{
-            CommandGate, CommandRunner, ResourceWorkerHandle, SimulatedKernel,
-        };
+        use crate::gruezi::addresses::CommandGate;
         use anyhow::Context;
         use tokio::sync::oneshot;
         let config = Config::from_yaml_str(
@@ -922,7 +936,8 @@ mod tests {
             super::address_manager(&runtime),
             CommandRunner::Simulated(kernel.clone()),
         );
-        let mut loop_state = super::initialize_loop_state(&runtime, None, &worker);
+        let peer = PeerTracker::new(&runtime, "127.0.0.1".parse()?, LOCAL_NONCE)?;
+        let mut loop_state = super::initialize_loop_state(&runtime, None, &worker, peer);
         entered_rx
             .await
             .context("withdrawal entered the command gate")?;
@@ -963,96 +978,128 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn rejects_packet_with_invalid_auth_tag() -> Result<()> {
+    fn unmanaged_runtime() -> Result<HaRuntimeConfig> {
         let config = Config::from_yaml_str(
-            r"
-mode: ha
-node:
-  id: node-a
-ha:
-  failure_policy: available
-  peer_id: peer-node
-  interface: eth0
-  group_id: cluster-ha
-  addresses:
-    - 10.0.0.10/24
-  peer: 127.0.0.1:9375
-  priority: 100
-  advert_interval_ms: 1000
-  dead_factor: 3
-  hold_down_ms: 3000
-  jitter_ms: 100
-  auth:
-    key: shared-secret-for-tests
-",
+            "mode: ha\nnode:\n  id: node-a\nha:\n  failure_policy: available\n  peer_id: node-b\n  auth: {key: shared-secret-for-tests}\n  group_id: cluster-ha\n  peer: 127.0.0.1:9\n  addresses: []\n",
         )?;
+        HaRuntimeConfig::try_from(&config)
+    }
 
-        let runtime = HaRuntimeConfig::try_from(&config)?;
-        let mut packet = build_packet(&runtime, HaState::Active, 7)?;
-        packet.node_id = "peer-a".to_owned();
-        packet.auth_tag = vec![0, 1, 2, 3];
-
-        assert!(!verify_auth_tag(&runtime, &packet));
-
-        let mut peer_observation = None;
-        let result = handle_incoming_packet(
-            &runtime,
-            &packet.encode()?,
-            "127.0.0.1:9375".parse()?,
-            Instant::now(),
-            &mut peer_observation,
+    fn unmanaged_loop() -> Result<(HaRuntimeConfig, ResourceWorkerHandle, super::HaLoopState)> {
+        let runtime = unmanaged_runtime()?;
+        let worker = ResourceWorkerHandle::spawn_with_runner(
+            super::address_manager(&runtime),
+            CommandRunner::Simulated(SimulatedKernel::new_shared()),
         );
+        let peer = PeerTracker::new(&runtime, "127.0.0.1".parse()?, LOCAL_NONCE)?;
+        let loop_state = super::initialize_loop_state(&runtime, None, &worker, peer);
+        Ok((runtime, worker, loop_state))
+    }
 
-        assert!(result.is_err());
-        assert!(peer_observation.is_none());
+    fn deliver(
+        runtime: &HaRuntimeConfig,
+        loop_state: &mut super::HaLoopState,
+        bytes: &[u8],
+        from: SocketAddr,
+    ) -> Result<()> {
+        handle_receive_event(runtime, None, loop_state, Ok((bytes.len(), from)), bytes)
+    }
 
+    fn peer_advert(receiver_nonce: Nonce, seq: u64, key: &[u8]) -> Result<Vec<u8>> {
+        HaPacket {
+            sender_nonce: PEER_NONCE,
+            receiver_nonce,
+            seq,
+            role: HaState::Active,
+            ..sample_packet()
+        }
+        .encode(&PacketKey::new(key)?)
+    }
+
+    #[tokio::test]
+    async fn rejections_change_counters_but_never_election_or_liveness() -> Result<()> {
+        let (runtime, _worker, mut loop_state) = unmanaged_loop()?;
+        let peer: SocketAddr = "127.0.0.1:40000".parse()?;
+
+        // First advert is only an establishment candidate (not fresh):
+        // election still has no peer.
+        deliver(
+            &runtime,
+            &mut loop_state,
+            &peer_advert(ZERO_NONCE, 1, TEST_KEY)?,
+            peer,
+        )?;
+        assert!(loop_state.peer_observation.is_none());
+        // Second advert echoes our nonce: the session is fresh.
+        deliver(
+            &runtime,
+            &mut loop_state,
+            &peer_advert(LOCAL_NONCE, 2, TEST_KEY)?,
+            peer,
+        )?;
+        let observed = loop_state
+            .peer_observation
+            .clone()
+            .ok_or_else(|| anyhow!("fresh advert must feed election"))?;
+        assert_eq!(observed.state, HaState::Active);
+        assert_eq!(loop_state.counters.packets_received, 2);
+
+        let own_id = HaPacket {
+            sender_id: "node-a".to_owned(),
+            sender_nonce: PEER_NONCE,
+            receiver_nonce: LOCAL_NONCE,
+            seq: 3,
+            ..sample_packet()
+        }
+        .encode(&PacketKey::new(TEST_KEY)?)?;
+        let attacks: [(Vec<u8>, SocketAddr); 5] = [
+            (
+                peer_advert(LOCAL_NONCE, 3, TEST_KEY)?,
+                "127.0.0.9:40000".parse()?,
+            ),
+            (peer_advert(LOCAL_NONCE, 3, b"wrong-key-for-forgery")?, peer),
+            (peer_advert(LOCAL_NONCE, 2, TEST_KEY)?, peer),
+            (own_id, peer),
+            (vec![0; 8], peer),
+        ];
+        for (index, (bytes, from)) in attacks.iter().enumerate() {
+            let state_before = loop_state.state;
+            deliver(&runtime, &mut loop_state, bytes, *from)?;
+            assert_eq!(loop_state.peer_observation.as_ref(), Some(&observed));
+            assert_eq!(loop_state.state, state_before);
+            assert_eq!(loop_state.counters.packets_received, 2);
+            assert_eq!(
+                loop_state.counters.invalid_packets,
+                u64::try_from(index)? + 1
+            );
+        }
+        let rejections = loop_state.peer.rejections();
+        assert_eq!(rejections.wrong_source, 1);
+        assert_eq!(rejections.bad_tag, 1);
+        assert_eq!(rejections.duplicate, 1);
+        assert_eq!(rejections.duplicate_node_id, 1);
+        assert_eq!(rejections.malformed, 1);
+        assert_eq!(loop_state.counters.auth_failures, 1);
+        assert_eq!(loop_state.counters.duplicate_node_id_packets, 1);
         Ok(())
     }
 
-    #[test]
-    fn rejects_packet_with_duplicate_node_id() -> Result<()> {
-        let config = Config::from_yaml_str(
-            r"
-mode: ha
-node:
-  id: node-a
-ha:
-  failure_policy: available
-  peer_id: peer-node
-  interface: eth0
-  group_id: cluster-ha
-  addresses:
-    - 10.0.0.10/24
-  peer: 127.0.0.1:9375
-  priority: 100
-  advert_interval_ms: 1000
-  dead_factor: 3
-  hold_down_ms: 3000
-  jitter_ms: 100
-  auth:
-    key: shared-secret-for-tests
-",
-        )?;
-
-        let runtime = HaRuntimeConfig::try_from(&config)?;
-        let packet = build_packet(&runtime, HaState::Active, 7)?;
-
-        let mut peer_observation = None;
-        let result = handle_incoming_packet(
-            &runtime,
-            &packet.encode()?,
-            "127.0.0.1:9375".parse()?,
-            Instant::now(),
-            &mut peer_observation,
-        );
-
-        let Err(error) = result else {
-            anyhow::bail!("duplicate node.id packet should be rejected");
-        };
-        assert!(is_duplicate_node_id_failure(&error));
-        assert!(peer_observation.is_none());
-
+    #[tokio::test]
+    async fn unmanaged_node_advertises_unmanaged_resource_state() -> Result<()> {
+        let (_runtime, _worker, mut loop_state) = unmanaged_loop()?;
+        let state = super::advert_state(&loop_state.ownership);
+        assert_eq!(state.resource_state, AdvertResourceState::Unmanaged);
+        assert_eq!(state.authority_source, AdvertAuthoritySource::None);
+        let (seq, bytes) = loop_state.peer.next_advert(state)?;
+        let advert = HaPacket::decode(&bytes, &PacketKey::new(TEST_KEY)?)?;
+        assert_eq!(seq, 1);
+        assert_eq!(advert.seq, 1);
+        assert_eq!(advert.sender_nonce, LOCAL_NONCE);
+        assert_eq!(advert.receiver_nonce, ZERO_NONCE);
+        assert_eq!(advert.ack_seq, 0);
+        assert_eq!(advert.resource_state, AdvertResourceState::Unmanaged);
+        assert_eq!(advert.transfer_phase, TransferPhase::None);
+        assert_eq!(advert.transfer_id, 0);
         Ok(())
     }
 

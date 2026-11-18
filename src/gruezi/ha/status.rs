@@ -2,6 +2,7 @@ use super::{
     config::HaRuntimeConfig,
     election::{HaDecisionReason, HaState},
     runtime::HaLoopState,
+    session::PeerRejections,
 };
 use crate::gruezi::ownership::{AuthoritySource, OwnershipController, ResourceState};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,21 @@ impl SafetyLevel {
             Self::Assumed => "assumed",
         }
     }
+}
+
+/// Protocol-layer view of the peer (design spec section 6: `peer`). Named
+/// `peer_session` because the existing `peer` field already carries the peer
+/// address and existing fields keep their meaning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerSessionStatus {
+    /// An authenticated, non-replayed datagram arrived within the follower
+    /// deadline (fresh or not).
+    pub reachable: bool,
+    /// The current peer session echoed our nonce and its newest fresh advert
+    /// is within the follower deadline. Becomes false as soon as the peer
+    /// restarts with a new nonce.
+    pub session_established: bool,
+    pub rejections: PeerRejections,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +136,7 @@ pub struct HaStatus {
     pub decision_reason: HaDecisionReason,
     pub last_transition_reason: Option<HaDecisionReason>,
     pub last_transition_ms_ago: Option<u64>,
+    pub peer_session: PeerSessionStatus,
 }
 
 impl HaStatus {
@@ -161,6 +178,7 @@ impl HaStatus {
             decision_reason: HaDecisionReason::Startup,
             last_transition_reason: None,
             last_transition_ms_ago: None,
+            peer_session: PeerSessionStatus::default(),
         }
     }
 }
@@ -184,6 +202,8 @@ fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Ins
         .peer_observation
         .as_ref()
         .map(|peer| saturating_elapsed_ms(now, peer.observed_at));
+    let within_deadline =
+        |seen: Option<Instant>| seen.is_some_and(|seen| runtime.follower_deadline(seen) > now);
 
     HaStatus {
         node_id: runtime.node_id.clone(),
@@ -199,7 +219,7 @@ fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Ins
         advert_interval_ms: runtime.advert_interval_ms,
         dead_timeout_ms: duration_millis_u64(runtime.dead_timeout()),
         hold_down_ms: runtime.hold_down_ms,
-        sequence: loop_state.sequence,
+        sequence: loop_state.peer.last_sent_seq(),
         peer_node_id: loop_state
             .peer_observation
             .as_ref()
@@ -217,6 +237,11 @@ fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Ins
         last_transition_ms_ago: loop_state
             .last_transition_at
             .map(|transition_at| saturating_elapsed_ms(now, transition_at)),
+        peer_session: PeerSessionStatus {
+            reachable: within_deadline(loop_state.peer.last_authenticated_at()),
+            session_established: within_deadline(loop_state.peer.last_fresh_at()),
+            rejections: loop_state.peer.rejections(),
+        },
     }
 }
 
