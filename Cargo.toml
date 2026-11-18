@@ -65,7 +65,7 @@ serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 socket2 = "0.6"
 tokio = { version = "1", features = ["full"] }
-tonic = { version = "0.14.6", features = ["tls-native-roots"], optional = true }
+tonic = { version = "0.14.9", features = ["tls-native-roots"], optional = true }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.34.0", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
