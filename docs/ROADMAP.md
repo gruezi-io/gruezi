@@ -111,3 +111,14 @@ for registration and health updates.
   one renewal interval.
 * The agent reconnects after a coordinator restart without duplicate records.
 * DNS answers and API records agree in an end-to-end fixture.
+
+## Unscheduled, Planned
+
+These items came from the earlier README checklist. None has a milestone or
+acceptance criteria yet, and none is implemented.
+
+* API authentication and TLS for the management API on `9376/tcp`.
+* Metrics export. Only OpenTelemetry traces are exported today.
+* Measured tuning of heartbeat, timer, and failover latency for HA.
+* Witness or arbiter support for two-node HA, beyond the external grant path.
+* Cluster bootstrap by discovery URL for KV mode, after M3.

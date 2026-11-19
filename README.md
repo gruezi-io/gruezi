@@ -16,6 +16,7 @@ systems.
 | --- | --- | --- |
 | HA election over UDP | Implemented | Prototype election and state reporting on `9375/udp`. |
 | Read-only status API | Implemented | `/status`, `/ha/status`, and `/health` on `9376/tcp`. |
+| Dual-stack API listener | Implemented | The API binds an explicit address when configured. Otherwise it tries a dual-stack `[::]` socket and falls back to IPv4 `0.0.0.0`. |
 | Transition hooks | Implemented | Promote, demote, backup, and fault hook configuration. |
 | VIP mutation and confirmed ownership | Implemented | A serialized Linux resource worker reads the kernel back before `owned=true`. |
 | Authenticated HA packets | Implemented | HMAC-SHA-256, peer pinning, sessions, and replay protection are tested. |
@@ -24,6 +25,10 @@ systems.
 | External grant happy path | Experimental | Two-node grant acquisition, renewal beyond 20 seconds, stale-grant withdrawal, and the lone-node `fencing: requested` state are tested. |
 | `gruezi peers` listing | Experimental | The command exists, but peer discovery currently returns an empty list. |
 | Direct `start` flags | Unsupported | `gruezi start --bind/--peers/--node-id` is a stub. Use YAML only. |
+| API authentication and TLS | Planned | The `9376/tcp` API has no authentication or TLS. Telemetry export has its own TLS settings. |
+| Metrics | Planned | Only OpenTelemetry traces are exported. There are no metrics. |
+| Failover timing tuning | Planned | Heartbeat, timer, and failover latency have no recorded tuning measurements. |
+| Witness or arbiter | Planned | Two-node HA has no third-party witness. See [HA safety](docs/HA-SAFETY.md). |
 | KV mode | Planned | No Raft or key-value runtime is shipped. |
 | DNS and agent | Planned | No service discovery runtime is shipped. |
 | FreeBSD backend | Planned | The next platform step is an `ifconfig` resource backend. |
