@@ -39,7 +39,7 @@ watchdog are **Planned** until implementation evidence changes their status.
 | Full partition | Owner withdraws. No takeover. Safe but unavailable. | Both nodes may own. This is unsafe for exclusive resources. | No grant from silence, so unavailable. |
 | A to B loss | Consent stops and the owner withdraws. No takeover. | B may promote while A still owns. | No new grant from packet loss. |
 | B to A loss | Consent stops and the owner withdraws. No takeover. | A continues while B sees A. | No new grant from packet loss. |
-| Gruezi freeze or crash with host up | Watchdog may self-fence. Peer still does not promote. | Peer may promote after the deadline. A residual VIP is possible until fencing. | Promotion waits for grant and fencing or release. |
+| Gruezi freeze or crash with host up | Watchdog may self-fence. Peer still does not promote. | Peer may promote after the deadline. A residual VIP is possible until fencing. A resumed owner that stalled past the follower deadline yields with `local_stall` before it advertises again; the peer that promoted keeps the VIP. | Promotion waits for grant and fencing or release. |
 | VIP withdrawal fails | No released state is advertised. Successor is blocked and watchdog stays armed. | Cooperative transfer blocks, but timeout takeover can overlap. | No release or fencing proof means no acquire. |
 | Watchdog arm fails | Required mode makes acquisition fail. | Automatic mode may run unprotected only when conclusively unarmed. | Grant does not override a required watchdog failure. |
 | Recovery or failback | Fresh consent and handoff are required. | Visible incumbent is honored when `preempt: false`. | Grant and fencing rules still apply. |
@@ -139,10 +139,14 @@ shows dual ownership (A+B), the documented unsafe overlap.
 
 Observed results that differ from the table above or from the planned design:
 
-* **available, frozen owner resumed (FAIL).** After SIGCONT both nodes yield at
-  the same moment, the VIP is absent for about one second, then the higher
-  priority node reacquires. One kernel VIP remains, but the documented result
-  was a single yielding side. Open fix todo 24 in the roadmap plan.
+* **available, frozen owner resumed (fixed by todo 24).** At 2d531e7, after
+  SIGCONT both nodes yielded at the same moment, the VIP was absent for about
+  one second, then the higher priority node reacquired. Now the resumed owner
+  detects its own stall, withdraws without advertising its stale claim, and
+  waits until the peer acknowledges that; the visible incumbent B keeps the
+  VIP with no gap. `test-ha-netem.sh process-freeze available` PASSes 3/3 on
+  gruezi-a (kernel 264), and an 80-sample trace after SIGCONT never shows
+  both kernels holding the VIP.
 * **external, stale release proof (FAIL, safety).** If the owner is stopped with
   SIGTERM, restarted, reacquires the VIP and then fails to withdraw it, a
   successor holding a fresh grant still acquired the VIP without fencing

@@ -1,7 +1,8 @@
 use super::{
     config::HaRuntimeConfig,
     election::{
-        HaDecisionReason, HaState, PeerObservation, desired_state, has_live_active_peer, outranks,
+        HaDecision, HaDecisionReason, HaState, PeerObservation, desired_state,
+        has_live_active_peer, outranks,
     },
     protocol::{
         AdvertAuthoritySource, AdvertResourceState, HaPacket, PacketRejection, RECEIVE_BUFFER_LEN,
@@ -74,6 +75,21 @@ pub(super) struct HaLoopState {
     pub(super) last_transition_trigger: Option<TransitionTrigger>,
     pub(super) handoff: handoff::Handoff,
     shutdown_deadline: Option<tokio::time::Instant>,
+    // End of the latest policy evaluation; a larger gap than the follower
+    // deadline means this process was stopped (stall detection).
+    last_refresh_at: tokio::time::Instant,
+    stall_resync: Option<StallResync>,
+}
+
+/// A stalled `available` owner yields and stays standby until the peer
+/// acknowledges an advert sent after the stall, so the peer state it then
+/// elects against is current instead of queued from before the stall.
+#[derive(Debug, Clone, Copy)]
+struct StallResync {
+    /// First own sequence number advertised after the stall was handled.
+    seq: u64,
+    /// Without such an acknowledgement ordinary election resumes here.
+    until: tokio::time::Instant,
 }
 
 /// Datagram transport seam (design spec 8a: an enum, never a trait object).
@@ -464,6 +480,8 @@ fn initialize_loop_state(
         last_transition_trigger: None,
         handoff: handoff::Handoff::default(),
         shutdown_deadline: None,
+        last_refresh_at: now_tokio,
+        stall_resync: None,
     };
 
     publish_loop_status(runtime, status_tx, &loop_state, startup_at);
@@ -513,10 +531,7 @@ fn refresh_local_state(
         loop_state.ownership.authority().is_valid(),
         decision,
     );
-    if loop_state.shutdown_deadline.is_some() {
-        decision.state = HaState::Standby;
-        decision.reason = HaDecisionReason::GracefulShutdown;
-    }
+    override_decision(runtime, loop_state, now_tokio, &mut decision);
     let bootstrap_ok = bootstrap_rule_satisfied(runtime, loop_state, now);
     loop_state.ownership.set_bootstrap_allowed(bootstrap_ok);
     loop_state.ownership.set_handoff_gate(
@@ -603,6 +618,62 @@ fn refresh_local_state(
         &loop_state.ownership,
         loop_state.peer.last_sent_seq().saturating_add(1),
     );
+}
+
+/// Coordinator overrides of the elected role for this evaluation: the
+/// post-stall standby hold (started, kept or ended here) and graceful
+/// shutdown. Also stamps the evaluation time used for stall detection.
+fn override_decision(
+    runtime: &HaRuntimeConfig,
+    loop_state: &mut HaLoopState,
+    now: tokio::time::Instant,
+    decision: &mut HaDecision,
+) {
+    if stalled_owner(runtime, loop_state, now) {
+        warn!(
+            node_id = %runtime.node_id,
+            stalled_ms = saturating_elapsed_ms(now.into_std(), loop_state.last_refresh_at.into_std()),
+            "HA coordinator stalled past the follower deadline; yielding to a peer that may have promoted"
+        );
+        loop_state.stall_resync = Some(StallResync {
+            seq: loop_state.peer.last_sent_seq().saturating_add(1),
+            until: now + runtime.dead_timeout() + runtime.hold_down(),
+        });
+    }
+    if loop_state
+        .stall_resync
+        .is_some_and(|resync| now >= resync.until)
+    {
+        loop_state.stall_resync = None;
+    }
+    if loop_state.stall_resync.is_some() {
+        decision.state = HaState::Standby;
+        decision.reason = HaDecisionReason::LocalStall;
+    }
+    if loop_state.shutdown_deadline.is_some() {
+        decision.state = HaState::Standby;
+        decision.reason = HaDecisionReason::GracefulShutdown;
+    }
+    loop_state.last_refresh_at = now;
+}
+
+/// The coordinator has not evaluated its policy for longer than the peer's
+/// follower deadline while owning under `available` (a stopped or frozen
+/// process): the peer may have promoted on its timeout meanwhile, so this
+/// claim is stale. The visible incumbent keeps the resource and exactly the
+/// stalled side yields. A transfer in progress blocks the peer's timeout
+/// fallback (I8), so only an idle handoff can have been displaced. `strict`
+/// and `external` peers never promote on silence and keep their own rules.
+fn stalled_owner(
+    runtime: &HaRuntimeConfig,
+    loop_state: &HaLoopState,
+    now: tokio::time::Instant,
+) -> bool {
+    runtime.failure_policy == FailurePolicy::Available
+        && loop_state.state == HaState::Active
+        && loop_state.handoff.idle()
+        && now.saturating_duration_since(loop_state.last_refresh_at)
+            >= runtime.dead_timeout() + runtime.hold_down()
 }
 
 fn dispatch_role_hook(
@@ -746,6 +817,14 @@ fn handle_receive_event(
                 loop_state.counters.packets_received.saturating_add(1);
             match admission {
                 Admission::Fresh(packet) => {
+                    if loop_state
+                        .stall_resync
+                        .is_some_and(|resync| packet.ack_seq >= resync.seq)
+                    {
+                        // The peer has seen our post-stall standby advert:
+                        // its state is current, so election resumes.
+                        loop_state.stall_resync = None;
+                    }
                     loop_state
                         .ownership
                         .set_fencing(crate::gruezi::ownership::FencingState::None);
@@ -920,6 +999,12 @@ async fn handle_send_event(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
 ) -> Result<()> {
+    if stalled_owner(runtime, loop_state, tokio::time::Instant::now()) {
+        // A thawed owner must evaluate the stall before it advertises: its
+        // stale Active claim would make the incumbent yield too. The advert
+        // stays due and is sent right after the next policy evaluation.
+        return Ok(());
+    }
     let mut advert = advert_state(&loop_state.ownership);
     (advert.transfer_id, advert.transfer_phase) = loop_state.handoff.advert();
     debug!(

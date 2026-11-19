@@ -1,5 +1,5 @@
 //! Watchdog rows use the real coordinator and simulated kernel. The outer
-//! polling gate freezes just the coordinator, leaving the fake hardware clock
+//! freeze gate stops just the coordinator, leaving the fake hardware clock
 //! independent of it, as with SIGSTOP on a real owner.
 
 use super::*;
@@ -12,17 +12,10 @@ use crate::{
         watchdog::{FakeWatchdog, WatchdogCall, WatchdogDevice, WatchdogFault},
     },
 };
-use std::{
-    future::{Future, poll_fn},
-    sync::atomic::{AtomicBool, Ordering},
-    task::Poll,
-};
-
 struct WatchdogHarness {
     pair: Harness,
     a: FakeWatchdog,
     b: FakeWatchdog,
-    freeze_a: Arc<AtomicBool>,
 }
 
 impl WatchdogHarness {
@@ -34,19 +27,12 @@ impl WatchdogHarness {
         let (net, a, b) = InMemoryNetwork::new_pair();
         let watchdog_a = FakeWatchdog::new(fault);
         let watchdog_b = FakeWatchdog::new(fault);
-        let freeze_a = Arc::new(AtomicBool::new(false));
         let mut config_a = node_config(Side::A, policy.clone());
         config_a.watchdog.mode = mode.clone();
         let mut config_b = node_config(Side::B, policy);
         config_b.watchdog.mode = mode;
-        let node_a = spawn(Side::A, a, config_a, watchdog_a.clone(), freeze_a.clone());
-        let node_b = spawn(
-            Side::B,
-            b,
-            config_b,
-            watchdog_b.clone(),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let node_a = spawn(Side::A, a, config_a, watchdog_a.clone());
+        let node_b = spawn(Side::B, b, config_b, watchdog_b.clone());
         net.capture_kernels(node_a.kernel.clone(), node_b.kernel.clone());
         Self {
             pair: Harness {
@@ -56,7 +42,6 @@ impl WatchdogHarness {
             },
             a: watchdog_a,
             b: watchdog_b,
-            freeze_a,
         }
     }
 
@@ -78,7 +63,6 @@ fn spawn(
     endpoint: InMemoryEndpoint,
     mut runtime: HaRuntimeConfig,
     watchdog: FakeWatchdog,
-    frozen: Arc<AtomicBool>,
 ) -> Node {
     let authority = if runtime.failure_policy == FailurePolicy::External {
         runtime.authority = Some(AuthorityConfig {
@@ -106,35 +90,25 @@ fn spawn(
     ));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let kernel = SimulatedKernel::new_shared();
-    let task_kernel = kernel.clone();
-    let task = tokio::spawn(async move {
-        let coordinator = super::super::run_with_watchdog(
-            runtime,
-            Transport::InMemory(endpoint),
-            CommandRunner::Simulated(task_kernel),
-            authority,
-            WatchdogDevice::Fake(watchdog),
-            Some(status_tx),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        );
-        tokio::pin!(coordinator);
-        poll_fn(|cx| {
-            if frozen.load(Ordering::SeqCst) {
-                Poll::Pending
-            } else {
-                coordinator.as_mut().poll(cx)
-            }
-        })
-        .await
-    });
+    let freeze = FreezeGate::default();
+    let task = tokio::spawn(freeze.clone().run(super::super::run_with_watchdog(
+        runtime,
+        Transport::InMemory(endpoint),
+        CommandRunner::Simulated(kernel.clone()),
+        authority,
+        WatchdogDevice::Fake(watchdog),
+        Some(status_tx),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    )));
     Node {
         name,
         status_rx,
         kernel,
         shutdown_tx: Some(shutdown_tx),
         task,
+        freeze,
     }
 }
 
@@ -235,7 +209,7 @@ async fn freeze_owner(policy: FailurePolicy) -> Result<()> {
         .lock()
         .reset_deadline
         .context("owner reset deadline")?;
-    harness.freeze_a.store(true, Ordering::SeqCst);
+    harness.pair.node_a.freeze.freeze();
     settle(Duration::from_secs(5)).await;
     assert_eq!(
         before,
@@ -291,13 +265,7 @@ async fn matrix_watchdog_unmanaged_owner_feeds_without_reset() -> Result<()> {
     runtime.addresses.clear();
     runtime.watchdog.mode = WatchdogMode::Required;
     let fake = FakeWatchdog::new(WatchdogFault::None);
-    let node = spawn(
-        Side::A,
-        endpoint,
-        runtime,
-        fake.clone(),
-        Arc::new(AtomicBool::new(false)),
-    );
+    let node = spawn(Side::A, endpoint, runtime, fake.clone());
     settle(BOOT_WINDOW).await;
     assert!(node.snapshot().owned);
     assert!(node.snapshot().watchdog.armed);

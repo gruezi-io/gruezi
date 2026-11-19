@@ -27,6 +27,10 @@ pub enum HaDecisionReason {
     PeerNodeIdTiebreak,
     PeerActiveNoPreempt,
     PeerBecameActiveConflict,
+    /// The coordinator stalled (for example SIGSTOP) past the follower
+    /// deadline: an `available` peer may have promoted meanwhile, so the
+    /// stale owner yields until the peer state is current again.
+    LocalStall,
     /// Authority was revoked because bilateral consent lapsed (policy layer,
     /// not an election outcome; design spec 4.4).
     ConsentExpired,
@@ -54,6 +58,7 @@ impl HaDecisionReason {
             Self::PeerNodeIdTiebreak => "peer_node_id_tiebreak",
             Self::PeerActiveNoPreempt => "peer_active_no_preempt",
             Self::PeerBecameActiveConflict => "peer_became_active_conflict",
+            Self::LocalStall => "local_stall",
             Self::ConsentExpired => "consent_expired",
             Self::PreemptHigherPriority => "preempt_higher_priority",
             Self::PreemptNodeIdTiebreak => "preempt_node_id_tiebreak",

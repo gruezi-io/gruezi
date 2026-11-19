@@ -27,7 +27,11 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, anyhow};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+    task::{Poll, Waker},
+};
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
@@ -93,12 +97,51 @@ fn node_config(side: Side, policy: FailurePolicy) -> HaRuntimeConfig {
     }
 }
 
+/// SIGSTOP/SIGCONT for one coordinator. While frozen its future is not
+/// polled, so time keeps running and peer datagrams queue as in a socket
+/// buffer; thawing wakes the task again.
+#[derive(Clone, Default)]
+struct FreezeGate(Arc<Mutex<(bool, Option<Waker>)>>);
+
+impl FreezeGate {
+    fn freeze(&self) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).0 = true;
+    }
+
+    fn thaw(&self) {
+        let waker = {
+            let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.0 = false;
+            guard.1.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    async fn run<F: Future>(self, future: F) -> F::Output {
+        tokio::pin!(future);
+        std::future::poll_fn(|cx| {
+            {
+                let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+                if guard.0 {
+                    guard.1 = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+            future.as_mut().poll(cx)
+        })
+        .await
+    }
+}
+
 struct Node {
     name: &'static str,
     status_rx: watch::Receiver<HaStatus>,
     kernel: Arc<Mutex<SimulatedKernel>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
+    freeze: FreezeGate,
 }
 
 impl Node {
@@ -218,28 +261,24 @@ fn spawn_with_authority(
         runtime.peer.clone(),
     ));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let task = {
-        let kernel = kernel.clone();
-        tokio::spawn(async move {
-            super::run_with_authority_commands(
-                runtime,
-                Transport::InMemory(endpoint),
-                CommandRunner::Simulated(kernel),
-                authority_runner,
-                Some(status_tx),
-                async move {
-                    let _ = shutdown_rx.await;
-                },
-            )
-            .await
-        })
-    };
+    let freeze = FreezeGate::default();
+    let task = tokio::spawn(freeze.clone().run(super::run_with_authority_commands(
+        runtime,
+        Transport::InMemory(endpoint),
+        CommandRunner::Simulated(kernel.clone()),
+        authority_runner,
+        Some(status_tx),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    )));
     Node {
         name,
         status_rx,
         kernel,
         shutdown_tx: Some(shutdown_tx),
         task,
+        freeze,
     }
 }
 
@@ -763,6 +802,98 @@ async fn matrix_available_one_way_loss_b_to_a() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn matrix_available_recovery_failback() -> Result<()> {
     run_recovery_failback(FailurePolicy::Available).await
+}
+
+/// GAP-6 (todo 24): SIGSTOP the available owner A until B promotes on the
+/// follower deadline, then SIGCONT A. The thawed owner detects its own stall
+/// and yields before it advertises again, so exactly one side yields: the
+/// visible incumbent B keeps the VIP with no gap and never withdraws.
+async fn run_thawed_owner(freeze_for: Duration) -> Result<()> {
+    let row = "available/process_freeze";
+    let harness = Harness::boot(FailurePolicy::Available);
+    settle(BOOT_WINDOW).await;
+    assert_single_owner(row, &harness.node_a, &harness.node_b);
+    harness.node_a.freeze.freeze();
+    settle(freeze_for).await;
+    let b = harness.node_b.snapshot();
+    assert!(
+        b.owned,
+        "{row}: incumbent promoted on the follower deadline"
+    );
+    assert_eq!(b.authority.source, Some(AuthoritySource::Assumed));
+    assert_ne!(
+        harness.node_a.kernel_table(),
+        Vec::<String>::new(),
+        "{row}: the frozen owner keeps its residual VIP (documented overlap)"
+    );
+    print_matrix_state(row, "frozen", &harness.node_a);
+    print_matrix_state(row, "frozen", &harness.node_b);
+    let a_adds = kernel_add_calls(&harness.node_a).len();
+    let b_calls = harness.node_b.kernel_calls().len();
+    let thawed_at = tokio::time::Instant::now();
+    harness.node_a.freeze.thaw();
+    for _ in 0..80 {
+        settle(Duration::from_millis(100)).await;
+        assert!(
+            harness.node_b.snapshot().owned,
+            "{row}: the incumbent yielded after the thaw"
+        );
+        assert_eq!(
+            harness.node_b.kernel_table(),
+            vec!["eth0 10.0.0.10/24".to_owned()],
+            "{row}: VIP gap on the incumbent"
+        );
+    }
+    print_matrix_state(row, "thawed", &harness.node_a);
+    print_matrix_state(row, "thawed", &harness.node_b);
+    let a = harness.node_a.snapshot();
+    assert!(!a.owned);
+    assert_eq!(a.state, crate::gruezi::ha::HaState::Standby);
+    assert_eq!(harness.node_a.kernel_table(), Vec::<String>::new());
+    assert_eq!(
+        kernel_add_calls(&harness.node_a).len(),
+        a_adds,
+        "{row}: the thawed owner reacquired"
+    );
+    let b_after: Vec<_> = harness
+        .node_b
+        .kernel_calls()
+        .into_iter()
+        .skip(b_calls)
+        .collect();
+    assert!(
+        !b_after
+            .iter()
+            .any(|call| call.iter().any(|part| part == "del")),
+        "{row}: the incumbent withdrew after the thaw: {b_after:?}"
+    );
+    let a_active_after_thaw = harness
+        .net
+        .history()
+        .into_iter()
+        .filter(|sent| sent.side == Side::A && sent.at >= thawed_at)
+        .filter_map(|sent| decode_advert(&sent.bytes))
+        .filter(|packet| packet.role == crate::gruezi::ha::HaState::Active)
+        .count();
+    assert_eq!(
+        a_active_after_thaw, 0,
+        "{row}: the thawed owner advertised its stale Active claim"
+    );
+    assert_single_owner(row, &harness.node_b, &harness.node_a);
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_available_thawed_owner_yields_to_incumbent() -> Result<()> {
+    // Just past the follower deadline (dead window plus hold-down) and far
+    // beyond it: the outcome must not depend on the freeze length.
+    for freeze_for in [
+        dead_window() + Duration::from_millis(HOLD_DOWN_MS + ADVERT_INTERVAL_MS * 3 / 2),
+        dead_window() * 10,
+    ] {
+        run_thawed_owner(freeze_for).await?;
+    }
+    Ok(())
 }
 
 fn adverts(net: &InMemoryNetwork, side: Side, phase: TransferPhase) -> Vec<(SentAdvert, HaPacket)> {

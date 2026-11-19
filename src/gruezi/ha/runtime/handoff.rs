@@ -253,6 +253,11 @@ impl Handoff {
         )
     }
 
+    /// No transfer is in progress or pending in either direction.
+    pub(super) const fn idle(&self) -> bool {
+        matches!(self.phase, Phase::Idle)
+    }
+
     pub(super) const fn bootstrap_permitted(&self) -> bool {
         matches!(self.phase, Phase::Idle)
             && matches!(
