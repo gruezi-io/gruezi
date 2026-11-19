@@ -685,6 +685,7 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "hmac",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

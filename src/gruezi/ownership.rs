@@ -5,7 +5,8 @@ use crate::{
             DesiredOwnership, ResourceCommand, ResourceReport, ResourceReportKind,
             ResourceWorkerHandle,
         },
-        ha::{HaDecisionReason, HaState},
+        ha::{HaDecisionReason, HaRuntimeConfig, HaState},
+        watchdog::{WatchdogDevice, WatchdogManager, WatchdogStatus},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -460,7 +461,7 @@ pub enum ReportEffect {
 }
 
 /// Coordinator state machine separating elected role, ownership authority, and verified resource state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OwnershipController {
     management: ResourceManagement,
     elected_role: HaState,
@@ -475,6 +476,7 @@ pub struct OwnershipController {
     promoted_generation: Option<u64>,
     last_observed_at: Option<Instant>,
     last_error: Option<String>,
+    watchdog: WatchdogManager,
 }
 
 impl OwnershipController {
@@ -503,6 +505,7 @@ impl OwnershipController {
             promoted_generation: None,
             last_observed_at: None,
             last_error: None,
+            watchdog: WatchdogManager::default(),
         }
     }
 
@@ -570,11 +573,12 @@ impl OwnershipController {
         self.last_error.as_deref()
     }
 
-    /// Verbatim §1 ownership predicate: `elected_role == active && authority == valid && resource_state in {present, unmanaged}`.
+    /// Section 1 ownership predicate, including required watchdog protection.
     #[must_use]
-    pub const fn owned(&self) -> bool {
+    pub fn owned(&self) -> bool {
         matches!(self.elected_role, HaState::Active)
             && self.authority.is_valid()
+            && self.watchdog.ownership_allowed()
             && match self.resource_state {
                 ResourceState::Present { generation } => generation == self.generation,
                 ResourceState::Unmanaged => true,
@@ -583,6 +587,60 @@ impl OwnershipController {
                 | ResourceState::Releasing { .. }
                 | ResourceState::Uncertain { .. } => false,
             }
+    }
+
+    pub(crate) fn configure_watchdog(&mut self, runtime: &HaRuntimeConfig, device: WatchdogDevice) {
+        // The worker currently has fixed command/withdrawal bounds. Do not
+        // under-budget them when a config requests shorter deadlines.
+        let budget = Duration::from_millis(runtime.advert_interval_ms)
+            .saturating_add(Duration::from_millis(
+                runtime
+                    .command_timeout_ms
+                    .max(crate::gruezi::addresses::COMMAND_TIMEOUT_MS),
+            ))
+            .saturating_add(Duration::from_millis(
+                runtime
+                    .withdraw_timeout_ms
+                    .max(crate::gruezi::addresses::WITHDRAW_TIMEOUT_MS),
+            ))
+            .saturating_add(Duration::from_millis(u64::from(
+                runtime.watchdog.safety_margin_ms,
+            )));
+        self.watchdog = WatchdogManager::new(runtime.watchdog.clone(), device, budget);
+    }
+
+    pub(crate) fn watchdog_status(&self, now: Instant) -> WatchdogStatus {
+        self.watchdog.status(now)
+    }
+
+    /// The only feeding entry point, called once per coordinator iteration.
+    /// Share the owned predicate so both present and unmanaged resources feed.
+    /// A failed keepalive revokes authority and starts bounded withdrawal.
+    pub(crate) fn feed_watchdog(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        if self.owned()
+            && self
+                .authority
+                .expiry()
+                .is_none_or(|until| until > Instant::now())
+            && let Err(error) = self.watchdog.feed(self.generation)
+        {
+            let effect = self.revoke_authority_internal(
+                self.elected_role,
+                self.elected_role,
+                HaDecisionReason::RuntimeFault,
+                worker,
+            );
+            self.last_error = Some(error.to_string());
+            return effect;
+        }
+        RoleTransitionEffect::None
+    }
+
+    fn disarm_watchdog_after_absence(&mut self) {
+        if let Err(error) = self.watchdog.disarm() {
+            tracing::warn!(%error, "watchdog remains unfed after confirmed absence");
+            self.last_error = Some(error.to_string());
+        }
     }
 
     /// True only when authority is not valid and the resource is confirmed `absent` or `unmanaged` (I6).
@@ -702,7 +760,7 @@ impl OwnershipController {
         if authority.is_valid() {
             if was_valid {
                 self.authority = authority;
-                return RoleTransitionEffect::None;
+                return self.feed_watchdog(worker);
             }
             let reason = self
                 .pending_promotion
@@ -740,6 +798,22 @@ impl OwnershipController {
                 previous_state: self.previous_role,
                 reason,
             });
+            return RoleTransitionEffect::AwaitingConfirmation;
+        }
+        if !self.resource_state.is_confirmed_absent_or_unmanaged() {
+            self.authority_provider.revoke();
+            self.authority = AuthorityState::Pending;
+            return RoleTransitionEffect::AwaitingConfirmation;
+        }
+        if let Err(error) = self.watchdog.arm(
+            self.generation,
+            self.last_observed_at.is_some() && matches!(self.lifecycle, LifecyclePhase::Ready),
+        ) {
+            // Keep the worker revoked: neither a direct Acquire nor periodic
+            // Reconcile may add a VIP after an unsuccessful arm (I10).
+            self.authority_provider.revoke();
+            self.authority = AuthorityState::Pending;
+            self.last_error = Some(error.to_string());
             return RoleTransitionEffect::AwaitingConfirmation;
         }
         if self.management == ResourceManagement::Unmanaged {
@@ -861,6 +935,7 @@ impl OwnershipController {
         reason: HaDecisionReason,
         worker: &ResourceWorkerHandle,
     ) -> RoleTransitionEffect {
+        self.watchdog.stop_feeding();
         self.authority_provider.revoke();
         self.authority = AuthorityState::None;
         self.pending_promotion = None;
@@ -875,6 +950,7 @@ impl OwnershipController {
             worker.send_command(ResourceCommand::Withdraw(self.generation));
         } else {
             self.resource_state = ResourceState::Unmanaged;
+            self.disarm_watchdog_after_absence();
         }
 
         if previous_role == HaState::Active {
@@ -909,6 +985,9 @@ impl OwnershipController {
         let was_booting = matches!(self.lifecycle, LifecyclePhase::Booting);
         self.lifecycle = LifecyclePhase::Ready;
         self.resource_state = ResourceState::Absent;
+        if !self.authority.is_valid() {
+            self.disarm_watchdog_after_absence();
+        }
 
         if was_booting && self.elected_role == HaState::Active {
             // Startup reconciliation confirmed absence: acquisition begins
@@ -954,6 +1033,7 @@ impl OwnershipController {
         if !valid_for_current {
             // Invariant I7: a stale completion never restores ownership and triggers compensating withdrawal.
             self.lifecycle = LifecyclePhase::RevokedSticky;
+            self.watchdog.stop_feeding();
             self.resource_state = ResourceState::Releasing {
                 generation: self.generation,
             };
@@ -989,6 +1069,9 @@ impl OwnershipController {
             ResourceState::Unmanaged => {
                 self.lifecycle = LifecyclePhase::Ready;
                 self.resource_state = ResourceState::Unmanaged;
+                if !self.authority.is_valid() {
+                    self.disarm_watchdog_after_absence();
+                }
                 if self.elected_role == HaState::Active && self.authority.is_valid() {
                     return self.consume_pending_promotion(self.generation);
                 }
@@ -1003,6 +1086,7 @@ impl OwnershipController {
                 ReportEffect::None
             }
             ResourceState::Releasing { generation } => {
+                self.watchdog.stop_feeding();
                 self.resource_state = ResourceState::Releasing { generation };
                 ReportEffect::None
             }
@@ -1045,6 +1129,7 @@ impl OwnershipController {
 
     /// Revoke authority, drain in-flight work, withdraw VIPs, and join the resource worker.
     pub async fn shutdown(&mut self, worker: &mut ResourceWorkerHandle) -> ResourceReport {
+        self.watchdog.stop_feeding();
         self.authority_provider.revoke();
         self.authority = AuthorityState::None;
         self.pending_promotion = None;
@@ -1062,6 +1147,7 @@ impl OwnershipController {
         self.resource_state = report.resource_state.clone();
         if self.resource_state.is_confirmed_absent_or_unmanaged() {
             self.lifecycle = LifecyclePhase::Ready;
+            self.disarm_watchdog_after_absence();
         }
         report
     }
@@ -2045,6 +2131,285 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         );
 
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    fn attach_watchdog(
+        controller: &mut OwnershipController,
+    ) -> crate::gruezi::watchdog::FakeWatchdog {
+        use crate::{
+            config::{WatchdogConfig, WatchdogMode},
+            gruezi::watchdog::{FakeWatchdog, WatchdogDevice, WatchdogFault, WatchdogManager},
+        };
+        let fake = FakeWatchdog::new(WatchdogFault::None);
+        controller.watchdog = WatchdogManager::new(
+            WatchdogConfig {
+                mode: WatchdogMode::Required,
+                ..WatchdogConfig::default()
+            },
+            WatchdogDevice::Fake(fake.clone()),
+            Duration::from_secs(11),
+        );
+        fake
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_required_owned_needs_an_armed_device() -> Result<()> {
+        let (_, mut worker, mut controller, _) = boot_managed_pair(vec!["10.0.0.10/24"]).await?;
+        let _ = attach_watchdog(&mut controller);
+        controller.elected_role = HaState::Active;
+        controller.authority = AuthorityState::Valid {
+            source: AuthoritySource::Peer,
+            term: 1,
+            expiry: None,
+        };
+        controller.generation = 1;
+        controller.resource_state = ResourceState::Present { generation: 1 };
+        assert!(
+            !controller.owned(),
+            "required watchdog participates in the owned formula"
+        );
+        controller.watchdog.arm(1, true)?;
+        assert!(controller.owned());
+        let status = controller.watchdog_status(Instant::now());
+        assert_eq!(status.mode, "required");
+        assert!(status.armed);
+        assert_eq!(status.effective_timeout_ms, Some(15_000));
+        assert_eq!(status.last_feed_ago_ms, Some(0));
+        assert!(!status.unprotected);
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_i11_feed_state_enumeration() -> Result<()> {
+        use crate::gruezi::watchdog::WatchdogCall;
+        let (_, mut worker, mut controller, _) = boot_managed_pair(vec!["10.0.0.10/24"]).await?;
+        let fake = attach_watchdog(&mut controller);
+        controller.watchdog.arm(7, true)?;
+        controller.elected_role = HaState::Active;
+        controller.generation = 7;
+        let valid = AuthorityState::Valid {
+            source: AuthoritySource::Peer,
+            term: 1,
+            expiry: Some(Instant::now() + Duration::from_secs(60)),
+        };
+        let authorities = [
+            AuthorityState::None,
+            AuthorityState::Pending,
+            valid,
+            AuthorityState::Uncertain {
+                source: Some(AuthoritySource::Peer),
+                term: 1,
+                expiry: None,
+            },
+            AuthorityState::Valid {
+                source: AuthoritySource::Peer,
+                term: 1,
+                expiry: Some(Instant::now()),
+            },
+        ];
+        let resources = [
+            ResourceState::Unmanaged,
+            ResourceState::Absent,
+            ResourceState::Acquiring { generation: 7 },
+            ResourceState::Present { generation: 7 },
+            ResourceState::Present { generation: 6 },
+            ResourceState::Releasing { generation: 7 },
+            ResourceState::Uncertain {
+                last_observation: ObservedPresence::Present,
+                last_error: None,
+            },
+        ];
+        for authority in authorities {
+            for resource in &resources {
+                controller.authority = authority;
+                controller.resource_state = resource.clone();
+                let before = fake.calls().len();
+                controller.feed_watchdog(&worker);
+                let should_feed = authority == valid
+                    && (*resource == ResourceState::Unmanaged
+                        || *resource == ResourceState::Present { generation: 7 });
+                assert_eq!(
+                    fake.calls().len() > before,
+                    should_feed,
+                    "{authority:?} {resource:?}"
+                );
+                println!(
+                    "WATCHDOG I11 authority={authority:?} resource={resource:?} generation=7 feed={should_feed}"
+                );
+            }
+        }
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|(_, call)| *call == WatchdogCall::KeepAlive)
+                .count(),
+            2
+        );
+        println!("WATCHDOG I11 actual device call log: {:?}", fake.calls());
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_owned_feeds_then_disarms_only_after_withdrawal() -> Result<()> {
+        use crate::gruezi::watchdog::WatchdogCall;
+        let (kernel, mut worker, mut controller, mut hooks) =
+            boot_managed_pair(vec!["10.0.0.10/24"]).await?;
+        let fake = attach_watchdog(&mut controller);
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        assert!(!controller.owned());
+        controller.feed_watchdog(&worker);
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|(_, call)| *call == WatchdogCall::KeepAlive)
+        );
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        assert!(controller.owned());
+        controller.feed_watchdog(&worker);
+        println!(
+            "WATCHDOG QA OWNED resource={:?} kernel={:?} calls={:?}",
+            controller.resource_state(),
+            SimulatedKernel::table_snapshot(&kernel),
+            fake.calls()
+        );
+        controller.revoke_authority(HaDecisionReason::GracefulShutdown, &worker);
+        let before = fake.calls();
+        controller.feed_watchdog(&worker);
+        assert_eq!(before, fake.calls());
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|(_, call)| *call == WatchdogCall::MagicClose)
+        );
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        assert!(!controller.watchdog_status(Instant::now()).armed);
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|(_, call)| *call == WatchdogCall::MagicClose)
+        );
+        println!(
+            "WATCHDOG QA ABSENT kernel={:?} calls={:?}",
+            SimulatedKernel::table_snapshot(&kernel),
+            fake.calls()
+        );
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_i12_failed_withdrawal_never_disarms_or_magic_closes() -> Result<()> {
+        use crate::gruezi::watchdog::WatchdogCall;
+        let (kernel, mut worker, mut controller, mut hooks) =
+            boot_managed_pair(vec!["10.0.0.10/24"]).await?;
+        let fake = attach_watchdog(&mut controller);
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        controller.feed_watchdog(&worker);
+        kernel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_del_addresses
+            .push("10.0.0.10/24".to_owned());
+        controller.revoke_authority(HaDecisionReason::GracefulShutdown, &worker);
+        let before = fake.calls();
+        let report = recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        assert_eq!(report.kind, ResourceReportKind::Fault);
+        controller.feed_watchdog(&worker);
+        assert_eq!(
+            before,
+            fake.calls(),
+            "withdrawal failure must issue no device calls"
+        );
+        assert!(controller.watchdog_status(Instant::now()).armed);
+        assert!(!controller.owned());
+        let deadline = fake.lock().reset_deadline.context("armed deadline")?;
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        let calls = fake.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, call)| *call == WatchdogCall::Reset { deadline })
+        );
+        assert!(!calls.iter().any(|(_, call)| matches!(
+            call,
+            WatchdogCall::Disarm | WatchdogCall::MagicClose | WatchdogCall::Close
+        )));
+        println!(
+            "WATCHDOG QA FAILED WITHDRAWAL resource={:?} kernel={:?} reset_deadline={deadline:?} calls={calls:?}",
+            controller.resource_state(),
+            SimulatedKernel::table_snapshot(&kernel)
+        );
+        let shutdown = controller.shutdown(&mut worker).await;
+        assert_eq!(shutdown.kind, ResourceReportKind::Fault);
+        assert_eq!(
+            calls,
+            fake.calls(),
+            "failed shutdown must also leave the watchdog unfed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_i16_restart_reconciles_before_any_open() -> Result<()> {
+        use crate::gruezi::watchdog::WatchdogCall;
+        let kernel = SimulatedKernel::new_shared();
+        SimulatedKernel::insert_address(&kernel, "eth0", "10.0.0.10/24", "");
+        let mut worker = ResourceWorkerHandle::spawn_with_runner(
+            managed_address_manager(vec!["10.0.0.10/24"]),
+            CommandRunner::Simulated(kernel.clone()),
+        );
+        let mut controller = OwnershipController::new(ResourceManagement::Managed);
+        let fake = attach_watchdog(&mut controller);
+        controller.start_reconciliation(&worker);
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        assert_eq!(controller.authority(), AuthorityState::Pending);
+        assert!(
+            fake.calls().is_empty(),
+            "no watchdog open before reconciliation completes"
+        );
+        let report = worker.recv_report().await.context("startup withdrawal")?;
+        assert_eq!(report.resource_state, ResourceState::Absent);
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        assert_eq!(fake.calls(), Vec::new());
+        controller.apply_worker_report(report, &worker);
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|(_, call)| *call == WatchdogCall::Open)
+        );
+        println!(
+            "WATCHDOG I16 residual VIP removed BEFORE first open: {:?}",
+            fake.calls()
+        );
+        let acquired = worker.recv_report().await.context("acquisition")?;
+        controller.apply_worker_report(acquired, &worker);
+        assert!(controller.owned());
         let _ = controller.shutdown(&mut worker).await;
         Ok(())
     }

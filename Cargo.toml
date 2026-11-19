@@ -59,6 +59,7 @@ chrono = "0.4"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.3"
 hmac = "0.13.0"
+libc = "0.2"
 opentelemetry = { version = "0.33.1", optional = true }
 opentelemetry-otlp = { version = "0.33.1", features = ["grpc-tonic", "gzip-tonic", "tls-ring", "tls-roots", "trace"], optional = true }
 opentelemetry_sdk = { version = "0.33.1", features = ["rt-tokio"], optional = true }

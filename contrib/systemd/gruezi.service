@@ -6,6 +6,8 @@ Wants=network-online.target
 ConditionPathExists=/etc/gruezi/gruezi.yaml
 
 [Service]
+# Gruezi must exclusively own its watchdog device. Do not enable systemd
+# RuntimeWatchdogSec on the same device.
 Type=simple
 User=root
 Group=root

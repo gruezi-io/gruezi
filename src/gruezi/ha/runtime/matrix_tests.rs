@@ -35,6 +35,7 @@ use tokio::{
 };
 
 mod external;
+mod watchdog;
 
 const ADVERT_INTERVAL_MS: u64 = 1_000;
 const DEAD_FACTOR: u8 = 3;

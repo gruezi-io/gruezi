@@ -6,6 +6,7 @@ use super::{
 };
 use crate::config::FailurePolicy;
 use crate::gruezi::ownership::{AuthoritySource, FencingState, OwnershipController, ResourceState};
+use crate::gruezi::watchdog::{WatchdogManager, WatchdogStatus};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -204,6 +205,7 @@ pub struct HaStatus {
     /// Configured failure policy (`strict | available | external`).
     pub failure_policy: String,
     pub peer_session: PeerSessionStatus,
+    pub watchdog: WatchdogStatus,
 }
 
 impl HaStatus {
@@ -248,6 +250,7 @@ impl HaStatus {
             last_transition: None,
             failure_policy: String::new(),
             peer_session: PeerSessionStatus::default(),
+            watchdog: WatchdogManager::default().status(tokio::time::Instant::now()),
         }
     }
 }
@@ -322,6 +325,7 @@ fn status_snapshot(runtime: &HaRuntimeConfig, loop_state: &HaLoopState, now: Ins
             session_established: within_deadline(loop_state.peer.last_fresh_at()),
             rejections: loop_state.peer.rejections(),
         },
+        watchdog: loop_state.ownership.watchdog_status(now.into()),
     }
 }
 

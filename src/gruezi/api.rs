@@ -132,7 +132,9 @@ mod tests {
                     r#""peer_session":{"reachable":false,"session_established":false,"#,
                     r#""rejections":{"wrong_source":0,"malformed":0,"unsupported":0,"bad_tag":0,"#,
                     r#""wrong_group":0,"duplicate_node_id":0,"wrong_sender":0,"wrong_receiver":0,"#,
-                    r#""retired_nonce":0,"nonce_limit":0,"duplicate":0,"too_old":0}}}}"#,
+                    r#""retired_nonce":0,"nonce_limit":0,"duplicate":0,"too_old":0}},"#,
+                    r#""watchdog":{"mode":"off","armed":false,"effective_timeout_ms":null,"#,
+                    r#""last_feed_ago_ms":null,"unprotected":false}}}"#,
                 )
             );
         }

@@ -8,3 +8,4 @@ pub mod peers;
 pub mod signal;
 pub mod start;
 pub mod status;
+pub mod watchdog;

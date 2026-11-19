@@ -17,6 +17,7 @@ use crate::{
         },
         hooks::{HookContext, HookEvent, spawn_hook},
         ownership::{OwnershipController, ReportEffect, ResourceManagement, RoleTransitionEffect},
+        watchdog::WatchdogDevice,
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -199,11 +200,35 @@ async fn run_with_authority_commands<F, T>(
 where
     F: Future<Output = T>,
 {
+    run_with_watchdog(
+        runtime,
+        transport,
+        command_runner,
+        authority_runner,
+        WatchdogDevice::default(),
+        status_tx,
+        shutdown,
+    )
+    .await
+}
+
+async fn run_with_watchdog<F, T>(
+    runtime: HaRuntimeConfig,
+    transport: Transport,
+    runner: CommandRunner,
+    authority_runner: authority_commands::AuthorityCommandRunner,
+    watchdog: WatchdogDevice,
+    status_tx: Option<watch::Sender<HaStatus>>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = T>,
+{
     let (io, local_bind, peer_addr) = open_transport(&runtime, transport).await?;
     let peer = PeerTracker::new(&runtime, peer_addr.ip(), boot_nonce()?)?;
     let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
-    let (mut worker, mut loop_state) =
-        spawn_worker(&runtime, command_runner, status_tx.as_ref(), peer);
+    let (mut worker, mut loop_state) = spawn_worker(&runtime, runner, status_tx.as_ref(), peer);
+    loop_state.ownership.configure_watchdog(&runtime, watchdog);
     tokio::pin!(shutdown);
     let mut authority_commands = authority_commands::AuthorityCommands::new(authority_runner);
 
@@ -419,6 +444,7 @@ fn initialize_loop_state(
     };
     let mut ownership = OwnershipController::new(management);
     ownership.set_failure_policy(runtime.failure_policy.clone());
+    ownership.configure_watchdog(runtime, WatchdogDevice::default());
     ownership.start_reconciliation(worker);
 
     let loop_state = HaLoopState {
@@ -555,7 +581,9 @@ fn refresh_local_state(
             loop_state.last_transition_reason = Some(reason);
             loop_state.last_transition_at = Some(now);
             loop_state.last_transition_trigger =
-                Some(if runtime.failure_policy == FailurePolicy::External {
+                Some(if reason == HaDecisionReason::RuntimeFault {
+                    TransitionTrigger::Fault
+                } else if runtime.failure_policy == FailurePolicy::External {
                     TransitionTrigger::External
                 } else {
                     TransitionTrigger::Consent
