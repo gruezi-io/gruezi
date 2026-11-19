@@ -13,10 +13,13 @@ if [[ "$(id -u)" != 0 || "$(uname -s)" != Linux ]]; then
     printf '%s\n' 'This test requires root on Linux.' >&2
     exit 2
 fi
-for command in ip modprobe curl gruezi; do
-    command -v "$command" >/dev/null
+# sudo's secure_path omits /usr/local/bin on Rocky, so gruezi is resolved from
+# an explicit path rather than PATH, and a missing piece is named.
+binary="${GRUEZI_BIN:-/usr/local/bin/gruezi}"
+for command in ip modprobe curl; do
+    command -v "$command" >/dev/null || { printf 'Missing required command: %s\n' "$command" >&2; exit 2; }
 done
-binary="$(command -v gruezi)"
+[[ -x "$binary" ]] || { printf 'Missing gruezi executable %s; install it there or set GRUEZI_BIN.\n' "$binary" >&2; exit 2; }
 if command -v systemctl >/dev/null; then
     runtime_watchdog="$(systemctl show --property=RuntimeWatchdogUSec --value)"
     if [[ -n "$runtime_watchdog" && "$runtime_watchdog" != 0 ]]; then
@@ -25,13 +28,23 @@ if command -v systemctl >/dev/null; then
     fi
 fi
 modprobe softdog nowayout=0 soft_noboot=0 soft_panic=0
-for parameter in nowayout soft_noboot soft_panic; do
-    value="$(<"/sys/module/softdog/parameters/$parameter")"
-    if [[ "$value" != 0 && "$value" != N ]]; then
-        printf 'Refusing softdog %s=%s\n' "$parameter" "$value" >&2
+if [[ -d /sys/module/softdog/parameters ]]; then
+    for parameter in nowayout soft_noboot soft_panic; do
+        value="$(<"/sys/module/softdog/parameters/$parameter")"
+        if [[ "$value" != 0 && "$value" != N ]]; then
+            printf 'Refusing softdog %s=%s\n' "$parameter" "$value" >&2
+            exit 2
+        fi
+    done
+else
+    # Rocky 10 exports no softdog sysfs parameters; the kernel's load message
+    # records the values the module was initialized with.
+    load_message="$(dmesg | awk '/softdog: initialized\./ { line = $0 } END { print line }')"
+    if [[ "$load_message" != *" soft_noboot=0 "* || "$load_message" != *" soft_panic=0 "* || "$load_message" != *"(nowayout=0)"* ]]; then
+        printf 'Refusing softdog: load message does not show nowayout=0 soft_noboot=0 soft_panic=0: %s\n' "$load_message" >&2
         exit 2
     fi
-done
+fi
 watchdog_sysfs=''
 for candidate in /sys/class/watchdog/watchdog*; do
     if [[ "$(<"$candidate/identity")" == 'Software Watchdog' ]]; then
@@ -59,12 +72,13 @@ ip netns add "$namespace"
 ip -n "$namespace" link set lo up
 ip -n "$namespace" link add wdtest0 type dummy
 ip -n "$namespace" link set wdtest0 up
-cat >"$directory/config.yaml" <<EOF
+cat >"$directory/config.yaml.tmp" <<EOF
 mode: ha
 node: {id: watchdog-lab-owner}
 ha:
   failure_policy: available
   peer_id: watchdog-lab-absent-peer
+  group_id: watchdog-lab
   bind: 127.0.0.1:9375
   peer: 127.0.0.2:9375
   interface: wdtest0
@@ -74,6 +88,7 @@ ha:
   auth: {key: disposable-watchdog-lab-key}
   watchdog: {mode: required, device: $device, timeout_ms: 15000, safety_margin_ms: 2000, nowayout: reject}
 EOF
+mv "$directory/config.yaml.tmp" "$directory/config.yaml"
 start_owner() {
     ip netns exec "$namespace" "$binary" -v start --config "$directory/config.yaml" >>"$directory/owner.log" 2>&1 &
     owner=$!
