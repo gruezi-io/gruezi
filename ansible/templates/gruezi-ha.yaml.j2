@@ -23,7 +23,7 @@ ha:
   withdraw_timeout_ms: {{ gruezi_withdraw_timeout_ms }}
   command_timeout_ms: {{ gruezi_command_timeout_ms }}
   watchdog:
-    mode: {{ gruezi_watchdog_mode }}
+    mode: {{ gruezi_watchdog_mode | string | to_json }}
     device: {{ gruezi_watchdog_device | to_json }}
     timeout_ms: {{ gruezi_watchdog_timeout_ms }}
     safety_margin_ms: {{ gruezi_watchdog_safety_margin_ms }}

@@ -41,6 +41,7 @@
           - -fsS
           - http://127.0.0.1:9376/status
       register: gruezi_status
+      failed_when: false
       changed_when: false
 
     - name: Read current qdisc state
@@ -77,6 +78,26 @@
           - dev
           - '{{ gruezi_interface }}'
       register: gruezi_ip_addr
+      failed_when: false
+      changed_when: false
+
+    - name: Read iptables OUTPUT rules
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/iptables
+          - -S
+          - OUTPUT
+      register: gruezi_iptables_output
+      failed_when: false
+      changed_when: false
+
+    - name: Read nft ruleset
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/nft
+          - list
+          - ruleset
+      register: gruezi_nft_ruleset
       failed_when: false
       changed_when: false
 
@@ -153,6 +174,24 @@
         dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-watchdog.txt'
         content: |
           {{ gruezi_watchdog_presence.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Store iptables OUTPUT rules locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-iptables-output.txt'
+        content: |
+          {{ gruezi_iptables_output.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Store nft ruleset locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-nft-ruleset.txt'
+        content: |
+          {{ gruezi_nft_ruleset.stdout | default('') }}
         mode: '0644'
       delegate_to: localhost
       become: false

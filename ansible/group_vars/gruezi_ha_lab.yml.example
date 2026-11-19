@@ -11,7 +11,7 @@ gruezi_hold_down_ms: 3000
 gruezi_jitter_ms: 100
 gruezi_withdraw_timeout_ms: 5000
 gruezi_command_timeout_ms: 3000
-gruezi_watchdog_mode: off
+gruezi_watchdog_mode: 'off'
 gruezi_watchdog_device: /dev/watchdog0
 gruezi_watchdog_timeout_ms: 15000
 gruezi_watchdog_safety_margin_ms: 2000
@@ -21,4 +21,4 @@ gruezi_watchdog_nowayout: reject
 gruezi_authority_check_command: /usr/local/bin/gruezi-authority-check
 gruezi_authority_fence_command: ''
 gruezi_authority_interval_ms: 1000
-gruezi_authority_grant_ttl_ms: 5000
+gruezi_authority_grant_ttl_ms: 15000

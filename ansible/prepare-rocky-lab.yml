@@ -12,7 +12,7 @@
       ansible.builtin.dnf:
         name: >-
           {{
-            ['iproute', 'iputils', 'procps-ng', 'iproute-tc']
+            ['iproute', 'iputils', 'procps-ng', 'iproute-tc', 'iptables-nft']
             + (['podman'] if gruezi_prepare_install_podman | bool else [])
           }}
         state: present

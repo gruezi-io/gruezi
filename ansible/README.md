@@ -133,19 +133,19 @@ ansible-playbook ha-drop.yml --limit gruezi-a
 Apply bounded delay and jitter to both lab nodes:
 
 ```bash
-ansible-playbook ha-netem.yml -e "gruezi_netem_args=delay 250ms 50ms"
+ansible-playbook ha-netem.yml -e '{"gruezi_netem_args": "delay 250ms 50ms"}'
 ```
 
 Create a full partition by dropping all HA traffic on both nodes:
 
 ```bash
-ansible-playbook ha-netem.yml -e "gruezi_netem_args=loss 100%"
+ansible-playbook ha-netem.yml -e '{"gruezi_netem_args": "loss 100%"}'
 ```
 
 Create one-way loss by limiting the playbook to one node:
 
 ```bash
-ansible-playbook ha-netem.yml --limit gruezi-a -e "gruezi_netem_args=loss 100%"
+ansible-playbook ha-netem.yml --limit gruezi-a -e '{"gruezi_netem_args": "loss 100%"}'
 ```
 
 Clear the impairment:
@@ -179,7 +179,8 @@ Operational notes:
 - after applying or clearing an impairment, validate the result with `gruezi status --watch` or by checking `http://127.0.0.1:9376/status` on each node
 - a full partition in a 2-node HA pair can produce dual-active ownership until connectivity is restored
 - collected artifacts are written locally under `ansible/artifacts/<label>/`
-- each collection stores one file per host for `/status`, `tc qdisc show`, `ip address show`, and the recent `gruezi.log` tail
+- each collection stores one file per host for `/status`, `tc qdisc show`, `ip address show`, `iptables -S OUTPUT`, `nft list ruleset`, and the recent `gruezi.log` tail
+- collection tolerates a stopped `gruezi`: the status fetch is best-effort, so the interface, qdisc, rule, and log files are still written
 - each collection also stores `ip -o addr show dev {{ gruezi_interface }}` and
   watchdog device/sysfs presence (presence checks do not open the device)
 
