@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -27,19 +28,33 @@ impl FakeIp {
     /// Returns filesystem errors while creating the fixture.
     pub fn new() -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "gruezi-fake-ip-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&dir)?;
+        // Exclusive directory ownership: create_dir is atomic and fails when
+        // the name already exists, so a leftover directory from a previous run
+        // (PID reuse) or a concurrent creator is never silently shared - retry
+        // with the next per-process counter until this fixture owns its state.
+        let mut attempts = 0u32;
+        let dir = loop {
+            let path = std::env::temp_dir().join(format!(
+                "gruezi-fake-ip-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    attempts += 1;
+                    if attempts >= 16 {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         let fixture = Self { dir };
         fs::write(fixture.dir.join("state"), "")?;
         fs::write(fixture.dir.join("flags"), "")?;
         for name in ["ip", "arping", "ndsend"] {
-            let path = fixture.command(name);
-            fs::write(&path, SCRIPT)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+            write_executable(&fixture.command(name), SCRIPT)?;
         }
         Ok(fixture)
     }
@@ -53,6 +68,51 @@ impl Drop for FakeIp {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Publish an executable script atomically.
+///
+/// The write runs in a dedicated writer subprocess: file descriptors opened
+/// in this process would be inherited by every `Command` child spawned
+/// concurrently by the parallel tests (fork copies the whole fd table and
+/// CLOEXEC only closes at the child's execve), and such an inherited
+/// writable handle keeps ETXTBSY alive on the script inode long after this
+/// function returns - the child, not the writer, is then the last holder.
+/// The writer owns a private fd table nothing else can clone from, writes a
+/// unique temporary file, chmods it and renames it into place, then exits;
+/// this function awaits that exit, so on return no process holds the final
+/// path open for write and a later exec can never observe a writer.
+///
+/// # Errors
+///
+/// Returns errors from spawning or waiting on the writer, from writing its
+/// stdin, or a non-zero writer exit.
+pub fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    static TEMP: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("cat > \"$1\" && chmod 755 \"$1\" && mv \"$1\" \"$2\"")
+        .arg("write-executable")
+        .arg(&temp)
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(anyhow!("writer subprocess stdin unavailable"));
+    };
+    stdin.write_all(contents.as_bytes())?;
+    // Close stdin so `cat` sees EOF before we wait for the writer to finish.
+    drop(stdin);
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("writer subprocess failed with {status}"));
+    }
+    Ok(())
 }
 
 const SCRIPT: &str = r#"#!/bin/bash

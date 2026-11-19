@@ -3,7 +3,7 @@
 mod common;
 
 use anyhow::{Result, anyhow};
-use common::FakeIp;
+use common::{FakeIp, write_executable};
 use gruezi::gruezi::{
     addresses::{AddressAction, AddressManager},
     ha::{HaAuth, HaRuntimeConfig, HaState, HaStatus, run_with_status},
@@ -11,7 +11,6 @@ use gruezi::gruezi::{
 };
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
@@ -151,13 +150,35 @@ async fn stop_node(shutdown_tx: oneshot::Sender<()>, task: JoinHandle<Result<()>
 }
 
 fn temp_dir(name: &str) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| StdDuration::from_secs(0))
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("gruezi-{name}-{nonce}"));
-    fs::create_dir_all(&path)?;
-    Ok(path)
+    // Exclusive directory ownership: create_dir is atomic and fails when the
+    // name exists, so this test can never share state with a leftover or
+    // concurrently-created directory (create_dir_all would silently reuse
+    // one). Retry with the next per-process counter until the dir is ours.
+    let mut attempts = 0u32;
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "gruezi-{name}-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempts += 1;
+                if attempts >= 16 {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn write_command_script(dir: &Path, name: &str, output_path: &Path) -> Result<String> {
@@ -166,44 +187,19 @@ fn write_command_script(dir: &Path, name: &str, output_path: &Path) -> Result<St
         "#!/usr/bin/env bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"{}\"\n",
         output_path.display()
     );
-    fs::write(&script_path, script)?;
-    let mut permissions = fs::metadata(&script_path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions)?;
+    write_executable(&script_path, &script)?;
     Ok(script_path.display().to_string())
 }
 
 fn write_ip_script(dir: &Path, name: &str, output_path: &Path, fixture: &FakeIp) -> Result<String> {
-    let path = write_command_script(dir, name, output_path)?;
-    fs::write(
-        &path,
-        format!(
-            "#!/bin/bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
-            output_path.display(),
-            fixture.command("ip").display()
-        ),
-    )?;
-    Ok(path)
-}
-
-async fn wait_for_log_lines(
-    path: &Path,
-    expected_lines: usize,
-    description: &str,
-) -> Result<String> {
-    timeout(Duration::from_secs(3), async {
-        loop {
-            if let Ok(contents) = fs::read_to_string(path)
-                && contents.lines().count() >= expected_lines
-            {
-                return Ok(contents);
-            }
-
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("timed out waiting for {description}"))?
+    let path = dir.join(format!("{name}.sh"));
+    let script = format!(
+        "#!/bin/bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
+        output_path.display(),
+        fixture.command("ip").display()
+    );
+    write_executable(&path, &script)?;
+    Ok(path.display().to_string())
 }
 
 async fn wait_for_log_contents(
@@ -285,7 +281,17 @@ async fn master_adds_and_backup_removes_addresses() -> Result<()> {
         "node-a address actions",
     )
     .await?;
-    let contents_b = wait_for_log_lines(&log_b, 3, "node-b address actions").await?;
+    // Wait for the exact actions this test asserts, not a line count: a count
+    // can be satisfied by unrelated earlier lines before the dels are logged.
+    let contents_b = wait_for_log_contents(
+        &log_b,
+        &[
+            "address del 10.0.0.10/24 dev lo",
+            "address del fd00::10/64 dev lo",
+        ],
+        "node-b address actions",
+    )
+    .await?;
 
     assert!(contents_a.contains("address add 10.0.0.10/24 dev lo"));
     assert!(contents_a.contains("address add fd00::10/64 dev lo"));
@@ -421,7 +427,18 @@ async fn demotion_removes_addresses_after_preemption() -> Result<()> {
         "node-a address actions",
     )
     .await?;
-    let contents_b = wait_for_log_lines(&log_b, 11, "node-b address actions").await?;
+    // Wait for the exact actions this test asserts, not a line count: a count
+    // can be satisfied by unrelated earlier lines before the dels are logged.
+    let contents_b = wait_for_log_contents(
+        &log_b,
+        &[
+            "address add 10.0.0.10/24 dev lo",
+            "address del 10.0.0.10/24 dev lo",
+            "address del fd00::10/64 dev lo",
+        ],
+        "node-b address actions",
+    )
+    .await?;
 
     assert!(contents_a.contains("address add 10.0.0.10/24 dev lo"));
     assert!(contents_a.contains("address add fd00::10/64 dev lo"));
@@ -528,14 +545,13 @@ async fn file_exists_on_wrong_interface_and_prefix_does_not_confirm_presence() -
         "other0 10.0.0.10/24\neth0 10.0.0.10/32\n",
     )?;
     let wrapper = fixture.dir.join("duplicate");
-    fs::write(
+    write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/bash\nif [[ \"$1\" == address ]]; then echo 'File exists' >&2; exit 2; fi\nexec \"{}\" \"$@\"\n",
             fixture.command("ip").display()
         ),
     )?;
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
     let mut manager = address_manager(&fixture);
     manager.addresses.truncate(1);
     manager.ip_command = wrapper.display().to_string();
@@ -557,15 +573,14 @@ async fn fifo_gated_command_is_killed_after_real_timeout() -> Result<()> {
     );
     let wrapper = fixture.dir.join("tracked-ip");
     let pid_path = fixture.dir.join("pid");
-    fs::write(
+    write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/bash\nif [[ \"$1\" == address ]]; then echo $$ > \"{}\"; fi\nexec \"{}\" \"$@\"\n",
             pid_path.display(),
             fixture.command("ip").display()
         ),
     )?;
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
     let mut manager = address_manager(&fixture);
     manager.addresses.truncate(1);
     manager.ip_command = wrapper.display().to_string();
