@@ -114,6 +114,7 @@ mod tests {
             .await?;
             // Compare the entire wire response so a renamed, omitted, or
             // changed legacy field cannot hide behind a successful decode.
+            // Additive schema fields also update this golden payload.
             assert_eq!(
                 response,
                 concat!(
@@ -134,7 +135,11 @@ mod tests {
                     r#""wrong_group":0,"duplicate_node_id":0,"wrong_sender":0,"wrong_receiver":0,"#,
                     r#""retired_nonce":0,"nonce_limit":0,"duplicate":0,"too_old":0}},"#,
                     r#""watchdog":{"mode":"off","armed":false,"effective_timeout_ms":null,"#,
-                    r#""last_feed_ago_ms":null,"unprotected":false}}}"#,
+                    r#""last_feed_ago_ms":null,"unprotected":false},"#,
+                    r#""lifecycle":{"configured":false,"phase":"not_configured","generation":0,"operation":null,"#,
+                    r#""activation_confirmed":false,"passive_confirmed":false,"verified_fresh":false,"#,
+                    r#""verification":{"state":"not_configured","last_verified_ago_ms":null,"next_verify_in_ms":null,"db_incarnation":null},"#,
+                    r#""last_critical_failure":null},"instance_id":""}}"#,
                 )
             );
         }

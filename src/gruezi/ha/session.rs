@@ -448,6 +448,16 @@ impl PeerTracker {
         self.last_sent_seq
     }
 
+    /// Status and actuator identity share the wire sender's boot nonce.
+    pub(super) fn instance_id(&self) -> String {
+        let mut id = String::with_capacity(32);
+        for byte in self.local_nonce {
+            use std::fmt::Write;
+            let _ = write!(id, "{byte:02x}");
+        }
+        id
+    }
+
     pub(super) const fn rejections(&self) -> PeerRejections {
         self.rejections
     }

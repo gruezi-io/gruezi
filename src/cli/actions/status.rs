@@ -24,6 +24,27 @@ fn rejection_pairs(rejections: &PeerRejections) -> String {
     )
 }
 
+fn lifecycle_details(ha: &gruezi::ha::HaStatus) -> String {
+    let lifecycle = &ha.lifecycle;
+    let verification = &lifecycle.verification;
+    format!(
+        "instance_id={} lifecycle={} configured={} generation={} activation_confirmed={} passive_confirmed={} verified_fresh={} verification={} last_verified_ago_ms={:?} next_verify_in_ms={:?} db_incarnation={:?} operation={:?} last_critical_failure={:?}",
+        ha.instance_id,
+        lifecycle.phase,
+        lifecycle.configured,
+        lifecycle.generation,
+        lifecycle.confirmations.activation_confirmed,
+        lifecycle.confirmations.passive_confirmed,
+        lifecycle.confirmations.verified_fresh,
+        verification.state,
+        verification.last_verified_ago_ms,
+        verification.next_verify_in_ms,
+        verification.db_incarnation,
+        lifecycle.operation,
+        lifecycle.last_critical_failure,
+    )
+}
+
 /// Execute the status action.
 ///
 /// # Errors
@@ -95,6 +116,7 @@ fn snapshot_lines(status: &gruezi::status::StatusResponse) -> Vec<String> {
         lines.push(format!("  Group ID: {}", ha.group_id));
         lines.push(format!("  Elected Role: {:?}", ha.state));
         lines.push(format!("  Owned: {}", ha.owned));
+        lines.push(format!("  Lifecycle: {}", lifecycle_details(ha)));
         lines.push(format!(
             "  Resource: {} confirmed={} observed_ago_ms={:?} last_error={:?}",
             ha.resource.state,
@@ -199,7 +221,7 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
         let session_rejections = rejection_pairs(&ha.peer_session.rejections);
 
         format!(
-            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} authority_expires_in_ms={:?} grant_expires_in_ms={:?} fencing={} failure_policy={} watchdog_mode={} watchdog_armed={} watchdog_effective_timeout_ms={:?} watchdog_last_feed_ago_ms={:?} watchdog_unprotected={} safety={} safety_why={:?} reason={} last_transition_reason={} last_transition_trigger={} last_transition_ago_ms={} peer_alive={} peer_node={} peer_state={} peer_reachable={} session_established={} session_rejections={:?} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
+            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} authority_expires_in_ms={:?} grant_expires_in_ms={:?} fencing={} failure_policy={} watchdog_mode={} watchdog_armed={} watchdog_effective_timeout_ms={:?} watchdog_last_feed_ago_ms={:?} watchdog_unprotected={} safety={} safety_why={:?} reason={} last_transition_reason={} last_transition_trigger={} last_transition_ago_ms={} peer_alive={} peer_node={} peer_state={} peer_reachable={} session_established={} session_rejections={:?} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={} {}",
             ha.node_id,
             ha.state,
             ha.owned,
@@ -244,7 +266,8 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
             ha.duplicate_node_id_packets,
             last_peer_seen,
             ha.last_transition_ms_ago
-                .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"))
+                .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms")),
+            lifecycle_details(ha),
         )
     } else {
         format!("[{timestamp}] mode={}", status.mode)
@@ -388,5 +411,48 @@ mod tests {
         assert!(watch.contains("watchdog_mode=required"));
         assert!(watch.contains("watchdog_armed=false"));
         assert!(watch.contains("watchdog_unprotected=true"));
+    }
+
+    #[test]
+    fn status_cli_renders_lifecycle_and_verification() {
+        let mut status = sample_status();
+        if let Some(ha) = status.ha.as_mut() {
+            ha.instance_id = "0123456789abcdef0123456789abcdef".to_owned();
+            ha.lifecycle.configured = true;
+            ha.lifecycle.phase = "ready".to_owned();
+            ha.lifecycle.generation = 7;
+            ha.lifecycle.confirmations.activation_confirmed = true;
+            ha.lifecycle.confirmations.verified_fresh = false;
+            ha.lifecycle.verification.state = "stale".to_owned();
+            ha.lifecycle.verification.last_verified_ago_ms = Some(250);
+            ha.lifecycle.verification.next_verify_in_ms = Some(0);
+            ha.lifecycle.verification.db_incarnation = Some("123:456".to_owned());
+        }
+        let snapshot = snapshot_lines(&status).join("\n");
+        let watch = format_watch_line("now", &status);
+        println!("{snapshot}\n{watch}");
+        for output in [&snapshot, &watch] {
+            assert!(output.contains("instance_id=0123456789abcdef0123456789abcdef"));
+            assert!(output.contains("lifecycle=ready configured=true generation=7"));
+            assert!(output.contains(
+                "activation_confirmed=true passive_confirmed=false verified_fresh=false"
+            ));
+            assert!(output.contains(
+                "verification=stale last_verified_ago_ms=Some(250) next_verify_in_ms=Some(0)"
+            ));
+            assert!(output.contains("db_incarnation=Some(\"123:456\")"));
+        }
+    }
+
+    #[test]
+    fn status_cli_renders_unconfigured_lifecycle() {
+        let status = sample_status();
+        let snapshot = snapshot_lines(&status).join("\n");
+        let watch = format_watch_line("now", &status);
+        for output in [&snapshot, &watch] {
+            assert!(output.contains("lifecycle=not_configured configured=false"));
+            assert!(output.contains("verification=not_configured"));
+            assert!(output.contains("operation=None last_critical_failure=None"));
+        }
     }
 }
