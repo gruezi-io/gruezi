@@ -218,6 +218,7 @@ mod tests {
             command_timeout_ms: 3_000,
             watchdog: crate::config::WatchdogConfig::default(),
             authority: None,
+            lifecycle: None,
             priority: 110,
             preempt: true,
             advert_interval_ms: 40,

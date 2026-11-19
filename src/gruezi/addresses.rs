@@ -12,6 +12,11 @@ use tracing::warn;
 pub const COMMAND_TIMEOUT_MS: u64 = 3000;
 pub const WITHDRAW_TIMEOUT_MS: u64 = 5000;
 
+/// Bound the worker's per-address add and announcement commands plus read-back.
+pub(crate) const fn acquisition_budget_ms(address_count: usize) -> u128 {
+    (2 * address_count as u128 + 1) * COMMAND_TIMEOUT_MS as u128
+}
+
 #[cfg(test)]
 pub(crate) struct CommandGate {
     pub(crate) entered: tokio::sync::oneshot::Sender<()>,

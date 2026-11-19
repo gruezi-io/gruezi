@@ -1,5 +1,5 @@
 use crate::{
-    config::{AuthorityConfig, Config, FailurePolicy, Mode, WatchdogConfig},
+    config::{AuthorityConfig, Config, FailurePolicy, LifecycleConfig, Mode, WatchdogConfig},
     gruezi::hooks::HaHooks,
 };
 use anyhow::{Result, bail};
@@ -38,6 +38,7 @@ pub struct HaRuntimeConfig {
     pub command_timeout_ms: u64,
     pub watchdog: WatchdogConfig,
     pub authority: Option<AuthorityConfig>,
+    pub lifecycle: Option<LifecycleConfig>,
     pub priority: u8,
     pub preempt: bool,
     pub advert_interval_ms: u64,
@@ -153,6 +154,7 @@ impl TryFrom<&Config> for HaRuntimeConfig {
             command_timeout_ms: config.ha.command_timeout_ms,
             watchdog: config.ha.watchdog.clone(),
             authority,
+            lifecycle: config.ha.lifecycle.clone(),
             priority: config.ha.priority,
             preempt: config.ha.preempt,
             advert_interval_ms: config.ha.advert_interval_ms,

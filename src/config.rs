@@ -151,6 +151,27 @@ impl Config {
         {
             bail!("ha.command_timeout_ms must be positive and smaller than ha.withdraw_timeout_ms");
         }
+        if let Some(lifecycle) = &self.ha.lifecycle {
+            for (path, field) in [
+                (&lifecycle.activate_command, "ha.lifecycle.activate_command"),
+                (
+                    &lifecycle.deactivate_command,
+                    "ha.lifecycle.deactivate_command",
+                ),
+            ] {
+                if path.trim().is_empty() || !Path::new(path).is_absolute() {
+                    bail!("{field} must be a non-empty absolute executable path");
+                }
+            }
+            if lifecycle.timeout_ms == 0
+                || lifecycle.timeout_ms > self.ha.command_timeout_ms
+                || lifecycle.timeout_ms >= self.ha.withdraw_timeout_ms
+            {
+                bail!(
+                    "ha.lifecycle.timeout_ms must be positive, at most ha.command_timeout_ms, and smaller than ha.withdraw_timeout_ms"
+                );
+            }
+        }
         self.validate_watchdog()?;
         self.validate_authority()?;
 
@@ -190,6 +211,19 @@ impl Config {
                     bail!(
                         "ha.watchdog.timeout_ms must exceed ha.advert_interval_ms + ha.command_timeout_ms + ha.withdraw_timeout_ms + ha.watchdog.safety_margin_ms"
                     );
+                }
+                if let Some(lifecycle) = &self.ha.lifecycle {
+                    // P + Q + B < W: the watchdog must mask lifecycle activation (P)
+                    // and the resource worker's acquisition (Q) while preserving the
+                    // existing feed/withdrawal reserve (B) before its timeout (W).
+                    let acquisition_budget = u128::from(lifecycle.timeout_ms)
+                        + crate::gruezi::addresses::acquisition_budget_ms(self.ha.addresses.len())
+                        + budget;
+                    if acquisition_budget >= u128::from(watchdog.timeout_ms) {
+                        bail!(
+                            "ha.lifecycle.timeout_ms + resource acquisition budget + watchdog reserve must be smaller than ha.watchdog.timeout_ms"
+                        );
+                    }
                 }
             }
         }
@@ -286,6 +320,7 @@ pub struct HaConfig {
     pub jitter_ms: u64,
     pub auth: HaAuthConfig,
     pub hooks: HaHooksConfig,
+    pub lifecycle: Option<LifecycleConfig>,
     pub withdraw_timeout_ms: u64,
     pub command_timeout_ms: u64,
     pub watchdog: WatchdogConfig,
@@ -312,6 +347,7 @@ impl Default for HaConfig {
             jitter_ms: 100,
             auth: HaAuthConfig::default(),
             hooks: HaHooksConfig::default(),
+            lifecycle: None,
             withdraw_timeout_ms: 5_000,
             command_timeout_ms: 3_000,
             watchdog: WatchdogConfig::default(),
@@ -393,6 +429,15 @@ pub struct HaHooksConfig {
     pub timeout_ms: u64,
 }
 
+/// Executable paths for direct lifecycle execution, never shell command lines.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleConfig {
+    pub activate_command: String,
+    pub deactivate_command: String,
+    pub timeout_ms: u64,
+}
+
 impl HaHooksConfig {
     #[must_use]
     pub fn default_timeout_ms() -> u64 {
@@ -449,6 +494,184 @@ mod tests {
     };
     use anyhow::Result;
     use std::path::Path;
+
+    const LIFECYCLE_FIELDS: &str = "
+  lifecycle:
+    activate_command: /usr/local/libexec/activate
+    deactivate_command: /usr/local/libexec/deactivate
+    timeout_ms: 1000
+";
+
+    fn rejects_lifecycle(input: &str, field: &str) -> Result<()> {
+        let error = Config::from_yaml_str(input)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("accepted invalid {field}: {input}"))?;
+        let message = format!("{error:#}");
+        let key = field.rsplit('.').next().unwrap_or(field);
+        assert!(message.contains(key), "{field}: {message}");
+        println!("rejected {field}: {message}");
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_absent_changes_nothing() -> Result<()> {
+        let config = Config::from_yaml_str(MINIMAL_HA)?;
+        let runtime = crate::gruezi::ha::HaRuntimeConfig::try_from(&config)?;
+        assert_eq!(config.ha.lifecycle, None);
+        assert_eq!(runtime.lifecycle, None);
+        assert_eq!(config.ha.hooks, super::HaHooksConfig::default());
+        assert_eq!(runtime.hooks, crate::gruezi::hooks::HaHooks::default());
+        assert_eq!(runtime.command_timeout_ms, 3_000);
+        assert_eq!(runtime.withdraw_timeout_ms, 5_000);
+        assert_eq!(runtime.watchdog, super::WatchdogConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_requires_both_commands() -> Result<()> {
+        let input = format!("{MINIMAL_HA}{LIFECYCLE_FIELDS}");
+        for (line, field) in [
+            (
+                "    activate_command: /usr/local/libexec/activate\n",
+                "ha.lifecycle.activate_command",
+            ),
+            (
+                "    deactivate_command: /usr/local/libexec/deactivate\n",
+                "ha.lifecycle.deactivate_command",
+            ),
+            ("    timeout_ms: 1000\n", "ha.lifecycle.timeout_ms"),
+        ] {
+            rejects_lifecycle(&input.replace(line, ""), field)?;
+        }
+        rejects_lifecycle(
+            &format!("{MINIMAL_HA}  lifecycle: {{timeout_ms: 1000}}\n"),
+            "ha.lifecycle.activate_command",
+        )
+    }
+
+    #[test]
+    fn lifecycle_rejects_relative_and_empty_paths() -> Result<()> {
+        let input = format!("{MINIMAL_HA}{LIFECYCLE_FIELDS}");
+        for (path, field) in [
+            (
+                "/usr/local/libexec/activate",
+                "ha.lifecycle.activate_command",
+            ),
+            (
+                "/usr/local/libexec/deactivate",
+                "ha.lifecycle.deactivate_command",
+            ),
+        ] {
+            for invalid in ["''", "'  '", "activate", "./activate", "../activate"] {
+                rejects_lifecycle(&input.replace(path, invalid), field)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_timeout_bounds() -> Result<()> {
+        let input = format!("{MINIMAL_HA}{LIFECYCLE_FIELDS}");
+        for timeout in [0, 3_001, 5_000, 5_001] {
+            rejects_lifecycle(
+                &input.replace("timeout_ms: 1000", &format!("timeout_ms: {timeout}")),
+                "ha.lifecycle.timeout_ms",
+            )?;
+        }
+        for timeout in [1, 2_999, 3_000] {
+            let config = Config::from_yaml_str(
+                &input.replace("timeout_ms: 1000", &format!("timeout_ms: {timeout}")),
+            )?;
+            assert_eq!(
+                config.ha.lifecycle.map(|lifecycle| lifecycle.timeout_ms),
+                Some(timeout)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_budget_with_watchdog_boundaries() -> Result<()> {
+        for (addresses, worker_budget) in [
+            ("[]", 3_000_u128),
+            ("[10.0.0.10/24]", 9_000),
+            ("[10.0.0.10/24, fd00::10/64]", 15_000),
+        ] {
+            // Defaults reserve 1000 + 3000 + 5000 + 2000 ms; activation is 1000 ms.
+            let total_budget = 1_000 + worker_budget + 11_000;
+            for mode in ["automatic", "required"] {
+                for (extra, accepted) in [(1, true), (0, false), (-1, false)] {
+                    let watchdog_timeout = i128::try_from(total_budget)? + extra;
+                    let input = format!(
+                        "{MINIMAL_HA}{LIFECYCLE_FIELDS}  interface: eth0\n  addresses: {addresses}\n  watchdog: {{mode: {mode}, timeout_ms: {watchdog_timeout}}}\n"
+                    );
+                    if accepted {
+                        Config::from_yaml_str(&input)?;
+                    } else {
+                        rejects_lifecycle(&input, "ha.lifecycle.timeout_ms")?;
+                    }
+                }
+            }
+        }
+        // A disabled watchdog imposes no acquisition budget.
+        Config::from_yaml_str(&format!(
+            "{MINIMAL_HA}{LIFECYCLE_FIELDS}  watchdog: {{mode: off, timeout_ms: 1}}\n"
+        ))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_accepted_with_strict_external_and_available() -> Result<()> {
+        for policy in ["strict", "external", "available"] {
+            let authority = if policy == "external" {
+                "  authority: {check_command: /check, grant_ttl_ms: 10000}\n"
+            } else {
+                ""
+            };
+            let input = format!(
+                "{}{LIFECYCLE_FIELDS}{authority}  watchdog: {{mode: required, timeout_ms: 15001}}\n",
+                MINIMAL_HA.replace(
+                    "failure_policy: strict",
+                    &format!("failure_policy: {policy}")
+                )
+            );
+            let config = Config::from_yaml_str(&input)?;
+            let runtime = crate::gruezi::ha::HaRuntimeConfig::try_from(&config)?;
+            assert_eq!(
+                runtime.lifecycle,
+                Some(super::LifecycleConfig {
+                    activate_command: "/usr/local/libexec/activate".to_owned(),
+                    deactivate_command: "/usr/local/libexec/deactivate".to_owned(),
+                    timeout_ms: 1_000,
+                })
+            );
+            assert_eq!(runtime.lifecycle, config.ha.lifecycle);
+            assert_eq!(runtime.watchdog.mode, super::WatchdogMode::Required);
+            println!(
+                "valid {policy} config with watchdog {:?}: {:?}",
+                runtime.watchdog.mode, runtime.lifecycle
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_rejects_verify_command_and_unknown_keys() -> Result<()> {
+        for (key, value) in [
+            ("verify_command", "/verify"),
+            ("verify_interval_ms", "1000"),
+            ("run_as", "root"),
+            ("unknown_setting", "true"),
+        ] {
+            rejects_lifecycle(
+                &format!("{MINIMAL_HA}{LIFECYCLE_FIELDS}    {key}: {value}\n"),
+                &format!("ha.lifecycle.{key}"),
+            )?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn parses_valid_ha_config() -> Result<()> {

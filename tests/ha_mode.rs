@@ -45,6 +45,7 @@ fn runtime_config(
         command_timeout_ms: 3_000,
         watchdog: gruezi::config::WatchdogConfig::default(),
         authority: None,
+        lifecycle: None,
         priority,
         preempt,
         advert_interval_ms: 40,

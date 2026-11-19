@@ -81,6 +81,7 @@ fn node_config(side: Side, policy: FailurePolicy) -> HaRuntimeConfig {
         command_timeout_ms: 3_000,
         watchdog: WatchdogConfig::default(),
         authority: None,
+        lifecycle: None,
         priority,
         // Stable failover: recovery rows assert the rank winner ends up as the
         // single owner, not that a returning node steals ownership.
