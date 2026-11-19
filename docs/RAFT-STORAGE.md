@@ -1,6 +1,7 @@
 # Raft storage
 
-This is a planned evaluation. No storage choice here is implemented or proven.
+This is a **Planned** evaluation. No Raft or KV storage choice here is
+implemented or proven. Raft and KV are outside the current HA safety milestone.
 
 ## Raft library
 

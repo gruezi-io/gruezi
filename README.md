@@ -17,10 +17,11 @@ systems.
 | HA election over UDP | Implemented | Prototype election and state reporting on `9375/udp`. |
 | Read-only status API | Implemented | `/status`, `/ha/status`, and `/health` on `9376/tcp`. |
 | Transition hooks | Implemented | Promote, demote, backup, and fault hook configuration. |
-| VIP mutation | Experimental | Uses external Linux commands and needs kernel-level validation. |
-| Authenticated HA packets | Planned | HMAC, peer identity checks, and replay protection are designed but not shipped. |
-| Explicit failure policies | Planned | Strict, available, and external policies are documented below. |
-| Watchdog fencing | Planned | Linux watchdog integration is not implemented. |
+| VIP mutation and confirmed ownership | Implemented | A serialized Linux resource worker reads the kernel back before `owned=true`. |
+| Authenticated HA packets | Implemented | HMAC-SHA-256, peer pinning, sessions, and replay protection are tested. |
+| Explicit failure policies | Implemented | Strict, available, and external policies are implemented and covered by tests. |
+| Watchdog fencing | Experimental | Linux and fake-device paths are tested, but the shipped Rocky helper still needs lab follow-up. |
+| External grant happy path | Experimental | Grant, fencing, and stale-grant behavior are tested; task 26 has no evidence record yet. |
 | `gruezi peers` listing | Experimental | The command exists, but peer discovery currently returns an empty list. |
 | Direct `start` flags | Unsupported | `gruezi start --bind/--peers/--node-id` is a stub. Use YAML only. |
 | KV mode | Planned | No Raft or key-value runtime is shipped. |
@@ -31,7 +32,7 @@ systems.
 ## HA quick start
 
 The HA runtime uses `9375/udp` for peer advertisements and `9376/tcp` for the
-read-only management API. The following is a complete shape for the planned
+read-only management API. The following is a complete shape for the
 authenticated configuration. Two nodes need different `node.id`, `peer_id`, and
 addresses.
 
@@ -61,8 +62,8 @@ ha:
 ```
 
 Configuration lookup order is `--config`, `GRUEZI_CONFIG`, then
-`/etc/gruezi/gruezi.yaml`. The current implementation still has prototype
-configuration behavior, so check the capability table before deploying.
+`/etc/gruezi/gruezi.yaml`. The configuration and protocol are prototype v1 and
+have no compatibility promise before release.
 
 ## Limitations
 
@@ -77,16 +78,17 @@ database fencing hook changes that behavior. Read [HA safety](docs/HA-SAFETY.md)
 before using a shared address for writes.
 
 The current HA protocol and configuration are prototype v1 and unstable. The
-planned authenticated protocol, ownership confirmation, failure policies, and
-watchdog behavior are not current guarantees.
+authenticated protocol, ownership confirmation, and failure policies are
+implemented. Watchdog operation remains Experimental, and `available` can
+intentionally produce dual ownership during a partition.
 
 ## Documentation
 
 * [Architecture](docs/ARCHITECTURE.md), boundaries and growth path
 * [HA safety](docs/HA-SAFETY.md), policies and the complete failure matrix
 * [Roadmap](docs/ROADMAP.md), milestones with measurable acceptance criteria
-* [Raft storage](docs/RAFT-STORAGE.md), planned storage evaluation
-* [Compatibility](docs/COMPATIBILITY.md), planned Patroni etcd3 surface
+* [Raft storage](docs/RAFT-STORAGE.md), storage evaluation
+* [Compatibility](docs/COMPATIBILITY.md), Patroni etcd3 surface
 * [Contributing](CONTRIBUTING.md), development and test workflow
 * [CLI architecture](CLI_ARCHITECTURE.md), command and telemetry layout
 * [Packaging](contrib/README.md), package and systemd assets

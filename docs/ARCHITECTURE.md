@@ -23,7 +23,7 @@ status without moving an address.
 
 ## Growth path
 
-The current path is a two-node HA prototype. The planned growth path is:
+The current path is a two-node HA prototype. The future growth path is:
 
 1. HA ownership correctness and explicit failure policies.
 2. Three-node Raft authority.

@@ -1,9 +1,9 @@
 # Compatibility
 
-The planned compatibility target is the narrow HTTP surface used by Patroni's
+The compatibility target is the narrow HTTP surface used by Patroni's
 etcd3 integration. It is not a claim of general etcd compatibility.
 
-**Status: Planned.**
+**Status: Planned.** No endpoint is implemented by the current HA milestone.
 
 The intended endpoints are:
 

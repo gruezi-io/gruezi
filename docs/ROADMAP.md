@@ -3,7 +3,7 @@
 Each milestone below is complete only when its acceptance criteria can be
 reproduced from a clean checkout and the recorded output is retained.
 
-## M1: HA ownership correctness
+## M1: HA ownership correctness, Implemented
 
 **Objective:** Separate election, authority, resource state, and status, then
 report ownership only after kernel read-back confirms the optional resource.
@@ -17,7 +17,7 @@ report ownership only after kernel read-back confirms the optional resource.
   a fault.
 * `owned` is false unless authority and confirmed resource state are valid.
 
-## M2: HA safety policies and watchdog
+## M2: HA safety policies and watchdog, Experimental
 
 **Objective:** Implement strict, available, and external authority semantics,
 authenticated peer sessions, replay protection, handoff, and Linux watchdog
@@ -25,15 +25,16 @@ operation.
 
 **Acceptance criteria:**
 
-* A deterministic matrix test covers every row in [HA safety](HA-SAFETY.md).
+* Deterministic policy tests cover the documented rows. The real netem script
+  still needs the available process-freeze follow-up recorded in task 28.
 * Strict mode never promotes after arbitrary simulated peer silence.
 * Available mode records `assumed` and demonstrates the documented partition
   outcome.
 * Required watchdog arm failure produces zero resource additions.
 * Fault injection proves a frozen owner stops feeding and the resource is
-  withdrawn or the host resets.
+  withdrawn or the host resets. The shipped Rocky helper remains a lab follow-up.
 
-## M3: Three-node Raft
+## M3: Three-node Raft, Planned
 
 **Objective:** Add quorum-backed authority for a three-node cluster.
 
@@ -46,7 +47,7 @@ operation.
   editing.
 * Leadership and authority are visible in status with term and member identity.
 
-## M4: etcd v3 subset KV
+## M4: etcd v3 subset KV, Planned
 
 **Objective:** Add a durable, quota-aware KV service with the narrow API surface
 needed by the integration milestone.
@@ -61,7 +62,7 @@ needed by the integration milestone.
 * Recovery time, write latency, reclaimed bytes, and quota results are stored
   with hardware, filesystem, dataset, and command details.
 
-## M5: Patroni etcd3 integration
+## M5: Patroni etcd3 integration, Planned
 
 **Objective:** Support the specific etcd3 calls Patroni actually uses, without
 claiming general etcd compatibility.
@@ -74,7 +75,7 @@ claiming general etcd compatibility.
 * Unsupported endpoints return a documented error and are not described as
   compatible.
 
-## M6: DNS and agent
+## M6: DNS and agent, Planned
 
 **Objective:** Project live KV records through DNS and provide a small node agent
 for registration and health updates.

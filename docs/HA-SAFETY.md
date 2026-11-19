@@ -1,8 +1,9 @@
 # HA safety
 
 This document describes the safety boundary of a two-node pair. It does not
-claim split-brain prevention. The protocol and configuration are prototype v1,
-and the items marked Planned are not current guarantees.
+claim split-brain prevention. The protocol and configuration are prototype v1.
+Linux is the implementation target. FreeBSD is the next platform step, and
+macOS and Windows have no product behavior promise.
 
 ## The two-node limit
 
@@ -25,8 +26,11 @@ authority, witness, or fencing system.
 * **external** requires an external grant and, when needed, confirmed release
   or fencing. Peer silence alone grants nothing.
 
-Authenticated HMAC packets, ownership confirmation, these policies, and the
-watchdog are **Planned** until implementation evidence changes their status.
+Authenticated HMAC packets, ownership confirmation, and all three policies are
+**Implemented**. The Linux watchdog is **Experimental** because device behavior
+passed on a patched Rocky Linux lab copy, while the shipped helper still needs
+follow-up fixes. External grant happy-path acceptance is **Experimental** until
+task 26 records the two-node run.
 
 ## Failure matrix
 
@@ -39,14 +43,14 @@ watchdog are **Planned** until implementation evidence changes their status.
 | Full partition | Owner withdraws. No takeover. Safe but unavailable. | Both nodes may own. This is unsafe for exclusive resources. | No grant from silence, so unavailable. |
 | A to B loss | Consent stops and the owner withdraws. No takeover. | B may promote while A still owns. | No new grant from packet loss. |
 | B to A loss | Consent stops and the owner withdraws. No takeover. | A continues while B sees A. | No new grant from packet loss. |
-| Gruezi freeze or crash with host up | Watchdog may self-fence. Peer still does not promote. | Peer may promote after the deadline. A residual VIP is possible until fencing. A resumed owner that stalled past the follower deadline yields with `local_stall` before it advertises again; the peer that promoted keeps the VIP. | Promotion waits for grant and fencing or release. |
+| Gruezi freeze or crash with host up | Watchdog may self-fence. Peer still does not promote. | Peer may promote after the deadline. A residual VIP is possible until fencing. A resumed owner that stalled past the follower deadline yields with `local_stall`; the visible incumbent keeps the VIP when it has already promoted. | Promotion waits for grant and fencing or release. |
 | VIP withdrawal fails | No released state is advertised. Successor is blocked and watchdog stays armed. | Cooperative transfer blocks, but timeout takeover can overlap. | No release or fencing proof means no acquire. |
 | Watchdog arm fails | Required mode makes acquisition fail. | Automatic mode may run unprotected only when conclusively unarmed. | Grant does not override a required watchdog failure. |
 | Recovery or failback | Fresh consent and handoff are required. | Visible incumbent is honored when `preempt: false`. | Grant and fencing rules still apply. |
 
-## Watchdog semantics
+## Watchdog semantics, Experimental
 
-Watchdog modes are `off`, `automatic`, and `required`. The planned controller
+Watchdog modes are `off`, `automatic`, and `required`. The controller
 arms only after authority is valid and before adding the VIP. It feeds only
 from a coordinator iteration where authority is valid, the resource is
 confirmed present, and the generation is unchanged. It disarms only after
@@ -57,7 +61,7 @@ disarm. `nowayout: reboot` explicitly accepts a device that will reboot on
 expiry. Automatic mode may proceed unprotected only when the device is
 conclusively unarmed. Unknown or partial arm state blocks acquisition.
 
-The planned timing check is `A + J + U + S < W`, where `A` is advert interval,
+The timing check is `A + J + U + S < W`, where `A` is advert interval,
 `J` is command delay, `U` is withdrawal timeout, `S` is the safety margin, and
 `W` is the effective watchdog timeout. Do not enable systemd
 `RuntimeWatchdogSec` on the same device. Gruezi must be the only watchdog
@@ -137,7 +141,7 @@ After a crash or freeze of an owner the VIP stays in the host kernel (a
 residual VIP) while its status is unavailable. The available partition row
 shows dual ownership (A+B), the documented unsafe overlap.
 
-Observed results that differ from the table above or from the planned design:
+Observed results that differ from the table above or from the design:
 
 * **available, frozen owner resumed (fixed by todo 24).** At 2d531e7, after
   SIGCONT both nodes yielded at the same moment, the VIP was absent for about
@@ -174,5 +178,9 @@ Observed results that differ from the table above or from the planned design:
 Full per-row observations, the discarded first-pass results and the cleanup
 verification are in `.omo/evidence/task-17-gruezi-ha-safety-roadmap.md`.
 
-Everything in this document that is not already identified as current
-prototype behavior is Planned.
+The current claim map is: ownership worker, kernel read-back, HMAC and session
+admission, strict and available policy behavior, external fencing state, and
+status fields are **Implemented** by tasks 6 through 13 and their tests.
+Watchdog operation and the external grant happy path remain **Experimental**.
+The unmodified netem script still has the available process-freeze failure
+described in task 28 evidence, so that lab result is not presented as green.
