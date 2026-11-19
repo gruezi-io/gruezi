@@ -38,5 +38,6 @@ CONNECT_TIMEOUT_S=2
 STATEMENT_TIMEOUT_S=5
 COMMAND_TIMEOUT_S=8
 
-# Upper bound for future bounded MASTER_GTID_WAIT catch-up (task 8).
+# Upper bound for peer-origin MASTER_GTID_WAIT catch-up. The event's remaining
+# GRUEZI_TIMEOUT_MS budget also bounds the client and can shorten this wait.
 MAX_APPLY_WAIT_S=10

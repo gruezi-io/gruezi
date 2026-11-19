@@ -325,7 +325,7 @@ impl AdapterFixture {
     ///
     /// Returns errors from spawning the adapter or decoding its output.
     pub fn run(&self, args: &[&str]) -> Result<Output> {
-        self.run_inner(args, true)
+        self.run_inner(args, true, &[])
     }
 
     /// Run the adapter WITHOUT `GRUEZI_ADAPTER_TEST`: internal commands must
@@ -335,10 +335,75 @@ impl AdapterFixture {
     ///
     /// Returns errors from spawning the adapter or decoding its output.
     pub fn run_unguarded(&self, args: &[&str]) -> Result<Output> {
-        self.run_inner(args, false)
+        self.run_inner(args, false, &[])
     }
 
-    fn run_inner(&self, args: &[&str], guard: bool) -> Result<Output> {
+    /// Run a lifecycle event with the complete pinned environment; overrides
+    /// replace individual fields to exercise malformed and stale inputs.
+    pub fn event(
+        &self,
+        event: &str,
+        generation: &str,
+        overrides: &[(&str, &str)],
+    ) -> Result<Output> {
+        self.event_args(&[event], generation, overrides)
+    }
+
+    /// Run an administrative authorization with the activation binding.
+    pub fn event_args(
+        &self,
+        args: &[&str],
+        generation: &str,
+        overrides: &[(&str, &str)],
+    ) -> Result<Output> {
+        let event = *args.first().ok_or_else(|| anyhow!("event missing"))?;
+        let mut vars = vec![
+            (
+                "GRUEZI_EVENT",
+                if event == "declare-authoritative" {
+                    "activate"
+                } else {
+                    event
+                },
+            ),
+            ("GRUEZI_GENERATION", generation),
+            ("GRUEZI_INSTANCE_ID", "11111111111111111111111111111111"),
+            ("GRUEZI_PEER_NONCE", "22222222222222222222222222222222"),
+            ("GRUEZI_TRANSFER_ID", "9"),
+            ("GRUEZI_AUTHORITY_SOURCE", "peer"),
+            ("GRUEZI_AUTHORITY_TERM", "1"),
+            ("GRUEZI_TIMEOUT_MS", "15000"),
+            ("GRUEZI_ACTIVATION_MODE", "handoff"),
+            ("GRUEZI_DEACTIVATE_MODE", "handoff_release"),
+        ];
+        vars.extend_from_slice(overrides);
+        self.run_inner(args, true, &vars)
+    }
+
+    /// Persist one fake-server control, independent of the adapter environment.
+    pub fn control(&self, name: &str, value: &str) -> Result<()> {
+        self.write_fixture_file(name, value)
+    }
+
+    /// Observe a fake-server value after a transition or compensation.
+    pub fn control_value(&self, name: &str) -> Result<String> {
+        Ok(fs::read_to_string(self.fixture_dir.join(name))?
+            .trim()
+            .to_owned())
+    }
+
+    /// Enable stateful fake SQL behavior for real lifecycle command tests.
+    pub fn lifecycle(&self) -> Result<()> {
+        self.control("lifecycle", "1")
+    }
+
+    /// Clear only the transcript, preserving all fake-server and adapter state.
+    pub fn clear_log(&self) -> Result<()> {
+        fs::write(&self.call_log, "")?;
+        Ok(())
+    }
+
+    fn run_inner(&self, args: &[&str], guard: bool, vars: &[(&str, &str)]) -> Result<Output> {
         let mut path = self.bin_dir.display().to_string();
         if let Ok(old) = std::env::var("PATH") {
             path.push(':');
@@ -351,6 +416,7 @@ impl AdapterFixture {
             .env("GRUEZI_MARIADB_ADAPTER_CONF", &self.conf_path)
             .env("GRUEZI_FAKE_MARIADB_LOG", &self.call_log)
             .env("GRUEZI_FAKE_MARIADB_FIXTURE", &self.fixture_dir)
+            .env("GRUEZI_FAKE_STATE_DIR", &self.state_dir)
             .env("PATH", &path)
             .env_remove("GRUEZI_INSTANCE_ID")
             .env_remove("GRUEZI_GENERATION");
@@ -359,6 +425,7 @@ impl AdapterFixture {
         } else {
             command.env_remove("GRUEZI_ADAPTER_TEST");
         }
+        command.envs(vars.iter().copied());
         let output = command.output()?;
         Ok(output)
     }

@@ -11,10 +11,12 @@ mod mariadb_support;
 
 use anyhow::{Result, anyhow};
 use mariadb_support::{
-    AdapterFixture, LocalFixture, PeerFixture, Receipt, assert_no_secret, assert_no_write_sql,
-    exit_code, stderr_str, stdout_str,
+    ADAPTER_PATH, AdapterFixture, LocalFixture, PeerFixture, Receipt, assert_no_secret,
+    assert_no_write_sql, exit_code, sha256_hex, stderr_str, stdout_str,
 };
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Output, time::Instant};
+use std::{
+    fmt::Write as _, fs, os::unix::fs::PermissionsExt, path::Path, process::Output, time::Instant,
+};
 
 fn combined(output: &Output) -> Result<String> {
     Ok(format!("{}{}", stdout_str(output)?, stderr_str(output)?))
@@ -748,6 +750,15 @@ fn receipt_digest_mismatch_refuses() -> Result<()> {
     sample.write(&path, None)?;
     let text = expect_exit(&receipt_verify(&fx, &path, &sample, "read")?, 0)?;
     assert!(text.contains("receipt=verified"));
+    // The production SQL carrier has the same integrity requirement.
+    let fx = lifecycle_fixture("carrier-digest")?;
+    let valid = carrier_row(&[])?;
+    let (fields, _) = valid
+        .rsplit_once('\t')
+        .ok_or_else(|| anyhow!("no digest"))?;
+    fx.control("receipt.peer.cnf", &format!("{fields}\t{}", "0".repeat(64)))?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)?;
     Ok(())
 }
 
@@ -964,5 +975,1219 @@ fn qa_eligibility_report_and_failure_reasons() -> Result<()> {
             "status output",
         )?;
     }
+    Ok(())
+}
+
+fn carrier_row(overrides: &[(&str, &str)]) -> Result<String> {
+    let state = "0-1-10,1-2-20";
+    let incarnation = format!("2:1:90:{}", sha256_hex(state)?);
+    let mut fields = vec![
+        ("singleton_id", "1"),
+        ("transfer_id", "9"),
+        ("server_id", "2"),
+        ("gruezi_instance_id", "22222222222222222222222222222222"),
+        ("generation", "73"),
+        ("db_incarnation", &incarnation),
+        ("target_gtid_binlog_pos", "0-1-10,1-2-20"),
+        ("target_gtid_current_pos", "0-1-10,1-2-20"),
+        ("target_gtid_slave_pos", "0-1-10,1-2-20"),
+        ("target_gtid_binlog_state", state),
+        ("release_nonce", "33333333333333333333333333333333"),
+        ("released_at_utc", "2026-11-19T12:00:00Z"),
+    ];
+    for (key, value) in &mut fields {
+        if let Some((_, replacement)) = overrides.iter().find(|(name, _)| name == key) {
+            *value = replacement;
+        }
+    }
+    let mut canonical = String::new();
+    for (key, value) in &fields {
+        writeln!(canonical, "{key}={value}")?;
+    }
+    let mut values: Vec<&str> = fields.iter().map(|(_, value)| *value).collect();
+    let digest = sha256_hex(&canonical)?;
+    values.push(&digest);
+    Ok(values.join("\t"))
+}
+
+fn lifecycle_fixture(name: &str) -> Result<AdapterFixture> {
+    let fx = AdapterFixture::new(name)?;
+    install_healthy(&fx)?;
+    fx.lifecycle()?;
+    fx.control("receipt.peer.cnf", &carrier_row(&[])?)?;
+    Ok(fx)
+}
+
+fn activated(name: &str) -> Result<AdapterFixture> {
+    let fx = lifecycle_fixture(name)?;
+    expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    Ok(fx)
+}
+
+fn assert_no_enable(fx: &AdapterFixture) -> Result<()> {
+    assert!(!fx.call_log()?.contains("SET GLOBAL read_only=0"));
+    Ok(())
+}
+
+fn assert_dirty(fx: &AdapterFixture) -> Result<()> {
+    assert!(
+        state_names(fx)?
+            .iter()
+            .any(|name| name.starts_with("dirty.") && name.ends_with(".record"))
+    );
+    Ok(())
+}
+
+fn ordered(log: &str, needles: &[&str]) {
+    let mut rest = log;
+    for needle in needles {
+        let position = rest.find(needle).unwrap_or_else(|| {
+            // Assertion failure keeps the entire transcript visible.
+            assert!(rest.contains(needle), "missing ordered {needle} in:\n{log}");
+            0
+        });
+        rest = rest.get(position + needle.len()..).unwrap_or("");
+    }
+}
+
+fn verify_active(fx: &AdapterFixture, incarnation: &str) -> Result<Output> {
+    fx.event("verify", "1", &[("GRUEZI_DB_INCARNATION", incarnation)])
+}
+
+fn active_incarnation(fx: &AdapterFixture) -> Result<String> {
+    let record = fs::read_to_string(fx.state_dir.join("active.record"))?;
+    Ok(record
+        .lines()
+        .find_map(|line| line.strip_prefix("proc_incarnation="))
+        .ok_or_else(|| anyhow!("no active incarnation"))?
+        .to_owned())
+}
+
+#[test]
+fn activate_sql_order_is_checks_then_wait_then_epoch_then_enable_then_readback() -> Result<()> {
+    let fx = activated("activate-order")?;
+    let log = fx.call_log()?;
+    ordered(
+        &log,
+        &[
+            "gtid_strict_mode",
+            "FROM gruezi_ha.handoff_release",
+            "MASTER_GTID_WAIT('1-2-20',10)",
+            "SELECT CONNECTION_ID()",
+            "EPOCH_BEFORE_ENABLE",
+            "SET GLOBAL read_only=0",
+            "SELECT 'enabled'",
+            "SELECT @@global.server_id,@@global.gtid_domain_id,@@global.read_only",
+        ],
+    );
+    assert!(log.contains("RECEIPT_CONSUMED_BEFORE_ENABLE"));
+    assert_dirty(&fx)?;
+    Ok(())
+}
+
+#[test]
+fn activate_refuses_when_quarantined() -> Result<()> {
+    let fx = lifecycle_fixture("activate-latch")?;
+    fs::write(
+        fx.state_dir.join("quarantine.record"),
+        "reason=origin_conflict\n",
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 11)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn activate_refuses_unclosed_dirty_epoch_not_covered_by_peer() -> Result<()> {
+    let fx = lifecycle_fixture("activate-dirty")?;
+    expect_exit(
+        &fx.run(&[
+            "internal-dirty-open",
+            "--id=unclosed",
+            "--reason=enable",
+            "--target-slave-pos=1-2-99",
+        ])?,
+        0,
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 11)?;
+    assert_dirty(&fx)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn activate_peer_unreachable_or_writable_fails_closed() -> Result<()> {
+    for (control, code) in [("peer_unreachable", 13), ("peer_writable", 10)] {
+        let fx = lifecycle_fixture(control)?;
+        fx.control(control, "1")?;
+        expect_exit(&fx.event("activate", "1", &[])?, code)?;
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn activate_wait_minus_one_or_null_fails_closed() -> Result<()> {
+    for result in ["-1", "NULL", "0\n0", "garbage"] {
+        let fx = lifecycle_fixture("wait-refuse")?;
+        fx.control("wait_result", result)?;
+        expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn activate_missing_domain_or_unexpected_origin_quarantines() -> Result<()> {
+    for state in ["0-1-1-10,1-3-1-20", "0-1-1-10,1-2-1-20,2-9-1-3"] {
+        let fx = lifecycle_fixture("activate-origin")?;
+        fx.set_local_output(
+            &LocalFixture {
+                binlog_state: state.to_owned(),
+                ..healthy_local(&fx)
+            }
+            .render(),
+        )?;
+        expect_exit(&fx.event("activate", "1", &[])?, 11)?;
+        assert!(fx.state_dir.join("quarantine.record").exists());
+        assert_no_enable(&fx)?;
+    }
+    // Wait returning 0 cannot manufacture a missing domain.
+    let fx = lifecycle_fixture("activate-missing-after-wait")?;
+    fx.control(
+        "after_wait.local",
+        &LocalFixture {
+            binlog_state: "0-1-1-10".to_owned(),
+            ..healthy_local(&fx)
+        }
+        .render(),
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 11)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn activate_readback_mismatch_compensates_and_fails() -> Result<()> {
+    let fx = lifecycle_fixture("activate-readback")?;
+    fx.control("readback_mismatch", "1")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    ordered(
+        &fx.call_log()?,
+        &[
+            "SET GLOBAL read_only=0",
+            "SELECT 'enabled'",
+            "SET GLOBAL read_only=1",
+        ],
+    );
+    assert_dirty(&fx)?;
+    assert!(!fx.state_dir.join("active.record").exists());
+    Ok(())
+}
+
+#[test]
+fn deactivate_kills_connections_not_just_queries() -> Result<()> {
+    let fx = lifecycle_fixture("deactivate-kill")?;
+    expect_exit(&fx.event("deactivate", "1", &[])?, 0)?;
+    let log = fx.call_log()?;
+    ordered(
+        &log,
+        &[
+            "KILL CONNECTION 41",
+            "SET GLOBAL read_only=1",
+            "KILL CONNECTION 42",
+            "INNODB_TRX",
+            "XA RECOVER",
+            "STOP REPLICA",
+        ],
+    );
+    assert!(!log.contains("KILL QUERY"));
+    Ok(())
+}
+
+#[test]
+fn deactivate_open_transaction_blocks_success() -> Result<()> {
+    let fx = activated("deactivate-trx")?;
+    fx.control("transactions", "1")?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 13)?;
+    assert_dirty(&fx)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    assert!(!fx.call_log()?.contains("STOP REPLICA"));
+    Ok(())
+}
+
+#[test]
+fn deactivate_xa_blocks_success() -> Result<()> {
+    let fx = activated("deactivate-xa")?;
+    fx.control("xa", "123\t8\t8\tprepared")?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 13)?;
+    assert_dirty(&fx)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    Ok(())
+}
+
+#[test]
+fn deactivate_dirty_epoch_closed_only_after_readback() -> Result<()> {
+    let fx = activated("deactivate-close")?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 0)?;
+    assert!(
+        !state_names(&fx)?
+            .iter()
+            .any(|name| name.starts_with("dirty."))
+    );
+    let log = fx.call_log()?;
+    ordered(
+        &log,
+        &[
+            "STOP REPLICA",
+            "REPLACE INTO",
+            "SELECT singleton_id",
+            "GLOBAL_STATUS",
+            "SELECT @@global.server_id,@@global.gtid_domain_id,@@global.read_only",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn fault_injection_refused_without_test_guard() -> Result<()> {
+    let fx = lifecycle_fixture("guard")?;
+    expect_exit(
+        &fx.run_unguarded(&["internal-dirty-open", "--id=bad", "--reason=bad"])?,
+        64,
+    )?;
+    assert_no_enable(&fx)
+}
+
+fn authorize(fx: &AdapterFixture) -> Result<()> {
+    expect_exit(
+        &fx.event_args(
+            &[
+                "declare-authoritative",
+                "--i-accept-possible-data-loss",
+                "--incident-id",
+                "INC-19",
+                "--reason",
+                "Peer network unavailable",
+                "--operator",
+                "ops-42",
+            ],
+            "1",
+            &[],
+        )?,
+        0,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn declare_authoritative_is_one_shot_and_audited() -> Result<()> {
+    let fx = lifecycle_fixture("override-audit")?;
+    authorize(&fx)?;
+    fx.control("peer_unreachable", "1")?;
+    let text = expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    assert!(text.contains("target=unknown") && text.contains("possible_data_loss=yes"));
+    assert!(!fx.state_dir.join("authority.pending").exists());
+    let audit = fs::read_to_string(fx.state_dir.join("quarantine.audit"))?;
+    assert!(
+        audit.contains("operator=ops-42")
+            && audit.contains("incident=INC-19")
+            && audit.contains("event=authority-consumed")
+    );
+    Ok(())
+}
+
+#[test]
+fn override_never_bypasses_authority_quarantine_dirty_epoch_or_incarnation() -> Result<()> {
+    for condition in [
+        "authority",
+        "quarantine",
+        "dirty",
+        "incarnation",
+        "writable",
+    ] {
+        let fx = lifecycle_fixture(condition)?;
+        authorize(&fx)?;
+        fx.control("peer_unreachable", "1")?;
+        let mut env = Vec::new();
+        let expected = match condition {
+            "authority" => {
+                env.push(("GRUEZI_AUTHORITY_SOURCE", "none"));
+                10
+            }
+            "quarantine" => {
+                fs::write(
+                    fx.state_dir.join("quarantine.record"),
+                    "reason=origin_conflict\n",
+                )?;
+                11
+            }
+            "dirty" => {
+                fs::write(fx.state_dir.join("dirty.prior.record"), "status=open\n")?;
+                11
+            }
+            "incarnation" => {
+                fs::write(&fx.pid_file, "1\n")?;
+                13
+            }
+            "writable" => {
+                fx.control("read_only", "0")?;
+                10
+            }
+            _ => return Err(anyhow!("bad condition")),
+        };
+        expect_exit(&fx.event("activate", "1", &env)?, expected)?;
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn override_consumed_before_enable_and_not_replayed() -> Result<()> {
+    let fx = lifecycle_fixture("override-consume")?;
+    authorize(&fx)?;
+    fx.control("peer_unreachable", "1")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    assert!(fx.call_log()?.contains("OVERRIDE_CONSUMED_BEFORE_ENABLE"));
+    expect_exit(&fx.event("activate", "1", &[])?, 64)?;
+    Ok(())
+}
+
+#[test]
+fn deactivate_cancels_obsolete_adapter_sql_sessions() -> Result<()> {
+    let fx = lifecycle_fixture("obsolete-session")?;
+    expect_exit(
+        &fx.event("deactivate", "1", &[("GRUEZI_DEACTIVATE_MODE", "revoke")])?,
+        0,
+    )?;
+    ordered(
+        &fx.call_log()?,
+        &[
+            "USER=SUBSTRING_INDEX(CURRENT_USER()",
+            "KILL CONNECTION 41",
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST",
+            "SET GLOBAL read_only=1",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn cooperative_handoff_preserves_last_acknowledged_token() -> Result<()> {
+    let fx = activated("last-token")?;
+    assert!(fx.call_log()?.contains("MASTER_GTID_WAIT('1-2-20',10)"));
+    let text = fs::read_to_string(
+        fx.state_dir
+            .join("dirty.11111111111111111111111111111111.1.record"),
+    )?;
+    assert!(text.contains("target=0-1-10,1-2-20"));
+    expect_exit(&fx.event("deactivate", "2", &[])?, 0)?;
+    let receipt = fs::read_to_string(fx.state_dir.join("last_release.record"))?;
+    assert!(receipt.contains("target_gtid_binlog_state=0-1-10,1-2-20"));
+    Ok(())
+}
+
+#[test]
+fn late_replication_invalidates_unproved_final_watermark() -> Result<()> {
+    let fx = lifecycle_fixture("late-peer")?;
+    fx.control("late_peer", "1")?;
+    assert_reason(
+        &expect_exit(&fx.event("activate", "1", &[])?, 13)?,
+        "receipt_live_state_mismatch",
+    );
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn receipt_requires_live_state_equality() -> Result<()> {
+    let fx = lifecycle_fixture("receipt-samples")?;
+    fx.control(
+        "receipt.peer.cnf",
+        &carrier_row(&[("target_gtid_current_pos", "0-1-11,1-2-20")])?,
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn verify_requires_full_env_contract() -> Result<()> {
+    let fx = activated("verify-env")?;
+    let incarnation = active_incarnation(&fx)?;
+    for name in [
+        "GRUEZI_EVENT",
+        "GRUEZI_GENERATION",
+        "GRUEZI_INSTANCE_ID",
+        "GRUEZI_TRANSFER_ID",
+        "GRUEZI_AUTHORITY_SOURCE",
+        "GRUEZI_AUTHORITY_TERM",
+        "GRUEZI_TIMEOUT_MS",
+        "GRUEZI_DB_INCARNATION",
+    ] {
+        expect_exit(
+            &fx.event(
+                "verify",
+                "1",
+                &[("GRUEZI_DB_INCARNATION", &incarnation), (name, "")],
+            )?,
+            64,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn verify_call_log_contains_no_write_statement() -> Result<()> {
+    let fx = activated("verify-readonly")?;
+    let incarnation = active_incarnation(&fx)?;
+    fx.clear_log()?;
+    let text = expect_exit(&verify_active(&fx, &incarnation)?, 0)?;
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("db_incarnation="))
+            .count(),
+        1
+    );
+    let log = fx.call_log()?;
+    assert_no_write_sql(&log)?;
+    for forbidden in [
+        "SET ",
+        "KILL ",
+        "START ",
+        "STOP ",
+        "MASTER_GTID_WAIT",
+        "peer.cnf",
+    ] {
+        assert!(!log.contains(forbidden), "verify issued {forbidden}");
+    }
+    Ok(())
+}
+
+#[test]
+fn verify_incarnation_mismatch_exit_13() -> Result<()> {
+    let fx = activated("verify-mismatch")?;
+    expect_exit(&verify_active(&fx, "1-999999")?, 13)?;
+    Ok(())
+}
+
+#[test]
+fn verify_unknown_incarnation_exit_13() -> Result<()> {
+    let fx = activated("verify-unknown")?;
+    let incarnation = active_incarnation(&fx)?;
+    fs::write(&fx.pid_file, "4294967295\n")?;
+    expect_exit(&verify_active(&fx, &incarnation)?, 13)?;
+    Ok(())
+}
+
+#[test]
+fn verify_read_only_change_fails() -> Result<()> {
+    let fx = activated("verify-read-only")?;
+    let incarnation = active_incarnation(&fx)?;
+    fx.control("read_only", "1")?;
+    expect_exit(&verify_active(&fx, &incarnation)?, 10)?;
+    Ok(())
+}
+
+#[test]
+fn verify_timeout_exit_12_within_bound() -> Result<()> {
+    let fx = activated("verify-timeout")?;
+    let incarnation = active_incarnation(&fx)?;
+    fx.set_mode("hang")?;
+    let started = Instant::now();
+    expect_exit(
+        &fx.event(
+            "verify",
+            "1",
+            &[
+                ("GRUEZI_DB_INCARNATION", &incarnation),
+                ("GRUEZI_TIMEOUT_MS", "150"),
+            ],
+        )?,
+        12,
+    )?;
+    assert!(started.elapsed().as_secs() < 3);
+    Ok(())
+}
+
+#[test]
+fn verify_at_active_generation_accepted() -> Result<()> {
+    let fx = activated("verify-idempotent")?;
+    let incarnation = active_incarnation(&fx)?;
+    expect_exit(&verify_active(&fx, &incarnation)?, 0)?;
+    expect_exit(&verify_active(&fx, &incarnation)?, 0)?;
+    Ok(())
+}
+
+#[test]
+fn verify_runs_through_configured_activate_command() -> Result<()> {
+    let fx = activated("verify-activate-command")?;
+    let incarnation = active_incarnation(&fx)?;
+    fx.clear_log()?;
+    expect_exit(
+        &fx.event_args(
+            &["activate"],
+            "1",
+            &[
+                ("GRUEZI_EVENT", "verify"),
+                ("GRUEZI_DB_INCARNATION", &incarnation),
+            ],
+        )?,
+        0,
+    )?;
+    let log = fx.call_log()?;
+    assert!(!log.contains("SET ") && !log.contains("peer.cnf"));
+    assert_no_write_sql(&log)
+}
+
+#[test]
+fn stale_same_instance_generation_refused() -> Result<()> {
+    let fx = activated("stale-generation")?;
+    expect_exit(&fx.event("deactivate", "1", &[])?, 64)?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 0)?;
+    Ok(())
+}
+
+#[test]
+fn operation_record_binds_instance_generation_incarnation_and_conn_id() -> Result<()> {
+    let fx = activated("operation-binding")?;
+    let record = fs::read_to_string(fx.state_dir.join("operation.record"))?;
+    assert!(record.contains("instance=11111111111111111111111111111111\n"));
+    assert!(record.contains("generation=1\n"));
+    assert!(record.contains(&format!("proc_incarnation={}\n", active_incarnation(&fx)?)));
+    assert!(record.contains("connection_id=77\n"));
+    Ok(())
+}
+
+#[test]
+fn deactivate_lock_order_blocks_delayed_enable() -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let fx = lifecycle_fixture("operation-lock")?;
+    let mut holder = Command::new("flock")
+        .arg("-x")
+        .arg(fx.state_dir.join("operation.lock"))
+        .args(["bash", "-c", "printf 'READY\\n'; read -r release"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = holder
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("no lock output"))?;
+    let mut ready = String::new();
+    BufReader::new(stdout).read_line(&mut ready)?;
+    assert_eq!(ready, "READY\n");
+    let out = fx.event("deactivate", "1", &[("GRUEZI_TIMEOUT_MS", "100")])?;
+    // Release and reap even before asserting, so a failed assertion cannot
+    // strand the operation lock.
+    drop(holder.stdin.take());
+    let _ = holder.wait()?;
+    expect_exit(&out, 12)?;
+    assert_eq!(fx.call_log()?, "");
+    Ok(())
+}
+
+#[test]
+fn delayed_enable_cannot_survive_deactivate() -> Result<()> {
+    let fx = lifecycle_fixture("delayed-enable")?;
+    fs::write(
+        fx.state_dir.join("operation.record"),
+        "instance=11111111111111111111111111111111\ngeneration=1\nconnection_id=41\n",
+    )?;
+    expect_exit(
+        &fx.event("deactivate", "2", &[("GRUEZI_DEACTIVATE_MODE", "revoke")])?,
+        0,
+    )?;
+    ordered(
+        &fx.call_log()?,
+        &[
+            "KILL CONNECTION 41",
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST",
+            "SET GLOBAL read_only=1",
+            "INNODB_TRX",
+            "XA RECOVER",
+            "SELECT @@global.read_only",
+        ],
+    );
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn cold_bootstrap_refuses_with_dirty_history() -> Result<()> {
+    let fx = lifecycle_fixture("cold-dirty")?;
+    fs::write(fx.state_dir.join("dirty.prior.record"), "status=open\n")?;
+    expect_exit(
+        &fx.event("activate", "1", &[("GRUEZI_ACTIVATION_MODE", "cold")])?,
+        11,
+    )?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn start_replica_resumes_only_in_baseline_without_quarantine() -> Result<()> {
+    for mode in ["baseline", "revoke", "handoff_release", "latched"] {
+        let fx = lifecycle_fixture(mode)?;
+        fx.control("threads", "No")?;
+        if mode == "latched" {
+            fs::write(
+                fx.state_dir.join("quarantine.record"),
+                "reason=origin_conflict\n",
+            )?;
+        }
+        expect_exit(
+            &fx.event(
+                "deactivate",
+                "1",
+                &[(
+                    "GRUEZI_DEACTIVATE_MODE",
+                    if mode == "latched" { "baseline" } else { mode },
+                )],
+            )?,
+            0,
+        )?;
+        assert_eq!(fx.call_log()?.contains("START REPLICA"), mode == "baseline");
+    }
+    Ok(())
+}
+
+#[test]
+fn closed_epoch_clears_pending_dirty_marker_not_quarantine() -> Result<()> {
+    let fx = activated("close-pending")?;
+    expect_exit(&fx.run(&["check"])?, 11)?;
+    assert!(fx.state_dir.join("dirty.pending").exists());
+    fs::write(
+        fx.state_dir.join("quarantine.record"),
+        "reason=origin_conflict\n",
+    )?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 0)?;
+    assert!(!fx.state_dir.join("dirty.pending").exists());
+    assert!(fx.state_dir.join("quarantine.record").exists());
+    Ok(())
+}
+
+#[test]
+fn unverified_closure_keeps_latch() -> Result<()> {
+    let fx = activated("unverified-closure")?;
+    expect_exit(&fx.run(&["check"])?, 11)?;
+    fx.control("transactions", "1")?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 13)?;
+    assert!(fx.state_dir.join("dirty.pending").exists());
+    assert_dirty(&fx)
+}
+
+#[test]
+fn row_field_count_must_be_exact() -> Result<()> {
+    for count in [7, 9] {
+        let fx = AdapterFixture::new("row-fields")?;
+        install_healthy(&fx)?;
+        let original = healthy_local(&fx).render();
+        let (_, remaining) = original
+            .split_once('\n')
+            .ok_or_else(|| anyhow!("no scalar row"))?;
+        let scalar = if count == 7 {
+            "1\t0\tON\tON\tON\tROW\tOFF".to_owned()
+        } else {
+            format!(
+                "1\t0\tON\tON\tON\tROW\tOFF\t{}\textra",
+                fx.pid_file.display()
+            )
+        };
+        fx.set_local_output(&format!("{scalar}\n{remaining}"))?;
+        expect_exit(&fx.run(&["check"])?, 13)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn receipt_rejects_consumed_instance_generation() -> Result<()> {
+    let fx = lifecycle_fixture("receipt-replay")?;
+    fs::write(
+        fx.state_dir.join("consumed.keys"),
+        "22222222222222222222222222222222:73\n",
+    )?;
+    assert_reason(
+        &expect_exit(&fx.event("activate", "1", &[])?, 13)?,
+        "receipt_already_consumed",
+    );
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn receipt_accepts_valid_predecessor_generation_independent_of_local() -> Result<()> {
+    let fx = lifecycle_fixture("receipt-independent-generation")?;
+    expect_exit(&fx.event("activate", "999", &[])?, 0)?;
+    assert_eq!(
+        fs::read_to_string(fx.state_dir.join("consumed.keys"))?,
+        "22222222222222222222222222222222:73\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn receipt_binlog_state_column_drives_coverage() -> Result<()> {
+    let fx = lifecycle_fixture("receipt-state-coverage")?;
+    // All sampled positions still match. Only the origin-aware state frontier
+    // is now beyond the successor, and MASTER_GTID_WAIT still returns zero.
+    let target = "0-1-10,1-2-21";
+    fx.set_peer_output(
+        &PeerFixture {
+            binlog_state: target.to_owned(),
+            ..PeerFixture::healthy()
+        }
+        .render(),
+    )?;
+    let incarnation = format!("2:1:90:{}", sha256_hex(target)?);
+    fx.control(
+        "receipt.peer.cnf",
+        &carrier_row(&[
+            ("target_gtid_binlog_state", target),
+            ("db_incarnation", &incarnation),
+        ])?,
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 11)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn qa_activate_then_deactivate_ordered_sql_cycle() -> Result<()> {
+    let fx = activated("qa-cycle")?;
+    let output = fx.event("deactivate", "2", &[])?;
+    println!(
+        "== full activate then deactivate (exit {}) ==\n{}\n== exact ordered SQL transcript ==\n{}",
+        exit_code(&output),
+        combined(&output)?,
+        fx.call_log()?
+    );
+    expect_exit(&output, 0)?;
+    for fault in ["transactions", "xa", "readback_mismatch"] {
+        let fx = lifecycle_fixture(fault)?;
+        if fault == "readback_mismatch" {
+            fx.control(fault, "1")?;
+            let output = fx.event("activate", "1", &[])?;
+            println!(
+                "== {fault} exit {} ==\n{}",
+                exit_code(&output),
+                combined(&output)?
+            );
+            expect_exit(&output, 13)?;
+        } else {
+            expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+            fx.control(fault, "1")?;
+            let output = fx.event("deactivate", "2", &[])?;
+            println!(
+                "== {fault} exit {} ==\n{}",
+                exit_code(&output),
+                combined(&output)?
+            );
+            expect_exit(&output, 13)?;
+        }
+        assert_dirty(&fx)?;
+        assert!(!fx.state_dir.join("last_release.record").exists());
+        assert_eq!(fx.control_value("read_only")?, "1");
+        println!("failure={fault} read_only=1 dirty_epoch=retained release=withheld");
+    }
+    Ok(())
+}
+
+#[test]
+fn override_refuses_observed_writable_peer() -> Result<()> {
+    let fx = lifecycle_fixture("override-writable-peer")?;
+    authorize(&fx)?;
+    fx.control("peer_writable", "1")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert!(fx.state_dir.join("authority.pending").exists());
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn normal_handoff_never_consumes_operator_authorization() -> Result<()> {
+    let fx = lifecycle_fixture("normal-with-override")?;
+    authorize(&fx)?;
+    expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    assert!(fx.state_dir.join("authority.pending").exists());
+    assert!(!fx.state_dir.join("authority.consumed").exists());
+    assert!(fx.call_log()?.contains("MASTER_GTID_WAIT"));
+    Ok(())
+}
+
+#[test]
+fn override_expiry_and_restart_identity_mismatch_refuse() -> Result<()> {
+    for condition in ["expiry", "restart"] {
+        let fx = lifecycle_fixture(condition)?;
+        authorize(&fx)?;
+        fx.control("peer_unreachable", "1")?;
+        let path = fx.state_dir.join("authority.pending");
+        let pending = fs::read_to_string(&path)?;
+        let replacement = if condition == "expiry" {
+            pending
+                .lines()
+                .map(|line| {
+                    if line.starts_with("expires_ms=") {
+                        "expires_ms=0"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            pending.replace(
+                "11111111111111111111111111111111",
+                "44444444444444444444444444444444",
+            )
+        };
+        fs::write(path, replacement)?;
+        expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn override_after_consumption_failure_requires_new_authorization() -> Result<()> {
+    let fx = lifecycle_fixture("override-cancelled-enable")?;
+    authorize(&fx)?;
+    fx.control("peer_unreachable", "1")?;
+    fx.control("readback_mismatch", "1")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert!(!fx.state_dir.join("authority.pending").exists());
+    assert!(fx.state_dir.join("authority.consumed").exists());
+    assert_dirty(&fx)?;
+    expect_exit(&fx.event("activate", "2", &[])?, 11)?;
+    Ok(())
+}
+
+#[test]
+fn override_never_bypasses_sql_errors_or_configuration() -> Result<()> {
+    let fx = lifecycle_fixture("override-sql-error")?;
+    authorize(&fx)?;
+    fx.set_local_output(
+        &LocalFixture {
+            sql_errno: "123".to_owned(),
+            ..healthy_local(&fx)
+        }
+        .render(),
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 11)?;
+    assert_no_enable(&fx)?;
+    let fx = lifecycle_fixture("override-config-error")?;
+    authorize(&fx)?;
+    fx.write_config(&format!("{}UNKNOWN_KEY=1\n", fx.default_config()))?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn permission_failure_never_counts_as_empty_success() -> Result<()> {
+    for statement in ["PROCESSLIST", "INNODB_TRX", "XA RECOVER", "STOP REPLICA"] {
+        let fx = lifecycle_fixture("permission-denied")?;
+        fx.control("deny_sql", statement)?;
+        expect_exit(&fx.event("deactivate", "1", &[])?, 13)?;
+        assert!(!fx.state_dir.join("last_release.record").exists());
+    }
+    let fx = lifecycle_fixture("override-permission-denied")?;
+    authorize(&fx)?;
+    fx.control(
+        "deny_sql",
+        "SELECT @@global.server_id,@@global.gtid_domain_id,@@global.read_only;",
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn receipt_carrier_requires_exact_columns_and_one_row() -> Result<()> {
+    let row = carrier_row(&[])?;
+    for invalid in [
+        row.split('\t').take(12).collect::<Vec<_>>().join("\t"),
+        format!("{row}\textra"),
+        format!("{row}\n{row}"),
+        String::new(),
+    ] {
+        let fx = lifecycle_fixture("carrier-shape")?;
+        fx.control("receipt.peer.cnf", &invalid)?;
+        expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn receipt_rejects_wrong_instance_generation_or_incarnation() -> Result<()> {
+    for (key, value) in [
+        ("gruezi_instance_id", "44444444444444444444444444444444"),
+        ("generation", "0"),
+        ("generation", "18446744073709551616"),
+        ("db_incarnation", "2:1:1000:unknown"),
+        ("transfer_id", "10"),
+        ("server_id", "3"),
+    ] {
+        let fx = lifecycle_fixture("receipt-bindings")?;
+        fx.control("receipt.peer.cnf", &carrier_row(&[(key, value)])?)?;
+        expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn peer_restart_invalidates_incarnation_binding() -> Result<()> {
+    let fx = lifecycle_fixture("peer-restart")?;
+    fx.control("peer_uptime", "1")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn peer_read_only_without_applier_quiescence_is_not_final() -> Result<()> {
+    let fx = lifecycle_fixture("peer-applier-live")?;
+    fx.control("peer_threads", "Yes")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn release_barrier_stops_appliers_and_blocks_late_commit() -> Result<()> {
+    let fx = activated("release-appliers")?;
+    fx.clear_log()?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 0)?;
+    ordered(
+        &fx.call_log()?,
+        &[
+            "SET GLOBAL read_only=1",
+            "INNODB_TRX",
+            "XA RECOVER",
+            "STOP REPLICA",
+            "GLOBAL_STATUS",
+            "REPLACE INTO",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn release_barrier_readback_precedes_capture() -> Result<()> {
+    let fx = lifecycle_fixture("barrier-readback")?;
+    expect_exit(&fx.event("deactivate", "1", &[])?, 0)?;
+    ordered(
+        &fx.call_log()?,
+        &[
+            "SET GLOBAL read_only=1",
+            "SELECT @@global.read_only",
+            "XA RECOVER",
+            "SELECT @@global.read_only",
+            "STOP REPLICA",
+            "SELECT @@global.gtid_binlog_pos",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn release_never_changes_event_scheduler() -> Result<()> {
+    let fx = activated("event-scheduler")?;
+    fx.control("event_scheduler", "ON")?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 10)?;
+    assert!(!fx.call_log()?.contains("SET GLOBAL event_scheduler"));
+    assert_dirty(&fx)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    Ok(())
+}
+
+#[test]
+fn cold_bootstrap_requires_no_prior_write_episode_and_converged_pair() -> Result<()> {
+    let fx = lifecycle_fixture("cold-new-pair")?;
+    fx.control("receipt.peer.cnf", "")?;
+    let text = expect_exit(
+        &fx.event("activate", "1", &[("GRUEZI_ACTIVATION_MODE", "cold")])?,
+        0,
+    )?;
+    assert!(text.contains("target=unknown") && text.contains("rpo=unknown"));
+    let fx = lifecycle_fixture("cold-prior-episode")?;
+    fx.control("receipt.peer.cnf", "")?;
+    fs::write(
+        fx.state_dir.join("last_release.record"),
+        "prior_write=yes\n",
+    )?;
+    expect_exit(
+        &fx.event("activate", "1", &[("GRUEZI_ACTIVATION_MODE", "cold")])?,
+        10,
+    )?;
+    assert_no_enable(&fx)?;
+    let fx = lifecycle_fixture("cold-unconverged")?;
+    fx.control("receipt.peer.cnf", "")?;
+    fx.set_peer_output(
+        &PeerFixture {
+            binlog_state: "0-1-1-10,1-2-1-21".to_owned(),
+            ..PeerFixture::healthy()
+        }
+        .render(),
+    )?;
+    expect_exit(
+        &fx.event("activate", "1", &[("GRUEZI_ACTIVATION_MODE", "cold")])?,
+        10,
+    )?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn baseline_and_revoke_preserve_dirty_epoch() -> Result<()> {
+    for mode in ["baseline", "revoke"] {
+        let fx = activated(mode)?;
+        expect_exit(
+            &fx.event("deactivate", "2", &[("GRUEZI_DEACTIVATE_MODE", mode)])?,
+            0,
+        )?;
+        assert_dirty(&fx)?;
+        assert!(!fx.state_dir.join("last_release.record").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn obsolete_sessions_must_be_observed_absent() -> Result<()> {
+    let fx = lifecycle_fixture("obsolete-remains")?;
+    fx.control("sessions_remaining", "1")?;
+    expect_exit(&fx.event("deactivate", "1", &[])?, 13)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    assert!(fx.call_log()?.contains("SET GLOBAL read_only=1"));
+    Ok(())
+}
+
+#[test]
+fn failed_receipt_readback_withholds_receipt_and_retains_epoch() -> Result<()> {
+    let fx = activated("receipt-publish-failure")?;
+    fx.control("receipt_readback_corrupt", "1")?;
+    expect_exit(&fx.event("deactivate", "2", &[])?, 13)?;
+    assert_dirty(&fx)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    ordered(
+        &fx.call_log()?,
+        &[
+            "REPLACE INTO",
+            "SELECT singleton_id",
+            "DELETE FROM gruezi_ha.handoff_release",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_empty_pair_can_form_without_inventing_history() -> Result<()> {
+    let fx = lifecycle_fixture("cold-empty")?;
+    fx.control("receipt.peer.cnf", "")?;
+    fx.set_local_output(
+        &LocalFixture {
+            binlog_state: String::new(),
+            binlog_pos: String::new(),
+            slave_pos: String::new(),
+            io_pos: String::new(),
+            ..healthy_local(&fx)
+        }
+        .render(),
+    )?;
+    fx.set_peer_output(
+        &PeerFixture {
+            binlog_state: String::new(),
+            binlog_pos: String::new(),
+            slave_pos: String::new(),
+            ..PeerFixture::healthy()
+        }
+        .render(),
+    )?;
+    let text = expect_exit(
+        &fx.event("activate", "1", &[("GRUEZI_ACTIVATION_MODE", "cold")])?,
+        0,
+    )?;
+    assert!(text.contains("target=unknown") && text.contains("rpo=unknown"));
+    assert!(!fx.call_log()?.contains("MASTER_GTID_WAIT"));
+    Ok(())
+}
+
+#[test]
+fn post_wait_missing_fields_cannot_reuse_prior_replica_state() -> Result<()> {
+    let fx = lifecycle_fixture("post-wait-missing")?;
+    let malformed = healthy_local(&fx)
+        .render()
+        .lines()
+        .filter(|line| !line.contains("Slave_SQL_Running"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fx.control("after_wait.local", &malformed)?;
+    expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+    assert_no_enable(&fx)
+}
+
+#[test]
+fn override_can_bypass_only_clean_sql_thread_io_connectivity() -> Result<()> {
+    let fx = lifecycle_fixture("override-io-only")?;
+    authorize(&fx)?;
+    fx.set_local_output(
+        &LocalFixture {
+            io_running: "Connecting".to_owned(),
+            io_errno: "2003".to_owned(),
+            ..healthy_local(&fx)
+        }
+        .render(),
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    assert!(fx.call_log()?.contains("OVERRIDE_CONSUMED_BEFORE_ENABLE"));
+    assert!(!fx.call_log()?.contains("MASTER_GTID_WAIT"));
+    Ok(())
+}
+
+#[test]
+fn override_unavailable_target_wait_never_claims_coverage() -> Result<()> {
+    let fx = lifecycle_fixture("override-wait")?;
+    authorize(&fx)?;
+    fx.control("wait_result", "-1")?;
+    let text = expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    assert!(text.contains("target=unknown") && text.contains("rpo=unknown"));
+    assert!(fx.state_dir.join("authority.consumed").exists());
+    assert!(!fx.state_dir.join("consumed.keys").exists());
+    Ok(())
+}
+
+#[test]
+fn adapter_file_is_executable() -> Result<()> {
+    // Tests launch through `bash <path>`, which hides a lost executable bit;
+    // the packaged asset is mode 0755, so pin it directly.
+    let mode = fs::metadata(ADAPTER_PATH)?.permissions().mode();
+    assert_eq!(mode & 0o755, 0o755, "adapter mode is {mode:o}");
+    Ok(())
+}
+
+#[test]
+fn deactivate_exempts_readonly_monitor_sessions() -> Result<()> {
+    let fx = lifecycle_fixture("monitor-exempt")?;
+    fx.control("monitor_session", "1")?;
+    expect_exit(&fx.event("deactivate", "1", &[])?, 0)?;
+    let log = fx.call_log()?;
+    assert!(
+        log.contains("USER<>'monitor'"),
+        "app kill must name the exemption"
+    );
+    assert!(
+        !log.contains("KILL CONNECTION 43"),
+        "monitor session was killed"
+    );
+    // A write-capable session that cannot be proven absent still fails closed.
+    let fx = lifecycle_fixture("monitor-exempt-remaining")?;
+    fx.control("monitor_session", "1")?;
+    fx.control("sessions_remaining", "1")?;
+    expect_exit(&fx.event("deactivate", "1", &[])?, 13)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    Ok(())
+}
+
+#[test]
+fn verify_rejects_non_active_generation() -> Result<()> {
+    let fx = activated("verify-wrong-generation")?;
+    let incarnation = active_incarnation(&fx)?;
+    for generation in ["2", "999"] {
+        let out = fx.event(
+            "verify",
+            generation,
+            &[("GRUEZI_DB_INCARNATION", &incarnation)],
+        )?;
+        assert_reason(&expect_exit(&out, 64)?, "stale_generation");
+    }
+    expect_exit(&verify_active(&fx, &incarnation)?, 0)?;
     Ok(())
 }

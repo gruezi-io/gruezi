@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gruezi-mariadb-adapter - MariaDB eligibility and quarantine foundation for
+# gruezi-mariadb-adapter - verified MariaDB lifecycle and eligibility for
 # Gruezi strict HA (2-node pair).
 #
 # This adapter is the only component allowed to talk to the database on
@@ -53,6 +53,11 @@ usage() {
 Usage: gruezi-mariadb-adapter <command> [args]
 
 Commands:
+  activate | deactivate | verify
+      Execute the GRUEZI_EVENT lifecycle contract under one bounded lock.
+  declare-authoritative --i-accept-possible-data-loss --incident-id <id>
+      --reason <text> --operator <id>
+      Audit a one-shot authorization bound to the next activation identity.
   check
       Read-only eligibility report as key=value lines on stdout.
   quarantine-status
@@ -311,8 +316,8 @@ check_state_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# Bounded SQL. sql_local / sql_peer are the only functions allowed to invoke
-# the mariadb client. SQL goes to the client on stdin (nothing sensitive on
+# Bounded SQL. Local/peer reads and the identity-bound interactive enable use
+# the same client timeout/credential rules. SQL goes on stdin (nothing sensitive on
 # argv), credentials come from the option file, and the whole invocation is
 # bounded by timeout --signal=KILL plus connect/statement timeouts.
 # ---------------------------------------------------------------------------
@@ -325,13 +330,14 @@ SQL_CLIENT_RC=0
 # Returns 0 on success, 2 on wall-clock timeout, 3 on any other client
 # failure. Unparseable output is the caller's concern (exit 13).
 sql_run() {
-    local optfile="$1" sql="$2" rc=0 errfile
+    local optfile="$1" sql="$2" rc=0 errfile budget
+    budget="$(remaining_seconds)" || return 2
     errfile="$(mktemp "$STATE_DIR/.tmp.stderr.XXXXXX")"
     SQL_OUT=""
     SQL_ERR=""
     # errexit-safe status capture: never toggle set -e here (it is global, and
     # re-enabling it before a nonzero return would kill the caller).
-    SQL_OUT="$(printf '%s\n' "$sql" | timeout --signal=KILL "$CFG_COMMAND_TIMEOUT_S" mariadb \
+    SQL_OUT="$(printf '%s\n' "$sql" | timeout --signal=KILL "$budget" mariadb \
         --defaults-extra-file="$optfile" \
         --connect-timeout="$CFG_CONNECT_TIMEOUT_S" \
         --max-statement-time="$CFG_STATEMENT_TIMEOUT_S" \
@@ -697,6 +703,10 @@ LATCH_REASONS=()
 INELIGIBLE_REASONS=()
 
 add_latch() {
+    local existing
+    for existing in "${LATCH_REASONS[@]}"; do
+        [[ "$existing" != "$1" ]] || return 0
+    done
     REASONS+=("$1")
     LATCH_REASONS+=("$1")
 }
@@ -719,6 +729,10 @@ vec_semantic_check() {
     local seen_own=0 seen_peer=0
     local -A origin_seen=() domain_origins=()
     while IFS=' ' read -r tag d s lo hi; do
+        if [[ "$tag" == G ]]; then
+            add_latch interval_gap
+            continue
+        fi
         [[ "$tag" == "R" ]] || continue
         if [[ "$d" == "$CFG_OWN_DOMAIN" ]]; then
             expected="$CFG_OWN_SERVER_ID"
@@ -791,6 +805,9 @@ DB_INCARNATION="UNKNOWN"
 parse_local_state() {
     local rows=() line_count row fields=()
     CHECK_FATAL_REASON=""
+    V_IO_RUNNING="" V_SQL_RUNNING="" V_IO_ERRNO="" V_SQL_ERRNO=""
+    V_USING_GTID="" V_IO_POS="" V_CONNECTION_NAME="" V_HAVE_CONNECTION_NAME=0 V_FILTERS=none
+    local have_io_pos=0
     mapfile -t rows <<<"$SQL_OUT"
     line_count="${#rows[@]}"
     if ((line_count < 4)); then
@@ -891,7 +908,7 @@ parse_local_state() {
             Last_IO_Errno) V_IO_ERRNO="$value" ;;
             Last_SQL_Errno) V_SQL_ERRNO="$value" ;;
             Using_Gtid) V_USING_GTID="$value" ;;
-            Gtid_IO_Pos) V_IO_POS="$value" ;;
+            Gtid_IO_Pos) V_IO_POS="$value"; have_io_pos=1 ;;
             Connection_name)
                 V_CONNECTION_NAME="$value"
                 V_HAVE_CONNECTION_NAME=1
@@ -907,13 +924,13 @@ parse_local_state() {
     done <<<"$replica_parsed"
 
     local req
-    for req in V_IO_RUNNING V_SQL_RUNNING V_IO_ERRNO V_SQL_ERRNO V_USING_GTID V_IO_POS; do
+    for req in V_IO_RUNNING V_SQL_RUNNING V_IO_ERRNO V_SQL_ERRNO V_USING_GTID; do
         if [[ -z "${!req}" ]]; then
             CHECK_FATAL_REASON=output_unparseable
             return 1
         fi
     done
-    if ((V_HAVE_CONNECTION_NAME == 0)); then
+    if ((V_HAVE_CONNECTION_NAME == 0 || have_io_pos == 0)); then
         CHECK_FATAL_REASON=output_unparseable
         return 1
     fi
@@ -951,6 +968,7 @@ report_pair() { printf '%s=%s\n' "$1" "$2"; }
 
 run_check() {
     local rc=0 exit_code r
+    REASONS=() LATCH_REASONS=() INELIGIBLE_REASONS=()
 
     if quarantine_active; then
         add_latch quarantine_latched
@@ -963,16 +981,16 @@ run_check() {
     if ((rc != 0)); then
         if ((rc == 2)); then
             report_pair reason mariadb_timeout
-            exit "$EXIT_TIMEOUT"
+            return "$EXIT_TIMEOUT"
         fi
         report_pair reason mariadb_client_failed
         report_pair client_rc "$SQL_CLIENT_RC"
-        exit "$EXIT_UNKNOWN"
+        return "$EXIT_UNKNOWN"
     fi
 
     if ! parse_local_state; then
         report_pair reason "$CHECK_FATAL_REASON"
-        exit "$EXIT_UNKNOWN"
+        return "$EXIT_UNKNOWN"
     fi
 
     # Identity: the live server must be who the config says it is.
@@ -980,7 +998,7 @@ run_check() {
         report_pair reason identity_mismatch
         report_pair server_id "$V_SERVER_ID"
         report_pair gtid_domain_id "$V_DOMAIN"
-        exit "$EXIT_UNKNOWN"
+        return "$EXIT_UNKNOWN"
     fi
 
     # Latch-class evidence: permanent quarantine is reserved for positive
@@ -1052,8 +1070,18 @@ run_check() {
     fi
 
     if [[ "$exit_code" == "$EXIT_QUARANTINED" ]] && ! quarantine_active; then
-        write_quarantine_record "${LATCH_REASONS[0]}" "$DB_INCARNATION" \
-            "$V_BINLOG_STATE" "$V_SLAVE_POS" "$V_IO_POS"
+        # An open epoch is pending closure, not evidence of an origin conflict.
+        # Keep its blocking marker separate so a verified release can close it
+        # without ever clearing a permanent evidence latch.
+        for r in "${LATCH_REASONS[@]}"; do
+            if [[ "$r" == dirty_history_open ]]; then
+                printf 'reason=dirty_history_open\n' | atomic_write "$STATE_DIR/dirty.pending"
+            else
+                write_quarantine_record "$r" "$DB_INCARNATION" \
+                    "$V_BINLOG_STATE" "$V_SLAVE_POS" "$V_IO_POS"
+                break
+            fi
+        done
     fi
 
     # Read-only eligibility report as key=value lines.
@@ -1108,7 +1136,7 @@ run_check() {
     for r in "${REASONS[@]}"; do
         report_pair reason "$r"
     done
-    exit "$exit_code"
+    return "$exit_code"
 }
 
 # ---------------------------------------------------------------------------
@@ -1466,6 +1494,590 @@ run_internal_receipt_verify() {
 # Dispatch
 # ---------------------------------------------------------------------------
 
+# All SQL, including an interactive enable connection, shares the event's
+# remaining budget. /proc/uptime is monotonic across wall-clock adjustments.
+monotonic_ms() { awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime; }
+
+remaining_seconds() {
+    local remaining=$((CFG_COMMAND_TIMEOUT_S * 1000))
+    if [[ -n "${OP_DEADLINE_MS:-}" ]]; then
+        local event_remaining=$((OP_DEADLINE_MS - $(monotonic_ms)))
+        ((event_remaining > 0)) || { printf 'reason=operation_timeout\n' >&2; return 12; }
+        ((event_remaining >= remaining)) || remaining="$event_remaining"
+    fi
+    printf '%s.%03d\n' "$((remaining / 1000))" "$((remaining % 1000))"
+}
+
+fail() { printf 'reason=%s\n' "$2" >&2; exit "$1"; }
+
+read_record() {
+    # Records are adapter-owned literal data, never shell programs.
+    local key="$1" file="$2"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    awk -v key="$key" 'index($0, key "=") == 1 { n++; value=substr($0,length(key)+2) }
+        END { if(n != 1) exit 1; print value }' "$file"
+}
+
+valid_u64() { is_canonical_uint "$1" && big_le "$1" "$MAX_SEQ"; }
+valid_nonce() { [[ "$1" =~ ^[0-9a-f]{32}$ ]]; }
+
+validate_event() {
+    [[ "${GRUEZI_EVENT:-}" == "$1" ]] || fail 64 event_mismatch
+    valid_nonce "${GRUEZI_INSTANCE_ID:-}" || fail 64 instance_invalid
+    valid_u64 "${GRUEZI_GENERATION:-}" && [[ "$GRUEZI_GENERATION" != 0 ]] || fail 64 generation_invalid
+    valid_u64 "${GRUEZI_TRANSFER_ID:-}" || fail 64 transfer_invalid
+    [[ -v GRUEZI_PEER_NONCE ]] || fail 64 peer_nonce_missing
+    [[ -z "$GRUEZI_PEER_NONCE" ]] || valid_nonce "$GRUEZI_PEER_NONCE" || fail 64 peer_nonce_invalid
+    case "${GRUEZI_AUTHORITY_SOURCE:-}" in
+        none | peer | assumed | external) ;;
+        *) fail 64 authority_source_invalid ;;
+    esac
+    valid_u64 "${GRUEZI_AUTHORITY_TERM:-}" || fail 64 authority_term_invalid
+    is_canonical_uint "${GRUEZI_TIMEOUT_MS:-}" && [[ "$GRUEZI_TIMEOUT_MS" != 0 ]] \
+        && big_le "$GRUEZI_TIMEOUT_MS" 86400000 || fail 64 timeout_invalid
+    case "$1" in
+        activate)
+            case "${GRUEZI_ACTIVATION_MODE:-}" in handoff | cold) ;; *) fail 64 activation_mode_invalid ;; esac ;;
+        deactivate)
+            case "${GRUEZI_DEACTIVATE_MODE:-}" in baseline | handoff_release | revoke) ;; *) fail 64 deactivate_mode_invalid ;; esac ;;
+        verify) [[ "${GRUEZI_DB_INCARNATION:-}" =~ ^[1-9][0-9]*-[0-9]+$ ]] || fail 64 incarnation_env_invalid ;;
+    esac
+    OP_DEADLINE_MS=$(($(monotonic_ms) + GRUEZI_TIMEOUT_MS))
+}
+
+operation_lock() {
+    local budget
+    budget="$(remaining_seconds)" || exit 12
+    exec {OP_LOCK_FD}>"$STATE_DIR/operation.lock"
+    flock -x -w "$budget" "$OP_LOCK_FD" || fail 12 operation_lock_timeout
+}
+
+generation_guard() {
+    local mode="$1" prior="$STATE_DIR/generation.record" instance generation
+    if [[ -e "$prior" ]]; then
+        instance="$(read_record instance "$prior")" || fail 13 generation_record_invalid
+        generation="$(read_record generation "$prior")" || fail 13 generation_record_invalid
+        valid_u64 "$generation" || fail 13 generation_record_invalid
+        if [[ "$instance" == "$GRUEZI_INSTANCE_ID" ]]; then
+            if [[ "$mode" == verify ]]; then
+                [[ "$generation" == "$GRUEZI_GENERATION" ]] || fail 64 stale_generation
+            else
+                ! big_le "$GRUEZI_GENERATION" "$generation" || fail 64 stale_generation
+            fi
+        elif [[ "$mode" == verify ]]; then
+            fail 13 active_instance_mismatch
+        fi
+    elif [[ "$mode" == verify ]]; then
+        fail 13 active_operation_missing
+    fi
+    if [[ "$mode" != verify ]]; then
+        printf 'instance=%s\ngeneration=%s\n' "$GRUEZI_INSTANCE_ID" "$GRUEZI_GENERATION" \
+            | atomic_write "$prior"
+    fi
+}
+
+query() {
+    local node="$1" statement="$2" rc=0
+    "sql_$node" "$statement" || rc=$?
+    case "$rc" in 0) ;; 2) fail 12 mariadb_timeout ;; *) fail 13 mariadb_client_failed ;; esac
+}
+
+IDENTITY_SQL='SELECT @@global.server_id,@@global.gtid_domain_id,@@global.read_only,@@global.pid_file;'
+
+local_identity() {
+    local fields=() row
+    query local "$IDENTITY_SQL"
+    [[ "$SQL_OUT" != *$'\n'* ]] || fail 13 identity_unparseable
+    row="$SQL_OUT"
+    while [[ "$row" == *$'\t'* ]]; do fields+=("${row%%$'\t'*}"); row="${row#*$'\t'}"; done
+    fields+=("$row")
+    ((${#fields[@]} == 4)) || fail 13 identity_unparseable
+    [[ "${fields[0]}" == "$CFG_OWN_SERVER_ID" && "${fields[1]}" == "$CFG_OWN_DOMAIN" ]] || fail 13 identity_mismatch
+    case "${fields[2]}" in 0 | 1) READ_ONLY="${fields[2]}" ;; *) fail 13 read_only_unparseable ;; esac
+    PROC_INCARNATION="$(derive_db_incarnation "${fields[3]}")"
+    [[ "$PROC_INCARNATION" != UNKNOWN ]] || fail 13 incarnation_unknown
+}
+
+run_verify() {
+    generation_guard verify
+    local_identity
+    local record="$STATE_DIR/active.record" recorded_instance recorded_generation recorded_incarnation
+    [[ "$PROC_INCARNATION" == "$GRUEZI_DB_INCARNATION" ]] || fail 13 incarnation_mismatch
+    recorded_instance="$(read_record instance "$record")" || fail 13 active_operation_missing
+    recorded_generation="$(read_record generation "$record")" || fail 13 active_operation_missing
+    recorded_incarnation="$(read_record proc_incarnation "$record")" || fail 13 active_operation_missing
+    [[ "$recorded_instance" == "$GRUEZI_INSTANCE_ID" && "$recorded_generation" == "$GRUEZI_GENERATION" \
+        && "$recorded_incarnation" == "$PROC_INCARNATION" ]] || fail 13 active_operation_mismatch
+    [[ "$READ_ONLY" == 0 ]] || fail 10 read_only
+    printf 'db_incarnation=%s\n' "$PROC_INCARNATION"
+}
+
+SNAPSHOT_SQL='SELECT @@global.server_id,@@global.gtid_domain_id,@@global.read_only,@@global.event_scheduler,(SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='\''UPTIME'\''),@@global.gtid_strict_mode,@@global.log_bin,@@global.log_slave_updates,@@global.binlog_format,@@global.slave_skip_errors;
+SELECT @@global.gtid_binlog_pos;
+SELECT @@global.gtid_current_pos;
+SELECT @@global.gtid_slave_pos;
+SELECT @@global.gtid_binlog_state;
+SHOW ALL SLAVES STATUS\G'
+
+snapshot() {
+    local node="$1" row fields=() rows=() parsed
+    query "$node" "$SNAPSHOT_SQL"
+    mapfile -t rows <<<"$SQL_OUT"
+    ((${#rows[@]} > 5)) || fail 13 snapshot_unparseable
+    row="${rows[0]}"
+    while [[ "$row" == *$'\t'* ]]; do fields+=("${row%%$'\t'*}"); row="${row#*$'\t'}"; done
+    fields+=("$row")
+    ((${#fields[@]} == 10)) || fail 13 snapshot_unparseable
+    S_SERVER="${fields[0]}" S_DOMAIN="${fields[1]}" S_RO="${fields[2]}" S_EVENT="${fields[3]}" S_UPTIME="${fields[4]}"
+    valid_u64 "$S_UPTIME" || fail 13 uptime_unparseable
+    if [[ "$node" == peer ]]; then
+        [[ "$S_SERVER" == "$CFG_PEER_SERVER_ID" && "$S_DOMAIN" == "$CFG_PEER_DOMAIN" ]] || fail 13 peer_identity_mismatch
+    else
+        [[ "$S_SERVER" == "$CFG_OWN_SERVER_ID" && "$S_DOMAIN" == "$CFG_OWN_DOMAIN" ]] || fail 13 identity_mismatch
+    fi
+    [[ "$S_RO" == 1 ]] || fail 10 snapshot_writable
+    [[ "$S_EVENT" == OFF ]] || fail 10 event_scheduler_enabled
+    S_POS="${rows[1]}" S_CURRENT="${rows[2]}" S_SLAVE="${rows[3]}" S_STATE="${rows[4]}"
+    local index
+    for index in 5 6 7; do
+        case "${fields[index]}" in ON | OFF) ;; *) fail 13 snapshot_unparseable ;; esac
+    done
+    case "${fields[8]}" in ROW | STATEMENT | MIXED) ;; *) fail 13 snapshot_unparseable ;; esac
+    local vector
+    for vector in "$S_POS" "$S_CURRENT" "$S_SLAVE"; do gtid_parse_rows position "$vector" >/dev/null || fail 13 gtid_parse_error; done
+    local state_rows
+    state_rows="$(gtid_parse_rows state "$S_STATE")" || fail 13 gtid_parse_error
+    REASONS=() LATCH_REASONS=() INELIGIBLE_REASONS=()
+    [[ "${fields[5]}" == ON ]] || add_latch gtid_strict_mode_violation
+    vec_semantic_check gtid_binlog_state "$state_rows"
+    vec_semantic_check gtid_slave_pos "$(gtid_parse_rows position "$S_SLAVE")"
+    vec_semantic_check gtid_binlog_pos "$(gtid_parse_rows position "$S_POS")"
+    if ((${#LATCH_REASONS[@]})); then
+        quarantine_active || write_quarantine_record "${LATCH_REASONS[0]}" "${PROC_INCARNATION:-UNKNOWN}" "$S_STATE" "$S_SLAVE" ""
+        fail 11 "${LATCH_REASONS[0]}"
+    fi
+    [[ "${fields[6]}" == ON && "${fields[7]}" == ON && "${fields[8]}" == ROW \
+        && "${fields[9]}" == OFF ]] || fail 10 snapshot_strict_preconditions_missing
+    # Normalize binlog state to sorted (domain,server,frontier) tuples. The
+    # position samples remain byte-for-byte server samples for live equality.
+    S_STATE="$(awk '$1=="R" { print $2,$3,$5 }' <<<"$state_rows" | sort -k1,1n -k2,2n \
+        | awk '{ printf "%s%s-%s-%s", sep,$1,$2,$3; sep="," }')"
+    parsed="$(printf '%s\n' "${rows[@]:5}" | awk "$REPLICA_PARSE_AWK")" || fail 13 replica_status_unparseable
+    S_IO="$(awk -F= '$1=="Slave_IO_Running" {print $2}' <<<"$parsed")"
+    S_SQL="$(awk -F= '$1=="Slave_SQL_Running" {print $2}' <<<"$parsed")"
+    [[ "$S_IO" == Yes || "$S_IO" == No || "$S_IO" == Connecting ]] || fail 13 replica_status_unparseable
+    [[ "$S_SQL" == Yes || "$S_SQL" == No ]] || fail 13 replica_status_unparseable
+    local io_errno sql_errno using_gtid io_pos
+    io_errno="$(awk -F= '$1=="Last_IO_Errno" {print $2}' <<<"$parsed")"
+    sql_errno="$(awk -F= '$1=="Last_SQL_Errno" {print $2}' <<<"$parsed")"
+    using_gtid="$(awk -F= '$1=="Using_Gtid" {print $2}' <<<"$parsed")"
+    io_pos="$(awk -F= '$1=="Gtid_IO_Pos" {print $2}' <<<"$parsed")"
+    valid_u64 "$io_errno" && valid_u64 "$sql_errno" || fail 13 replica_status_unparseable
+    if [[ "$sql_errno" != 0 ]]; then
+        quarantine_active || write_quarantine_record replication_error_sql "${PROC_INCARNATION:-UNKNOWN}" "$S_STATE" "$S_SLAVE" "$io_pos"
+        fail 11 replication_error_sql
+    fi
+    [[ "$using_gtid" == Slave_Pos || "$using_gtid" == Current_Pos ]] || fail 10 gtid_replication_not_in_use
+    gtid_parse_rows position "$io_pos" >/dev/null || fail 13 gtid_parse_error
+    awk -F= '$1=="Connection_name" {n++} $1=="Gtid_IO_Pos" {m++} END {exit n!=1 || m!=1}' <<<"$parsed" || fail 13 replica_status_unparseable
+    if awk -F= '$1 ~ /^Replicate_/ && $2!="" {found=1} END {exit !found}' <<<"$parsed"; then fail 10 replication_filter_set; fi
+    S_STATE_DIGEST="$(printf '%s' "$S_STATE" | sha256sum | cut -d' ' -f1)"
+}
+
+# Receipt carrier: fields are serialized as key=value\n, in this exact order.
+# F-15: generation is op_seq; proc incarnation never crosses the monitor channel.
+CARRIER_FIELDS=(singleton_id transfer_id server_id gruezi_instance_id generation db_incarnation
+    target_gtid_binlog_pos target_gtid_current_pos target_gtid_slave_pos target_gtid_binlog_state
+    release_nonce released_at_utc)
+CARRIER_COLUMNS="$(IFS=,; printf '%s' "${CARRIER_FIELDS[*]}"),record_digest"
+declare -A CARRIER=()
+
+carrier_canonical() {
+    local field
+    for field in "${CARRIER_FIELDS[@]}"; do printf '%s=%s\n' "$field" "${CARRIER[$field]}"; done
+}
+
+carrier_digest() { carrier_canonical | sha256sum | cut -d' ' -f1; }
+
+carrier_read() {
+    local node="$1" row fields=() i
+    query "$node" "SELECT $CARRIER_COLUMNS FROM gruezi_ha.handoff_release;"
+    [[ -n "$SQL_OUT" && "$SQL_OUT" != *$'\n'* ]] || fail 13 receipt_requires_one_row
+    row="$SQL_OUT"
+    while [[ "$row" == *$'\t'* ]]; do fields+=("${row%%$'\t'*}"); row="${row#*$'\t'}"; done
+    fields+=("$row")
+    ((${#fields[@]} == ${#CARRIER_FIELDS[@]} + 1)) || fail 13 receipt_field_count
+    CARRIER=()
+    for ((i=0; i<${#CARRIER_FIELDS[@]}; i++)); do
+        [[ "${fields[i]}" != *[!A-Za-z0-9_,.:-]* ]] || fail 13 receipt_unparseable
+        CARRIER[${CARRIER_FIELDS[i]}]="${fields[i]}"
+    done
+    CARRIER[record_digest]="${fields[i]}"
+    [[ "${CARRIER[record_digest]}" =~ ^[0-9a-f]{64}$ ]] || fail 13 receipt_digest_invalid
+    [[ "$(carrier_digest)" == "${CARRIER[record_digest]}" ]] || fail 13 receipt_digest_mismatch
+    [[ "${CARRIER[singleton_id]}" == 1 ]] || fail 13 receipt_identity_mismatch
+    valid_u64 "${CARRIER[generation]}" && [[ "${CARRIER[generation]}" != 0 ]] || fail 13 receipt_generation_invalid
+    valid_nonce "${CARRIER[release_nonce]}" || fail 13 receipt_nonce_invalid
+    valid_nonce "${CARRIER[gruezi_instance_id]}" || fail 13 receipt_instance_invalid
+}
+
+receipt_live_equal() {
+    [[ "${CARRIER[target_gtid_binlog_pos]}" == "$S_POS" \
+        && "${CARRIER[target_gtid_current_pos]}" == "$S_CURRENT" \
+        && "${CARRIER[target_gtid_slave_pos]}" == "$S_SLAVE" \
+        && "${CARRIER[target_gtid_binlog_state]}" == "$S_STATE" ]] || fail 13 receipt_live_state_mismatch
+    local server domain uptime digest extra
+    IFS=: read -r server domain uptime digest extra <<<"${CARRIER[db_incarnation]}"
+    [[ -z "$extra" && "$server" == "$S_SERVER" && "$domain" == "$S_DOMAIN" \
+        && "$digest" == "$S_STATE_DIGEST" ]] || fail 13 receipt_incarnation_mismatch
+    valid_u64 "$uptime" && big_le "$uptime" "$S_UPTIME" || fail 13 receipt_incarnation_discontinuous
+}
+
+receipt_key() { printf '%s:%s' "${CARRIER[gruezi_instance_id]}" "${CARRIER[generation]}"; }
+
+receipt_unconsumed() {
+    local key
+    key="$(receipt_key)"
+    if [[ -f "$STATE_DIR/consumed.keys" ]] && awk -v key="$key" '$0==key {found=1} END {exit !found}' "$STATE_DIR/consumed.keys"; then
+        fail 13 receipt_already_consumed
+    fi
+}
+
+consume_receipt() {
+    receipt_unconsumed
+    {
+        if [[ -f "$STATE_DIR/consumed.keys" ]]; then cat "$STATE_DIR/consumed.keys"; fi
+        printf '%s\n' "$(receipt_key)"
+    } | atomic_write "$STATE_DIR/consumed.keys"
+}
+
+assert_passive() {
+    query local 'SELECT @@global.read_only;'
+    [[ "$SQL_OUT" == 1 ]] || fail 13 passive_readback_mismatch
+}
+
+kill_sessions() {
+    local predicate="$1" ids id
+    query local "SELECT ID FROM information_schema.PROCESSLIST WHERE ID<>CONNECTION_ID() AND $predicate;"
+    ids="$SQL_OUT"
+    if [[ -n "$ids" ]]; then
+        while IFS= read -r id; do
+            valid_u64 "$id" && [[ "$id" != 0 ]] || fail 13 processlist_unparseable
+            query local "KILL CONNECTION $id;"
+        done <<<"$ids"
+    fi
+    query local "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID<>CONNECTION_ID() AND $predicate;"
+    [[ "$SQL_OUT" == 0 ]] || fail 13 sessions_not_absent
+}
+
+# The read-only monitor account is the user named in the peer option file; its
+# sessions are exempt from the application kill (F-06). Only that exact name is
+# exempt, and an unreadable or odd name fails closed instead of widening the kill.
+monitor_user() {
+    local user
+    user="$(awk -F= '$1=="user" {n++; v=$2} END {if (n==1) print v}' "$CFG_PEER_OPTION_FILE")"
+    [[ "$user" =~ ^[A-Za-z0-9_.-]+$ ]] || fail 13 monitor_user_unknown
+    printf '%s' "$user"
+}
+
+app_predicate() {
+    printf "USER NOT IN ('system user','event_scheduler') AND USER<>'%s' AND COMMAND NOT IN ('Binlog Dump','Binlog Dump GTID','Slave_IO','Slave_SQL')" "$(monitor_user)"
+}
+ACTUATOR_PREDICATE="USER=SUBSTRING_INDEX(CURRENT_USER(),'@',1)"
+
+run_deactivate() {
+    generation_guard mutate
+    trap 'compensate_deactivate' EXIT
+    trap 'exit 13' TERM INT
+    # The operation lock is already held. A dead client is not SQL cancellation:
+    # kill every observed obsolete actuator connection, not merely its query.
+    kill_sessions "$ACTUATOR_PREDICATE"
+    query local 'SET GLOBAL read_only=1;'
+    assert_passive
+    kill_sessions "$(app_predicate)"
+    query local 'SELECT COUNT(*) FROM information_schema.INNODB_TRX;'
+    [[ "$SQL_OUT" == 0 ]] || fail 13 transactions_not_absent
+    query local 'XA RECOVER;'
+    [[ -z "$SQL_OUT" ]] || fail 13 xa_not_absent
+    assert_passive
+    local_identity
+    [[ "$READ_ONLY" == 1 ]] || fail 13 passive_readback_mismatch
+    case "$GRUEZI_DEACTIVATE_MODE" in
+        handoff_release)
+            [[ "$GRUEZI_TRANSFER_ID" != 0 ]] || fail 64 release_requires_transfer
+            query local 'STOP REPLICA;'
+            snapshot local
+            [[ "$S_IO" == No && "$S_SQL" == No ]] || fail 13 appliers_not_stopped
+            # Close only the epoch belonging to this process and DB incarnation.
+            # Baseline/revoke and an unverified release never delete history.
+            local f instance incarnation
+            for f in $(dirty_records); do
+                instance="$(read_record instance "$f")" || fail 11 unresolved_dirty_epoch
+                incarnation="$(read_record proc_incarnation "$f")" || fail 11 unresolved_dirty_epoch
+                [[ "$instance" == "$GRUEZI_INSTANCE_ID" && "$incarnation" == "$PROC_INCARNATION" ]] || fail 11 unresolved_dirty_epoch
+            done
+            CARRIER=([singleton_id]=1 [transfer_id]="$GRUEZI_TRANSFER_ID" [server_id]="$CFG_OWN_SERVER_ID"
+                [gruezi_instance_id]="$GRUEZI_INSTANCE_ID" [generation]="$GRUEZI_GENERATION"
+                [db_incarnation]="$S_SERVER:$S_DOMAIN:$S_UPTIME:$S_STATE_DIGEST"
+                [target_gtid_binlog_pos]="$S_POS" [target_gtid_current_pos]="$S_CURRENT"
+                [target_gtid_slave_pos]="$S_SLAVE" [target_gtid_binlog_state]="$S_STATE"
+                [release_nonce]="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+                [released_at_utc]="$(utc_now)")
+            CARRIER[record_digest]="$(carrier_digest)"
+            local values="" field expected
+            expected="$(carrier_canonical)"
+            for field in "${CARRIER_FIELDS[@]}" record_digest; do
+                [[ -z "$values" ]] || values+=,
+                values+="'${CARRIER[$field]}'"
+            done
+            query local "SET SESSION sql_log_bin=0;
+REPLACE INTO gruezi_ha.handoff_release ($CARRIER_COLUMNS) VALUES ($values);"
+            { carrier_canonical; printf 'record_digest=%s\n' "${CARRIER[record_digest]}"; } \
+                | atomic_write "$STATE_DIR/last_release.record"
+            carrier_read local
+            [[ "$(carrier_canonical)" == "$expected" ]] || fail 13 receipt_write_readback_mismatch
+            snapshot local
+            [[ "$S_IO" == No && "$S_SQL" == No ]] || fail 13 appliers_not_stopped
+            receipt_live_equal
+            local_identity
+            [[ "$READ_ONLY" == 1 ]] || fail 13 passive_readback_mismatch
+            for f in $(dirty_records); do rm -- "$f"; done
+            rm -f -- "$STATE_DIR/dirty.pending" "$STATE_DIR/active.record"
+            fsync_path "$STATE_DIR"
+            printf 'release=verified\n'
+            ;;
+        baseline)
+            if ! quarantine_active && ! dirty_open; then
+                # START is idempotent but issued only when a thread is stopped.
+                snapshot local
+                if [[ "$S_IO" != Yes || "$S_SQL" != Yes ]]; then query local 'START REPLICA;'; fi
+            fi
+            ;;
+        revoke) ;;
+    esac
+    trap - EXIT TERM INT
+    printf 'inactive=yes\ndb_incarnation=%s\n' "$PROC_INCARNATION"
+}
+
+compensate_deactivate() {
+    local status=$?
+    trap - EXIT TERM INT
+    sql_local 'SET GLOBAL read_only=1;' || true
+    # A partially published receipt must never survive a failed release.
+    if [[ "${GRUEZI_DEACTIVATE_MODE:-}" == handoff_release ]]; then
+        sql_local 'SET SESSION sql_log_bin=0;
+DELETE FROM gruezi_ha.handoff_release;' || true
+        rm -f -- "$STATE_DIR/last_release.record"
+        fsync_path "$STATE_DIR"
+    fi
+    exit "$status"
+}
+
+declare_authoritative() {
+    local accepted="" incident="" reason="" operator=""
+    while (($#)); do
+        case "$1" in
+            --i-accept-possible-data-loss) accepted=yes ;;
+            --incident-id | --reason | --operator)
+                (($# >= 2)) || fail 64 override_arguments_invalid
+                case "$1" in --incident-id) incident="$2" ;; --reason) reason="$2" ;; --operator) operator="$2" ;; esac
+                shift ;;
+            *) fail 64 override_arguments_invalid ;;
+        esac
+        shift
+    done
+    [[ "$accepted" == yes && "$incident" =~ ^[A-Za-z0-9_.:@-]+$ \
+        && "$operator" =~ ^[A-Za-z0-9_.:@-]+$ && -n "$reason" \
+        && "$reason" != *$'\n'* && "$reason" != *$'\r'* ]] || fail 64 override_arguments_invalid
+    local_identity
+    append_audit "event=declare-authoritative incident=$incident operator=$operator operator_uid=$(id -u) reason=$reason instance=$GRUEZI_INSTANCE_ID generation=$GRUEZI_GENERATION proc_incarnation=$PROC_INCARNATION"
+    printf 'instance=%s\ngeneration=%s\nproc_incarnation=%s\nexpires_ms=%s\n' \
+        "$GRUEZI_INSTANCE_ID" "$GRUEZI_GENERATION" "$PROC_INCARNATION" "$(($(monotonic_ms)+60000))" \
+        | atomic_write "$STATE_DIR/authority.pending"
+    printf 'authorization=pending\n'
+}
+
+consume_override() {
+    local file="$STATE_DIR/authority.pending" instance generation incarnation expires
+    instance="$(read_record instance "$file")" || fail 13 override_invalid
+    generation="$(read_record generation "$file")" || fail 13 override_invalid
+    incarnation="$(read_record proc_incarnation "$file")" || fail 13 override_invalid
+    expires="$(read_record expires_ms "$file")" || fail 13 override_invalid
+    [[ "$instance" == "$GRUEZI_INSTANCE_ID" && "$generation" == "$GRUEZI_GENERATION" \
+        && "$incarnation" == "$PROC_INCARNATION" ]] || fail 13 override_identity_mismatch
+    valid_u64 "$expires" && big_le "$(monotonic_ms)" "$expires" || fail 13 override_expired
+    mv -- "$file" "$STATE_DIR/authority.consumed"
+    fsync_path "$STATE_DIR"
+    append_audit "event=authority-consumed instance=$instance generation=$generation proc_incarnation=$incarnation"
+}
+
+override_peer_check() {
+    local rc=0
+    sql_peer 'SELECT @@global.server_id,@@global.gtid_domain_id,@@global.read_only;' || rc=$?
+    if ((rc != 0)); then
+        # Only transport failure is bypassable. Permission and SQL errors are
+        # unknown evidence, not proof that a peer cannot be reached.
+        if ((rc == 2)) || [[ "$SQL_ERR" =~ ERROR[[:space:]]+(2002|2003|2006|2013) ]]; then
+            OVERRIDE_NEEDED=yes
+            return 0
+        fi
+        fail 13 peer_client_failed
+    fi
+    [[ "$SQL_OUT" == "$CFG_PEER_SERVER_ID"$'\t'"$CFG_PEER_DOMAIN"$'\t'1 ]] || fail 13 override_peer_not_verified_passive
+}
+
+enable_writes() {
+    local budget conn output pid input_fd output_fd rc=0
+    budget="$(remaining_seconds)" || exit 12
+    # The same server connection is identified, recorded durably, and then used
+    # to enable. A separate SELECT CONNECTION_ID() invocation cannot bind SQL.
+    coproc ENABLE_SQL {
+        timeout --signal=KILL "$budget" mariadb --defaults-extra-file="$CFG_LOCAL_OPTION_FILE" \
+            --connect-timeout="$CFG_CONNECT_TIMEOUT_S" --max-statement-time="$CFG_STATEMENT_TIMEOUT_S" \
+            --batch --skip-column-names --unbuffered
+    }
+    pid="$ENABLE_SQL_PID" input_fd="${ENABLE_SQL[1]}" output_fd="${ENABLE_SQL[0]}"
+    printf 'SELECT CONNECTION_ID();\n' >&"$input_fd"
+    if ! IFS= read -r -t "$budget" conn <&"$output_fd"; then fail 12 enable_connection_timeout; fi
+    valid_u64 "$conn" && [[ "$conn" != 0 ]] || fail 13 connection_id_unparseable
+    printf 'instance=%s\ngeneration=%s\nproc_incarnation=%s\nconnection_id=%s\n' \
+        "$GRUEZI_INSTANCE_ID" "$GRUEZI_GENERATION" "$PROC_INCARNATION" "$conn" \
+        | atomic_write "$STATE_DIR/operation.record"
+    printf 'instance=%s\ngeneration=%s\nproc_incarnation=%s\ntarget=%s\n' \
+        "$GRUEZI_INSTANCE_ID" "$GRUEZI_GENERATION" "$PROC_INCARNATION" "$ACTIVATION_TARGET" \
+        | atomic_write "$STATE_DIR/dirty.$GRUEZI_INSTANCE_ID.$GRUEZI_GENERATION.record"
+    # Once enable is submitted even timeout/parse/readback failure must attempt
+    # compensation; the dirty record is retained regardless of that outcome.
+    trap 'compensate_enable' EXIT
+    trap 'exit 13' TERM INT
+    printf "SET GLOBAL read_only=0;\nSELECT 'enabled';\n" >&"$input_fd"
+    if ! IFS= read -r -t "$budget" output <&"$output_fd"; then fail 12 enable_timeout; fi
+    [[ "$output" == enabled ]] || fail 13 enable_response_invalid
+    exec {input_fd}>&-
+    wait "$pid" || rc=$?
+    ((rc == 0)) || fail 13 enable_client_failed
+    local_identity
+    [[ "$READ_ONLY" == 0 && "$PROC_INCARNATION" == "$ENABLE_INCARNATION" ]] || fail 13 enable_readback_mismatch
+    printf 'instance=%s\ngeneration=%s\nproc_incarnation=%s\n' \
+        "$GRUEZI_INSTANCE_ID" "$GRUEZI_GENERATION" "$PROC_INCARNATION" \
+        | atomic_write "$STATE_DIR/active.record"
+    trap - EXIT TERM INT
+}
+
+compensate_enable() {
+    local status=$?
+    trap - EXIT TERM INT
+    # Bounded best effort only. Never turn the failed enable into success and
+    # never delete the epoch. The next deactivate kills the recorded SQL session.
+    sql_local 'SET GLOBAL read_only=1;' || true
+    exit "$status"
+}
+
+run_activate() {
+    [[ "$GRUEZI_AUTHORITY_SOURCE" != none && "$GRUEZI_AUTHORITY_TERM" != 0 ]] || fail 10 authority_missing
+    generation_guard mutate
+    quarantine_active && fail 11 quarantine_latched
+    dirty_open && fail 11 unresolved_dirty_epoch
+    local_identity
+    [[ "$READ_ONLY" == 1 ]] || fail 10 local_writable
+    ENABLE_INCARNATION="$PROC_INCARNATION"
+    local override=no check_rc=0 reason
+    OVERRIDE_NEEDED=no
+    [[ ! -f "$STATE_DIR/authority.pending" ]] || override=yes
+    run_check >/dev/null || check_rc=$?
+    if ((check_rc != 0)); then
+        # Initial formation may have empty/missing domains. Every other
+        # eligibility condition remains mandatory and convergence is checked
+        # against the reachable peer before enabling.
+        ((check_rc == 10)) || fail "$check_rc" activation_check_failed
+        for reason in "${REASONS[@]}"; do
+            case "$reason" in
+                missing_required_domain)
+                    [[ "$GRUEZI_ACTIVATION_MODE" == cold ]] || fail 10 missing_required_domain ;;
+                replica_io_thread_not_running | replication_error_io)
+                    [[ "$override" == yes ]] || fail 10 "$reason"
+                    OVERRIDE_NEEDED=yes ;;
+                *) fail "$check_rc" "$reason" ;;
+            esac
+        done
+    fi
+    local rc=0 wait_result
+    ACTIVATION_TARGET=unknown
+    if [[ "$override" == yes ]]; then
+        override_peer_check
+    fi
+    if [[ "$override" == yes && "$OVERRIDE_NEEDED" == yes ]]; then
+        consume_override
+    elif [[ "$GRUEZI_ACTIVATION_MODE" == handoff ]]; then
+        [[ "$GRUEZI_TRANSFER_ID" != 0 && -n "$GRUEZI_PEER_NONCE" ]] || fail 64 handoff_identity_missing
+        snapshot peer
+        [[ "$S_IO" == No && "$S_SQL" == No ]] || fail 13 peer_appliers_not_stopped
+        carrier_read peer
+        [[ "${CARRIER[server_id]}" == "$CFG_PEER_SERVER_ID" \
+            && "${CARRIER[gruezi_instance_id]}" == "$GRUEZI_PEER_NONCE" \
+            && "${CARRIER[transfer_id]}" == "$GRUEZI_TRANSFER_ID" ]] || fail 13 receipt_identity_mismatch
+        receipt_live_equal
+        receipt_unconsumed
+        # MASTER_GTID_WAIT ignores origin. Wait ONLY for peer-origin entries;
+        # full origin-aware coverage is a separate required check afterwards.
+        local frontier
+        frontier="$(gtid_parse_rows state "${CARRIER[target_gtid_binlog_state]}" \
+            | awk -v d="$CFG_PEER_DOMAIN" -v s="$CFG_PEER_SERVER_ID" '$1=="R" && $2==d && $3==s {printf "%s%s-%s-%s", sep,$2,$3,$5;sep=","}')"
+        [[ -n "$frontier" ]] || fail 13 peer_frontier_missing
+        sql_local "SELECT MASTER_GTID_WAIT('$frontier',$CFG_MAX_APPLY_WAIT_S);" || rc=$?
+        ((rc != 2)) || fail 12 mariadb_timeout
+        ((rc == 0)) || fail 13 mariadb_client_failed
+        wait_result="$SQL_OUT"
+        if [[ "$wait_result" == -1 && "$override" == yes ]]; then
+            # The explicit authorization can accept an unavailable target
+            # wait, but cannot turn it into coverage or a planned-handoff label.
+            consume_override
+        else
+            [[ "$wait_result" == 0 ]] || fail 13 gtid_wait_not_zero
+            # Retain parsed state in this shell; missing fields can never
+            # inherit values from the pre-wait observation.
+            run_check >/dev/null || fail "$?" post_wait_check_failed
+            local state="${CARRIER[target_gtid_binlog_state]}" slave="${CARRIER[target_gtid_slave_pos]}"
+            if [[ "$(gtid_covered state "$V_BINLOG_STATE" state "$state")" != covered=yes \
+                || ( "$(gtid_covered position "$V_SLAVE_POS" position "$slave")" != covered=yes \
+                && "$(gtid_covered state "$V_BINLOG_STATE" position "$slave")" != covered=yes ) ]]; then
+                quarantine_active || write_quarantine_record target_not_covered "$PROC_INCARNATION" "$V_BINLOG_STATE" "$V_SLAVE_POS" ""
+                fail 11 target_not_covered
+            fi
+            consume_receipt
+            ACTIVATION_TARGET="$state"
+        fi
+        # Re-read the live peer after the wait: a late applier or stale carrier
+        # invalidates the final target even if MASTER_GTID_WAIT returned zero.
+        snapshot peer
+        [[ "$S_IO" == No && "$S_SQL" == No ]] || fail 13 peer_appliers_not_stopped
+        receipt_live_equal
+    else
+        [[ ! -e "$STATE_DIR/last_release.record" && ! -e "$STATE_DIR/operation.record" ]] || fail 10 prior_write_episode
+        snapshot peer
+        query peer 'SELECT COUNT(*) FROM gruezi_ha.handoff_release;'
+        [[ "$SQL_OUT" == 0 ]] || fail 10 prior_peer_release
+        query local 'SELECT COUNT(*) FROM gruezi_ha.handoff_release;'
+        [[ "$SQL_OUT" == 0 ]] || fail 10 prior_local_release
+        query local "$LOCAL_READ_SQL"
+        parse_local_state || fail 13 "$CHECK_FATAL_REASON"
+        [[ "$(gtid_covered state "$V_BINLOG_STATE" state "$S_STATE")" == covered=yes \
+            && "$(gtid_covered state "$S_STATE" state "$V_BINLOG_STATE")" == covered=yes ]] || fail 10 cold_vectors_not_converged
+    fi
+    local_identity
+    [[ "$READ_ONLY" == 1 && "$PROC_INCARNATION" == "$ENABLE_INCARNATION" ]] || fail 13 incarnation_changed_before_enable
+    enable_writes
+    printf 'active=yes\ndb_incarnation=%s\ntarget=%s\nrpo=unknown\npossible_data_loss=yes\ndivergence=unknown\nhistory_integrity=unknown\n' \
+        "$PROC_INCARNATION" "$ACTIVATION_TARGET"
+    if [[ "$ACTIVATION_TARGET" == unknown ]]; then
+        printf 'assumption_A1=unknown\n'
+    else
+        printf 'assumption_A1=verified_barrier\n'
+    fi
+    printf 'assumption_A2=assumed_no_privileged_unlogged_writer\nassumption_A3=verified_local_assumed_peer\nassumption_A4=verified_local\nassumption_A5=verified_local\nassumption_A6=assumed_deployment_trust\n'
+    printf 'limits=unlogged_writes,privileged_writes,unlogged_DDL,nontransactional_anomalies,restores,external_effects,corruption\n'
+}
+
 main() {
     if (($# == 0)); then
         usage >&2
@@ -1473,12 +2085,17 @@ main() {
     fi
     local command="$1"
     shift
+    # B1 deliberately reuses activate_command for Verify jobs; no separate
+    # configuration key or command argv is supplied by the executor.
+    if [[ "$command" == activate && "${GRUEZI_EVENT:-}" == verify ]]; then
+        command=verify
+    fi
     case "$command" in
         help | --help | -h)
             usage
             exit "$EXIT_OK"
             ;;
-        check | quarantine-status | quarantine-clear | \
+        check | quarantine-status | quarantine-clear | activate | deactivate | verify | declare-authoritative | \
             internal-gtid-parse | internal-gtid-covers | internal-peer-vectors | \
             internal-dirty-open | internal-baseline-cleanup | internal-receipt-verify)
             ;;
@@ -1509,6 +2126,18 @@ main() {
     check_option_file "$CFG_PEER_OPTION_FILE"
 
     case "$command" in
+        activate | deactivate | verify)
+            (($# == 0)) || fail 64 unexpected_arguments
+            validate_event "$command" ;;
+        declare-authoritative) validate_event activate ;;
+    esac
+    operation_lock
+
+    case "$command" in
+        activate) run_activate ;;
+        deactivate) run_deactivate ;;
+        verify) run_verify ;;
+        declare-authoritative) declare_authoritative "$@" ;;
         check) run_check ;;
         quarantine-status) run_quarantine_status ;;
         quarantine-clear) run_quarantine_clear "$@" ;;
