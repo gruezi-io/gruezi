@@ -81,6 +81,21 @@ impl Handoff {
                 packet.resource_state,
                 AdvertResourceState::Absent | AdvertResourceState::Unmanaged
             );
+        // A release proof only speaks for the incarnation that released. A
+        // new nonce (restart) or a peer that again claims authority or a
+        // possibly held resource may own the VIP, so the unused proof is
+        // discarded; acquisition then needs fresh evidence (bootstrap,
+        // consent, grant plus fencing). Authority already granted from the
+        // proof is ownership the peer saw and is kept.
+        if matches!(self.phase, Phase::Acquiring(_))
+            && !ownership.authority().is_valid()
+            && (!peer_absent
+                || self
+                    .incoming
+                    .is_none_or(|(nonce, _)| nonce != packet.sender_nonce))
+        {
+            self.phase = Phase::Idle;
+        }
         if let Phase::Released(id) = self.phase {
             if packet.transfer_id == id {
                 if packet.transfer_phase == TransferPhase::Returned && peer_absent {
@@ -279,9 +294,50 @@ mod tests {
     use anyhow::Result;
 
     fn runtime() -> Result<HaRuntimeConfig> {
-        HaRuntimeConfig::try_from(&Config::from_yaml_str(
-            "mode: ha\nnode: {id: node-a}\nha:\n  failure_policy: strict\n  group_id: cluster-ha\n  peer_id: node-b\n  peer: 127.0.0.1:9\n  addresses: []\n  auth: {key: shared-secret-for-tests}\n",
-        )?)
+        runtime_with_policy("strict")
+    }
+
+    fn runtime_with_policy(policy: &str) -> Result<HaRuntimeConfig> {
+        HaRuntimeConfig::try_from(&Config::from_yaml_str(&format!(
+            "mode: ha\nnode: {{id: node-a}}\nha:\n  failure_policy: {policy}\n  group_id: cluster-ha\n  peer_id: node-b\n  peer: 127.0.0.1:9\n  addresses: []\n  auth: {{key: shared-secret-for-tests}}\n",
+        ))?)
+    }
+
+    #[test]
+    fn release_proof_is_discarded_once_the_releasing_peer_restarts_or_reclaims() -> Result<()> {
+        let runtime = runtime_with_policy("available")?;
+        let ownership = OwnershipController::new(ResourceManagement::Unmanaged);
+        let mut released = sample_packet();
+        released.transfer_id = 41;
+        released.transfer_phase = TransferPhase::Released;
+        released.authority_source = AdvertAuthoritySource::None;
+        released.resource_state = AdvertResourceState::Absent;
+        let restarted = super::HaPacket {
+            sender_nonce: [0x42; 16],
+            transfer_id: 0,
+            transfer_phase: TransferPhase::None,
+            ..released.clone()
+        };
+        let reclaimed = super::HaPacket {
+            transfer_phase: TransferPhase::None,
+            authority_source: AdvertAuthoritySource::Peer,
+            resource_state: AdvertResourceState::Present,
+            ..released.clone()
+        };
+        for later in [restarted, reclaimed] {
+            let mut handoff = Handoff::default();
+            handoff.observe(&runtime, &released, None, Instant::now(), &ownership);
+            handoff.observe(&runtime, &released, None, Instant::now(), &ownership);
+            assert!(handoff.allowed(), "a repeated release keeps the proof");
+            handoff.observe(&runtime, &later, None, Instant::now(), &ownership);
+            assert!(!handoff.allowed(), "stale proof survived: {later:?}");
+            handoff.observe(&runtime, &released, None, Instant::now(), &ownership);
+            assert!(
+                !handoff.allowed(),
+                "the consumed release token cannot be reused"
+            );
+        }
+        Ok(())
     }
 
     #[test]

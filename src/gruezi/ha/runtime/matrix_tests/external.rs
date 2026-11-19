@@ -358,6 +358,91 @@ async fn matrix_external_failed_withdrawal() -> Result<()> {
     harness.stop().await
 }
 
+/// GAP-2 (todo 23): a release proof belongs to the incarnation that released.
+/// A restarts (after SIGTERM with a release advert, or after SIGKILL without
+/// one), reacquires under its grant, then fails to withdraw when the grant
+/// moves to B. Fencing is unavailable, so B must never acquire.
+async fn restart_then_failed_withdrawal(cooperative: bool, row: &str) -> Result<()> {
+    let mut harness = ExternalHarness::boot();
+    settle(BOOT_WINDOW).await;
+    assert_external_owner(&harness.pair.node_a, &harness.pair.node_b);
+    if cooperative {
+        harness.pair.node_a.begin_shutdown();
+        // B holds no grant, so the transfer is never acknowledged and A exits
+        // at its bounded withdrawal deadline.
+        settle(Duration::from_millis(6_000)).await;
+        assert!(harness.pair.node_a.task.is_finished());
+        assert!(!adverts(&harness.pair.net, Side::A, TransferPhase::Released).is_empty());
+        assert_eq!(harness.pair.node_a.kernel_table(), Vec::<String>::new());
+    } else {
+        harness.pair.node_a.crash();
+        settle(Duration::ZERO).await;
+    }
+    assert_no_acquisition(&harness.pair.node_b);
+    harness.pair.node_a = spawn_with_authority(
+        Side::A,
+        harness.pair.net.restart_endpoint(Side::A),
+        external_config(Side::A),
+        harness.pair.node_a.kernel.clone(),
+        AuthorityCommandRunner::Scripted(harness.a.clone()),
+    );
+    settle(BOOT_WINDOW).await;
+    assert_external_owner(&harness.pair.node_a, &harness.pair.node_b);
+    harness.print(row, "restarted A reacquired under its grant");
+    harness
+        .pair
+        .node_a
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fail_del_addresses
+        .push("10.0.0.10/24".to_owned());
+    harness.grant_b();
+    for _ in 0..120 {
+        settle(Duration::from_millis(250)).await;
+        assert!(
+            !harness.pair.node_b.snapshot().owned,
+            "{row}: successor owned on a stale release proof"
+        );
+        assert_eq!(
+            harness.pair.node_b.kernel_table(),
+            Vec::<String>::new(),
+            "{row}: two kernel VIPs"
+        );
+    }
+    assert_no_acquisition(&harness.pair.node_b);
+    let a = harness.pair.node_a.snapshot();
+    assert!(!a.owned);
+    assert_eq!(a.resource.state, "uncertain");
+    assert_eq!(
+        harness.pair.node_a.kernel_table(),
+        vec!["eth0 10.0.0.10/24".to_owned()]
+    );
+    harness.print(
+        row,
+        "withdrawal failed; fresh grant without fencing; successor blocked; one kernel VIP",
+    );
+    harness
+        .pair
+        .node_a
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fail_del_addresses
+        .clear();
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_external_release_proof_dies_with_sigterm_restart() -> Result<()> {
+    restart_then_failed_withdrawal(true, "sigterm_restart_failed_withdrawal").await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_external_sigkill_restart_failed_withdrawal_stays_blocked() -> Result<()> {
+    restart_then_failed_withdrawal(false, "sigkill_restart_failed_withdrawal").await
+}
+
 #[tokio::test(start_paused = true)]
 async fn matrix_external_recovery_failback() -> Result<()> {
     let mut harness = ExternalHarness::boot();
