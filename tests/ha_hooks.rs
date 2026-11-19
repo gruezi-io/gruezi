@@ -1,16 +1,14 @@
 mod common;
 
 use anyhow::{Result, anyhow};
-use common::FakeIp;
+use common::{FakeIp, write_executable};
 use gruezi::gruezi::{
     ha::{HaAuth, HaRuntimeConfig, HaState, HaStatus, run_with_status},
     hooks::HaHooks,
 };
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{oneshot, watch},
@@ -147,13 +145,27 @@ async fn stop_node(shutdown_tx: oneshot::Sender<()>, task: JoinHandle<Result<()>
 }
 
 fn temp_dir(name: &str) -> Result<PathBuf> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| StdDuration::from_secs(0))
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("gruezi-{name}-{nonce}"));
-    fs::create_dir_all(&path)?;
-    Ok(path)
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut attempts = 0_u32;
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "gruezi-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempts += 1;
+                if attempts >= 16 {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn write_hook_script(dir: &Path, name: &str, output_path: &Path) -> Result<String> {
@@ -162,10 +174,7 @@ fn write_hook_script(dir: &Path, name: &str, output_path: &Path) -> Result<Strin
         "#!/usr/bin/env bash\nset -eu\nprintf '%s|%s|%s|%s|%s|%s|%s|%s\\n' \"${{GRUEZI_EVENT}}\" \"${{GRUEZI_STATE}}\" \"${{GRUEZI_PREVIOUS_STATE}}\" \"${{GRUEZI_REASON:-}}\" \"${{GRUEZI_PRIORITY}}\" \"${{GRUEZI_PEER_ID:-}}\" \"${{GRUEZI_PEER_STATE:-}}\" \"${{GRUEZI_PEER_PRIORITY:-}}\" >> \"{}\"\n",
         output_path.display()
     );
-    fs::write(&script_path, script)?;
-    let mut permissions = fs::metadata(&script_path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions)?;
+    write_executable(&script_path, &script)?;
     Ok(script_path.display().to_string())
 }
 
