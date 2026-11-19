@@ -207,5 +207,6 @@ The policy matrix evidence is scoped to task 24 for available process freeze,
 task 27 for the three failed-withdrawal rows, task 26 for all ten external
 rows, and the two consecutive 30/30 all-policy runs at
 `/home/ansible/t28/trace-head-full-1/run.out` and
-`/home/ansible/t28/trace-head-full-2/run.out`. The task 28 artifact is cited
-only for its stale-binary root-cause lesson until it reports DONE.
+`/home/ansible/t28/trace-head-full-2/run.out`. The task 28 artifact records the
+stale-binary root cause, the decisive traces, and the row-28 acceptance
+verification (Status: DONE).
