@@ -86,13 +86,23 @@ assets = [
     { source = "target/release/gruezi", dest = "/usr/bin/gruezi", mode = "0755" },
     { source = "contrib/systemd/gruezi.service", dest = "/etc/systemd/system/gruezi.service", mode = "0644" },
     { source = "contrib/systemd/gruezi.env.example", dest = "/etc/gruezi/gruezi.env", mode = "0640" },
+    { source = "contrib/mariadb/gruezi-mariadb-adapter", dest = "/usr/libexec/gruezi/gruezi-mariadb-adapter", mode = "0755" },
+    { source = "contrib/mariadb/mariadb-adapter.conf.example", dest = "/usr/share/doc/gruezi/examples/mariadb-adapter.conf.example", mode = "0644" },
+    { source = "contrib/systemd/gruezi-sysusers.conf", dest = "/usr/lib/sysusers.d/gruezi.conf", mode = "0644" },
+    { source = "contrib/systemd/gruezi-tmpfiles.conf", dest = "/usr/lib/tmpfiles.d/gruezi.conf", mode = "0644" },
 ]
+# Same account and directory setup as the Debian package (see contrib/debian/postinst).
+post_install_script = "contrib/debian/postinst"
 
 [package.metadata.deb]
 assets = [
   ["target/release/gruezi", "/usr/bin/gruezi", "755"],
   ["contrib/systemd/gruezi.service", "/etc/systemd/system/gruezi.service", "644"],
   ["contrib/systemd/gruezi.env.example", "/etc/gruezi/gruezi.env", "640"],
+  ["contrib/mariadb/gruezi-mariadb-adapter", "/usr/libexec/gruezi/gruezi-mariadb-adapter", "755"],
+  ["contrib/mariadb/mariadb-adapter.conf.example", "/usr/share/doc/gruezi/examples/mariadb-adapter.conf.example", "644"],
+  ["contrib/systemd/gruezi-sysusers.conf", "/usr/lib/sysusers.d/gruezi.conf", "644"],
+  ["contrib/systemd/gruezi-tmpfiles.conf", "/usr/lib/tmpfiles.d/gruezi.conf", "644"],
 ]
 depends = ""
 maintainer-scripts = "contrib/debian"

@@ -1,6 +1,26 @@
 #!/bin/sh
 set -e
 
+# MariaDB adapter privilege boundary: the actuator and the notification hooks run
+# as separate system accounts, and their state directories are owner-only.
+# Creation is idempotent. Option files are operator-provisioned and never written here.
+ensure_account() {
+    if getent passwd "$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    useradd --system --home-dir /nonexistent --no-create-home \
+        --shell /usr/sbin/nologin --comment "$2" "$1"
+}
+
+if command -v systemd-sysusers >/dev/null 2>&1 && command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-sysusers /usr/lib/sysusers.d/gruezi.conf
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/gruezi.conf
+else
+    ensure_account gruezi-actuator "Gruezi HA lifecycle actuator"
+    ensure_account gruezi-notify "Gruezi HA notification hooks"
+    install -d -m 0700 -o gruezi-actuator -g gruezi-actuator /etc/gruezi/mariadb /var/lib/gruezi/mariadb-adapter
+fi
+
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
     systemctl enable gruezi.service || true

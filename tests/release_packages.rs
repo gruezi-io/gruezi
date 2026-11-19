@@ -7,6 +7,8 @@
 //! upload a workflow would do next) is reached; assertions read exit statuses and
 //! the call logs, never printed prose.
 
+#[path = "release_packages/assets.rs"]
+mod assets;
 mod release_actions;
 mod release_support;
 #[path = "release_packages/tools.rs"]
