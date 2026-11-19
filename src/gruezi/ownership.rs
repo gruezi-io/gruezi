@@ -165,17 +165,89 @@ pub struct PolicyInputs {
     pub handoff_blocked: bool,
 }
 
+/// A fence request is never evidence that the peer stopped serving.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FencingState {
+    #[default]
+    None,
+    Requested,
+    Confirmed,
+}
+
+impl FencingState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Requested => "requested",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+/// Volatile external evidence. A grant's deadline is anchored at command
+/// start, and fencing proof is invalidated by fresh peer activity or revocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalAuthority {
+    grant_until: Option<Instant>,
+    fencing: FencingState,
+    term: u64,
+    active: bool,
+}
+
+impl ExternalAuthority {
+    fn evaluate(
+        &mut self,
+        elected_role: HaState,
+        ready: bool,
+        inputs: PolicyInputs,
+    ) -> AuthorityState {
+        let was_active = self.active;
+        let permitted = elected_role == HaState::Active && !inputs.handoff_blocked;
+        let grant_valid = self.grant_until.is_some_and(|until| until > Instant::now());
+        if permitted
+            && ready
+            && grant_valid
+            && (was_active
+                || inputs.bootstrap_ok
+                || inputs.handoff_allowed
+                || self.fencing == FencingState::Confirmed)
+        {
+            if !self.active {
+                self.term = self.term.saturating_add(1);
+            }
+            self.active = true;
+            return AuthorityState::Valid {
+                source: AuthoritySource::External,
+                term: self.term,
+                expiry: self.grant_until,
+            };
+        }
+        self.active = false;
+        if was_active {
+            self.fencing = FencingState::None;
+        }
+        if permitted {
+            AuthorityState::Pending
+        } else {
+            AuthorityState::None
+        }
+    }
+}
+
 /// Ownership authority provider boundary.
 ///
 /// `LocalTimeout` is the `assumed` provider: the existing local-timeout
 /// election decision. `PeerConsent` is selected by `failure_policy` and
 /// grants `peer` authority from bilateral consent (design spec 4.4): `strict`
 /// fails closed when consent lapses, `available` falls back to `assumed`
-/// semantics while consent is stale, and `external` stays fail-closed until
-/// its command provider lands. There is no fourth policy, and authority never
+/// semantics while consent is stale. `External` requires a live command grant
+/// and release or confirmed fencing evidence. Authority never
 /// survives a restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipAuthority {
+    External(ExternalAuthority),
     LocalTimeout {
         term: u64,
         active: bool,
@@ -207,6 +279,7 @@ impl OwnershipAuthority {
         inputs: PolicyInputs,
     ) -> AuthorityState {
         match self {
+            Self::External(external) => external.evaluate(elected_role, ready_to_authorize, inputs),
             Self::LocalTimeout { term, active } => {
                 Self::evaluate_assumed(term, active, elected_role, ready_to_authorize)
             }
@@ -267,9 +340,7 @@ impl OwnershipAuthority {
                         Self::evaluate_assumed(term, active, elected_role, ready_to_authorize)
                     }
                     FailurePolicy::External => {
-                        // The command authority (check_command grant with
-                        // confirmed fencing) lands with the external policy
-                        // todo; until then nothing grants, fail closed.
+                        // External grants use the separate command provider.
                         *active = false;
                         AuthorityState::Pending
                     }
@@ -322,6 +393,10 @@ impl OwnershipAuthority {
     /// Explicitly revoke authority.
     pub fn revoke(&mut self) {
         match self {
+            Self::External(external) => {
+                external.active = false;
+                external.fencing = FencingState::None;
+            }
             Self::LocalTimeout { active, .. } | Self::PeerConsent { active, .. } => {
                 *active = false;
             }
@@ -520,14 +595,59 @@ impl OwnershipController {
 
     /// Select the authority provider for the configured failure policy.
     /// `strict` and `available` are authorized by bilateral consent (with the
-    /// documented `available` fallback); `external` stays fail-closed until
-    /// its command provider lands.
+    /// documented `available` fallback); `external` requires command evidence.
     pub fn set_failure_policy(&mut self, policy: FailurePolicy) {
-        self.authority_provider = OwnershipAuthority::PeerConsent {
-            policy,
-            term: 0,
-            active: false,
+        self.authority_provider = if policy == FailurePolicy::External {
+            OwnershipAuthority::External(ExternalAuthority::default())
+        } else {
+            OwnershipAuthority::PeerConsent {
+                policy,
+                term: 0,
+                active: false,
+            }
         };
+    }
+
+    /// Apply a bounded check result. Failure immediately removes the grant;
+    /// even successful commands completing after their cutoff grant nothing.
+    pub(crate) fn observe_external_grant(&mut self, expiry: Option<Instant>) {
+        if let OwnershipAuthority::External(external) = &mut self.authority_provider {
+            external.grant_until = expiry.filter(|until| *until > Instant::now());
+        }
+    }
+
+    pub(crate) fn external_grant_expiry(&self) -> Option<Instant> {
+        match &self.authority_provider {
+            OwnershipAuthority::External(external) => external.grant_until,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fencing(&self) -> FencingState {
+        match &self.authority_provider {
+            OwnershipAuthority::External(external) => external.fencing,
+            _ => FencingState::None,
+        }
+    }
+
+    pub(crate) fn set_fencing(&mut self, state: FencingState) {
+        if let OwnershipAuthority::External(external) = &mut self.authority_provider {
+            external.fencing = state;
+        }
+    }
+
+    /// Only a live grant may initiate fencing. Neither silence nor a previous
+    /// grant's expiry is proof of release, including at lone-node startup.
+    pub(crate) fn needs_fencing(&self) -> bool {
+        matches!(&self.authority_provider, OwnershipAuthority::External(external)
+            if !external.active
+                && external.grant_until.is_some_and(|until| until > Instant::now())
+                && external.fencing != FencingState::Confirmed)
+            && self.elected_role == HaState::Active
+            && matches!(self.lifecycle, LifecyclePhase::Ready)
+            && !self.policy_inputs.bootstrap_ok
+            && !self.policy_inputs.handoff_allowed
+            && !self.policy_inputs.handoff_blocked
     }
 
     /// Record bilateral consent evidence (design spec 4.4): a fresh
@@ -825,6 +945,10 @@ impl OwnershipController {
         let valid_for_current = generation == self.generation
             && self.elected_role == HaState::Active
             && self.authority.is_valid()
+            && self
+                .authority
+                .expiry()
+                .is_none_or(|until| until > Instant::now())
             && matches!(self.lifecycle, LifecyclePhase::Ready);
 
         if !valid_for_current {

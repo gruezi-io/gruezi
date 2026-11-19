@@ -29,6 +29,7 @@ use std::{
 use tokio::{net::UdpSocket, sync::watch};
 use tracing::{debug, info, warn};
 
+mod authority_commands;
 mod handoff;
 /// Deterministic in-process datagram fabric used by the failure matrix tests
 /// (design spec 8a: an enum seam, never a trait object).
@@ -176,21 +177,56 @@ pub(super) async fn run_with_transport<F, T>(
 where
     F: Future<Output = T>,
 {
+    run_with_authority_commands(
+        runtime,
+        transport,
+        command_runner,
+        authority_commands::AuthorityCommandRunner::System,
+        status_tx,
+        shutdown,
+    )
+    .await
+}
+
+async fn run_with_authority_commands<F, T>(
+    runtime: HaRuntimeConfig,
+    transport: Transport,
+    command_runner: CommandRunner,
+    authority_runner: authority_commands::AuthorityCommandRunner,
+    status_tx: Option<watch::Sender<HaStatus>>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = T>,
+{
     let (io, local_bind, peer_addr) = open_transport(&runtime, transport).await?;
     let peer = PeerTracker::new(&runtime, peer_addr.ip(), boot_nonce()?)?;
     let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
     let (mut worker, mut loop_state) =
         spawn_worker(&runtime, command_runner, status_tx.as_ref(), peer);
     tokio::pin!(shutdown);
+    let mut authority_commands = authority_commands::AuthorityCommands::new(authority_runner);
 
     log_runtime_start(&runtime, &local_bind, peer_addr);
 
     loop {
         drain_reports(&runtime, status_tx.as_ref(), &mut loop_state, &mut worker);
-        refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
+        refresh_local_state(&runtime, &mut loop_state, &worker);
+        authority_commands.start_due(
+            &runtime,
+            &mut loop_state.ownership,
+            loop_state.peer.last_fresh_at(),
+        );
+        publish_loop_status(
+            &runtime,
+            status_tx.as_ref(),
+            &loop_state,
+            tokio::time::Instant::now().into_std(),
+        );
         if loop_state.shutdown_deadline.is_some_and(|deadline| {
             tokio::time::Instant::now() >= deadline || loop_state.handoff.acknowledged
         }) {
+            authority_commands.stop().await;
             cleanup_before_exit(
                 &runtime,
                 status_tx.as_ref(),
@@ -207,77 +243,65 @@ where
         // Wake exactly at the authority deadline so a lapsed consent is
         // handled on time instead of at the next advert tick (invariant I3).
         let authority_sleep = sleep_until_optional(loop_state.ownership.authority().expiry());
-        tokio::pin!(advert_sleep);
-        tokio::pin!(reconcile_sleep);
-        tokio::pin!(authority_sleep);
+        tokio::pin!(advert_sleep, reconcile_sleep, authority_sleep);
         let shutdown_sleep = sleep_until_optional(loop_state.shutdown_deadline);
         tokio::pin!(shutdown_sleep);
+        let command_sleep =
+            sleep_until_optional(authority_commands.deadline(&runtime, &loop_state.ownership));
+        tokio::pin!(command_sleep);
 
-        tokio::select! {
+        let event = tokio::select! {
+            () = authority_commands.complete(
+                &runtime, &mut loop_state.ownership, loop_state.peer.last_fresh_at(),
+            ) => Ok(()),
+            () = &mut command_sleep => Ok(()),
             _ = &mut shutdown, if loop_state.shutdown_deadline.is_none() => {
                 info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
+                authority_commands.stop().await;
                 if !begin_graceful_handoff(&runtime, &mut loop_state) {
                     cleanup_before_exit(
                         &runtime, status_tx.as_ref(), &mut loop_state, &mut worker, false,
                     ).await;
                     break;
                 }
+                Ok(())
             }
             Some(report) = worker.recv_report() => {
                 handle_resource_report(&runtime, status_tx.as_ref(), &mut loop_state, &worker, report);
+                Ok(())
             }
-            recv = io.recv(&mut buffer) => {
-                if let Err(error) = handle_receive_event(
-                    &runtime,
-                    status_tx.as_ref(),
-                    &mut loop_state,
-                    recv,
-                    &buffer,
-                ) {
-                    cleanup_before_exit(
-                        &runtime,
-                        status_tx.as_ref(),
-                        &mut loop_state,
-                        &mut worker,
-                        true,
-                    )
-                    .await;
-                    return Err(error);
-                }
-            }
-            () = &mut advert_sleep => {
-                if let Err(error) = handle_send_event(
-                    &io,
-                    &runtime,
-                    peer_addr,
-                    status_tx.as_ref(),
-                    &mut loop_state,
-                )
-                .await
-                {
-                    cleanup_before_exit(
-                        &runtime,
-                        status_tx.as_ref(),
-                        &mut loop_state,
-                        &mut worker,
-                        true,
-                    )
-                    .await;
-                    return Err(error);
-                }
-            }
+            recv = io.recv(&mut buffer) => handle_receive_event(
+                &runtime, status_tx.as_ref(), &mut loop_state, recv, &buffer,
+            ),
+            () = &mut advert_sleep => handle_send_event(
+                &io, &runtime, peer_addr, status_tx.as_ref(), &mut loop_state,
+            ).await,
             () = &mut reconcile_sleep => {
                 loop_state.next_reconcile_at =
                     tokio::time::Instant::now() + runtime.dead_timeout();
                 if loop_state.ownership.is_startup_reconciled() {
                     loop_state.ownership.request_reconcile(&worker);
                 }
+                Ok(())
             }
             () = &mut authority_sleep => {
                 // Authority deadline reached; the next loop iteration
                 // re-evaluates the failure policy against the consent state.
+                Ok(())
             }
-            () = &mut shutdown_sleep => {}
+            () = &mut shutdown_sleep => Ok(()),
+        };
+        if let Err(error) = event {
+            authority_commands.stop().await;
+            cleanup_before_exit(
+                &runtime,
+                status_tx.as_ref(),
+                &mut loop_state,
+                &mut worker,
+                true,
+            )
+            .await;
+            return Err(error);
         }
     }
 
@@ -439,7 +463,6 @@ fn log_runtime_start(runtime: &HaRuntimeConfig, local_bind: &str, peer_addr: std
 
 fn refresh_local_state(
     runtime: &HaRuntimeConfig,
-    status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
     worker: &ResourceWorkerHandle,
 ) {
@@ -531,7 +554,12 @@ fn refresh_local_state(
             // consent (not the election) drove this transition.
             loop_state.last_transition_reason = Some(reason);
             loop_state.last_transition_at = Some(now);
-            loop_state.last_transition_trigger = Some(TransitionTrigger::Consent);
+            loop_state.last_transition_trigger =
+                Some(if runtime.failure_policy == FailurePolicy::External {
+                    TransitionTrigger::External
+                } else {
+                    TransitionTrigger::Consent
+                });
             info!(
                 node_id = %runtime.node_id,
                 reason = %reason,
@@ -547,7 +575,6 @@ fn refresh_local_state(
         &loop_state.ownership,
         loop_state.peer.last_sent_seq().saturating_add(1),
     );
-    publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
 fn dispatch_role_hook(
@@ -691,6 +718,9 @@ fn handle_receive_event(
                 loop_state.counters.packets_received.saturating_add(1);
             match admission {
                 Admission::Fresh(packet) => {
+                    loop_state
+                        .ownership
+                        .set_fencing(crate::gruezi::ownership::FencingState::None);
                     loop_state.handoff.observe(
                         runtime,
                         &packet,

@@ -5,7 +5,7 @@ use super::{
     session::PeerRejections,
 };
 use crate::config::FailurePolicy;
-use crate::gruezi::ownership::{AuthoritySource, OwnershipController, ResourceState};
+use crate::gruezi::ownership::{AuthoritySource, FencingState, OwnershipController, ResourceState};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -27,6 +27,11 @@ pub struct AuthorityStatus {
     /// (`None` for `assumed` authority, which only ends when the elected role
     /// or the policy says so).
     pub expires_in_ms: Option<u64>,
+    /// Grant cutoff remains visible while acquisition waits for fencing.
+    #[serde(default)]
+    pub grant_expires_in_ms: Option<u64>,
+    #[serde(default)]
+    pub fencing: FencingState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +84,7 @@ pub enum TransitionTrigger {
     Consent,
     Shutdown,
     Fault,
+    External,
 }
 
 impl TransitionTrigger {
@@ -89,6 +95,7 @@ impl TransitionTrigger {
             Self::Consent => "consent",
             Self::Shutdown => "shutdown",
             Self::Fault => "fault",
+            Self::External => "external",
         }
     }
 }
@@ -151,6 +158,10 @@ fn ownership_status(
             expires_in_ms: authority.expiry().map(|expiry| {
                 duration_millis_u64(expiry.into_std().saturating_duration_since(now))
             }),
+            grant_expires_in_ms: ownership.external_grant_expiry().map(|expiry| {
+                duration_millis_u64(expiry.into_std().saturating_duration_since(now))
+            }),
+            fencing: ownership.fencing(),
         },
         SafetyStatus {
             level,

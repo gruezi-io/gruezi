@@ -12,7 +12,6 @@
 use super::{
     Transport,
     in_memory::{DropRule, InMemoryEndpoint, InMemoryNetwork, SentAdvert, Side, decode_advert},
-    run_with_transport,
 };
 use crate::{
     config::{FailurePolicy, WatchdogConfig},
@@ -34,6 +33,8 @@ use tokio::{
     task::JoinHandle,
     time::Duration,
 };
+
+mod external;
 
 const ADVERT_INTERVAL_MS: u64 = 1_000;
 const DEAD_FACTOR: u8 = 3;
@@ -189,6 +190,22 @@ fn spawn_config(
     runtime: HaRuntimeConfig,
     kernel: Arc<Mutex<SimulatedKernel>>,
 ) -> Node {
+    spawn_with_authority(
+        side,
+        endpoint,
+        runtime,
+        kernel,
+        super::authority_commands::AuthorityCommandRunner::System,
+    )
+}
+
+fn spawn_with_authority(
+    side: Side,
+    endpoint: InMemoryEndpoint,
+    runtime: HaRuntimeConfig,
+    kernel: Arc<Mutex<SimulatedKernel>>,
+    authority_runner: super::authority_commands::AuthorityCommandRunner,
+) -> Node {
     let name = match side {
         Side::A => "node-a",
         Side::B => "node-b",
@@ -203,10 +220,11 @@ fn spawn_config(
     let task = {
         let kernel = kernel.clone();
         tokio::spawn(async move {
-            run_with_transport(
+            super::run_with_authority_commands(
                 runtime,
                 Transport::InMemory(endpoint),
                 CommandRunner::Simulated(kernel),
+                authority_runner,
                 Some(status_tx),
                 async move {
                     let _ = shutdown_rx.await;
@@ -245,7 +263,7 @@ fn kernel_add_calls(node: &Node) -> Vec<Vec<String>> {
 fn print_matrix_state(row: &str, phase: &str, node: &Node) {
     let status = node.snapshot();
     println!(
-        "MATRIX[{row}] {phase} node={} state={:?} owned={} authority={} source={:?} term={} expires_in_ms={:?} safety={:?} resource={} kernel_table={:?} kernel_calls={:?}",
+        "MATRIX[{row}] {phase} node={} state={:?} owned={} authority={} source={:?} term={} expires_in_ms={:?} grant_expires_in_ms={:?} fencing={} safety={:?} resource={} kernel_table={:?} kernel_calls={:?}",
         node.name,
         status.state,
         status.owned,
@@ -253,6 +271,8 @@ fn print_matrix_state(row: &str, phase: &str, node: &Node) {
         status.authority.source,
         status.authority.term,
         status.authority.expires_in_ms,
+        status.authority.grant_expires_in_ms,
+        status.authority.fencing.as_str(),
         status.safety.level,
         status.resource.state,
         node.kernel_table(),
