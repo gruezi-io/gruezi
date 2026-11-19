@@ -117,6 +117,8 @@ for registration and health updates.
 These items came from the earlier README checklist. None has a milestone or
 acceptance criteria yet, and none is implemented.
 
+* Native netlink VIP management, dropping the `arping` and `ndsend` runtime
+  commands.
 * API authentication and TLS for the management API on `9376/tcp`.
 * Metrics export. Only OpenTelemetry traces are exported today.
 * Measured tuning of heartbeat, timer, and failover latency for HA.

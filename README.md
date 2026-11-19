@@ -25,6 +25,7 @@ systems.
 | External grant happy path | Experimental | Two-node grant acquisition, renewal beyond 20 seconds, stale-grant withdrawal, and the lone-node `fencing: requested` state are tested. |
 | `gruezi peers` listing | Experimental | The command exists, but peer discovery currently returns an empty list. |
 | Direct `start` flags | Unsupported | `gruezi start --bind/--peers/--node-id` is a stub. Use YAML only. |
+| Native netlink VIP management | Planned | VIP announcements still use the configured `arping` and `ndsend` commands. |
 | API authentication and TLS | Planned | The `9376/tcp` API has no authentication or TLS. Telemetry export has its own TLS settings. |
 | Metrics | Planned | Only OpenTelemetry traces are exported. There are no metrics. |
 | Failover timing tuning | Planned | Heartbeat, timer, and failover latency have no recorded tuning measurements. |
@@ -91,6 +92,7 @@ intentionally produce dual ownership during a partition.
 
 * [Architecture](docs/ARCHITECTURE.md), boundaries and growth path
 * [HA safety](docs/HA-SAFETY.md), policies and the complete failure matrix
+* [Checklist](docs/CHECKLIST.md), what is done and what is missing, as checkboxes
 * [Roadmap](docs/ROADMAP.md), milestones with measurable acceptance criteria
 * [Raft storage](docs/RAFT-STORAGE.md), storage evaluation
 * [Compatibility](docs/COMPATIBILITY.md), Patroni etcd3 surface
