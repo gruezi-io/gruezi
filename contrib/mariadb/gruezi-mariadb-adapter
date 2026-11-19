@@ -1,0 +1,1524 @@
+#!/usr/bin/env bash
+# gruezi-mariadb-adapter - MariaDB eligibility and quarantine foundation for
+# Gruezi strict HA (2-node pair).
+#
+# This adapter is the only component allowed to talk to the database on
+# Gruezi's behalf. Every SQL statement it issues is strictly bounded (connect
+# timeout, statement timeout, and a KILL-signal wall clock), credentials live
+# only in MySQL option files, and every value read back from the server is
+# parsed strictly: an unparseable value is never guessed at, it is exit 13.
+#
+# Safety contract (see contrib/mariadb/README.md for the full contract):
+#   * `check` is read-only and never trusts Seconds_Behind_Master.
+#   * GTID evidence is origin-aware: vectors are parsed per
+#     (domain_id, server_id, seq) tuples with checked numeric bounds, compared
+#     digit-length first and lexicographically afterwards - never as floats and
+#     never as whole strings. `gtid_binlog_state` is keyed by
+#     (domain_id, server_id) and may legitimately hold several server_ids in
+#     one domain; that multi-origin state is a QUARANTINE signal (origin
+#     conflict), never a parse error. Position vectors (gtid_binlog_pos,
+#     gtid_slave_pos, Gtid_IO_Pos) reject duplicate domains outright.
+#   * Positive divergence evidence latches a permanent quarantine record that
+#     only an explicit operator action can clear. GTID equality never clears
+#     it. A node with no prior evidence is UNKNOWN, never "clean". Divergence
+#     vocabulary is exactly `detected` or `unknown`.
+#   * This is NOT write fencing and NOT a trust root.
+#
+# Exit codes:
+#   0  ok / eligible
+#   10 ineligible (operational or configuration condition, no divergence proof)
+#   11 quarantined (positive divergence evidence, or a prior latch)
+#   12 timeout (bounded SQL exceeded its wall clock)
+#   13 unknown or unparseable evidence (includes identity, ownership and
+#      credential-hygiene refusals)
+#   64 usage error
+
+set -euo pipefail
+
+# Deterministic byte-wise string comparison for bounds checks.
+export LC_ALL=C
+
+EXIT_OK=0
+EXIT_INELIGIBLE=10
+EXIT_QUARANTINED=11
+EXIT_TIMEOUT=12
+EXIT_UNKNOWN=13
+EXIT_USAGE=64
+
+MAX_U32="4294967295"
+MAX_SEQ="18446744073709551615"
+
+usage() {
+    cat <<'EOF'
+Usage: gruezi-mariadb-adapter <command> [args]
+
+Commands:
+  check
+      Read-only eligibility report as key=value lines on stdout.
+  quarantine-status
+      Report the quarantine latch and dirty-history state.
+  quarantine-clear --i-have-reconciled-history --operator <id>
+      The ONLY way to clear a quarantine latch (explicit flag + audited
+      operator identity). Rotates the old record to
+      quarantine.cleared.<timestamp> and appends an audit line.
+
+Exit codes: 0 ok, 10 ineligible, 11 quarantined, 12 timeout,
+13 unknown/unparseable, 64 usage.
+
+Internal test-only commands exist behind GRUEZI_ADAPTER_TEST=1 and are
+refused in every other environment.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Sanitize a value destined for a key=value record: never let caller-supplied
+# content inject new lines or keys. Unknown shapes become literally "unknown".
+safe_value() {
+    local value="${1:-}"
+    if [[ "$value" =~ ^[A-Za-z0-9_.:@/,-]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf 'unknown'
+    fi
+}
+
+# big_le A B: true iff canonical decimal A <= B. Compares digit length first,
+# then digit-by-digit; never numeric coercion (mawk/bash would lose precision
+# above 2^53 and the sequence bound is 2^64-1).
+big_le() {
+    local a="$1" b="$2" i ca cb
+    if ((${#a} != ${#b})); then
+        ((${#a} < ${#b}))
+        return
+    fi
+    for ((i = 0; i < ${#a}; i++)); do
+        ca="${a:i:1}"
+        cb="${b:i:1}"
+        if [[ "$ca" != "$cb" ]]; then
+            [[ "$ca" < "$cb" ]]
+            return
+        fi
+    done
+    return 0
+}
+
+# Canonical decimal check: 0 | [1-9][0-9]*.
+is_canonical_uint() {
+    [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]
+}
+
+# fsync a file (or directory) through coreutils sync -f.
+fsync_path() { sync -f -- "$1"; }
+
+# atomic_write DEST: reads content on stdin, writes it via temp + fsync +
+# rename inside STATE_DIR so a reader never observes a partial record and a
+# crash never leaves one published.
+atomic_write() {
+    local dest="$1" tmp
+    tmp="$(mktemp "$STATE_DIR/.tmp.record.XXXXXX")"
+    cat >"$tmp"
+    chmod 600 "$tmp"
+    fsync_path "$tmp"
+    mv -f "$tmp" "$dest"
+    fsync_path "$STATE_DIR"
+}
+
+# append_audit LINE: append-only audit with an fsync per record.
+append_audit() {
+    printf '%s\n' "$1" >>"$STATE_DIR/quarantine.audit"
+    fsync_path "$STATE_DIR/quarantine.audit"
+}
+
+# ---------------------------------------------------------------------------
+# Configuration: literal key=value data, parsed as data - never sourced,
+# never expanded, never eval'd. A closed key set with every key required
+# exactly once.
+# ---------------------------------------------------------------------------
+
+CONFIG_KEYS=(
+    OWN_SERVER_ID PEER_SERVER_ID OWN_DOMAIN PEER_DOMAIN
+    LOCAL_OPTION_FILE PEER_OPTION_FILE STATE_DIR
+    CONNECT_TIMEOUT_S STATEMENT_TIMEOUT_S COMMAND_TIMEOUT_S MAX_APPLY_WAIT_S
+)
+
+config_fail() {
+    printf 'reason=config_error detail=%s\n' "$1" >&2
+    exit "$EXIT_UNKNOWN"
+}
+
+load_config() {
+    local path="$1" line n=0 key value
+    local -A seen=()
+    local owner mode
+
+    if [[ -L "$path" ]]; then
+        printf 'reason=config_symlink\n' >&2
+        exit "$EXIT_UNKNOWN"
+    fi
+    if [[ ! -f "$path" ]]; then
+        config_fail config_missing
+    fi
+    owner="$(stat -c %u -- "$path")"
+    mode="$(stat -c %a -- "$path")"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        config_fail config_owner_mismatch
+    fi
+    # The config is credential-free but integrity sensitive: never writable by
+    # anyone but its owner.
+    if ((8#$mode & 022)); then
+        config_fail config_group_or_world_writable
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" != *=* ]]; then
+            config_fail "config_syntax_line_$n"
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+            config_fail "config_bad_key_line_$n"
+        fi
+        # Values are restricted to a data character set. Shell metacharacters
+        # ($, `, ;, |, &, quotes, whitespace, ..) are rejected outright, so a
+        # config can never be interpreted as code even if a parser bug existed.
+        if [[ ! "$value" =~ ^[A-Za-z0-9_./:-]+$ ]]; then
+            config_fail "config_invalid_value_line_$n"
+        fi
+        local known=0 k
+        for k in "${CONFIG_KEYS[@]}"; do
+            if [[ "$key" == "$k" ]]; then
+                known=1
+                break
+            fi
+        done
+        if ((known == 0)); then
+            config_fail "config_unknown_key_line_$n"
+        fi
+        if [[ -n "${seen[$key]:-}" ]]; then
+            config_fail "config_duplicate_key_line_$n"
+        fi
+        seen[$key]=1
+        case "$key" in
+            OWN_SERVER_ID | PEER_SERVER_ID)
+                is_canonical_uint "$value" || config_fail "config_bad_number_$key"
+                [[ "$value" != "0" ]] || config_fail "config_bad_number_$key"
+                big_le "$value" "$MAX_U32" || config_fail "config_bad_number_$key"
+                ;;
+            OWN_DOMAIN | PEER_DOMAIN)
+                is_canonical_uint "$value" || config_fail "config_bad_number_$key"
+                big_le "$value" "$MAX_U32" || config_fail "config_bad_number_$key"
+                ;;
+            LOCAL_OPTION_FILE | PEER_OPTION_FILE | STATE_DIR)
+                [[ "$value" == /* ]] || config_fail "config_relative_path_$key"
+                ;;
+            CONNECT_TIMEOUT_S | STATEMENT_TIMEOUT_S | COMMAND_TIMEOUT_S | MAX_APPLY_WAIT_S)
+                is_canonical_uint "$value" || config_fail "config_bad_number_$key"
+                [[ "$value" != "0" ]] || config_fail "config_bad_number_$key"
+                big_le "$value" "86400" || config_fail "config_bad_number_$key"
+                ;;
+        esac
+        printf -v "CFG_$key" '%s' "$value"
+    done <"$path"
+
+    for key in "${CONFIG_KEYS[@]}"; do
+        if [[ -z "${seen[$key]:-}" ]]; then
+            config_fail "config_missing_key_$key"
+        fi
+    done
+    if [[ "$CFG_OWN_SERVER_ID" == "$CFG_PEER_SERVER_ID" ]]; then
+        config_fail config_server_ids_must_differ
+    fi
+    if [[ "$CFG_OWN_DOMAIN" == "$CFG_PEER_DOMAIN" ]]; then
+        config_fail config_domains_must_differ
+    fi
+    if [[ "$CFG_LOCAL_OPTION_FILE" == "$CFG_PEER_OPTION_FILE" ]]; then
+        config_fail config_option_files_must_differ
+    fi
+    # The state store root: every record (quarantine, dirty history, op_seq)
+    # lives beneath this directory.
+    STATE_DIR="$CFG_STATE_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Credential hygiene (B4 scope): the option files must be regular non-symlink
+# files owned by the adapter's own execution UID with mode 0600, beneath a
+# mode-0700 directory owned by the same UID; STATE_DIR follows the same rule.
+# This protects the credentials from OTHER uids. It deliberately does not
+# claim same-UID isolation (task-8/B4 scope) and it is not a trust root.
+# ---------------------------------------------------------------------------
+
+hygiene_fail() {
+    printf 'reason=%s\n' "$1" >&2
+    exit "$EXIT_UNKNOWN"
+}
+
+check_option_file() {
+    local path="$1" owner mode dir dir_owner dir_mode
+    if [[ -L "$path" ]]; then
+        hygiene_fail option_file_symlink
+    fi
+    if [[ ! -f "$path" ]]; then
+        hygiene_fail option_file_not_regular
+    fi
+    owner="$(stat -c %u -- "$path")"
+    mode="$(stat -c %a -- "$path")"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        hygiene_fail option_file_owner_mismatch
+    fi
+    if [[ "$mode" != "600" ]]; then
+        hygiene_fail option_file_mode
+    fi
+    dir="$(dirname -- "$path")"
+    if [[ -L "$dir" ]]; then
+        hygiene_fail option_dir_symlink
+    fi
+    if [[ ! -d "$dir" ]]; then
+        hygiene_fail option_dir_not_directory
+    fi
+    dir_owner="$(stat -c %u -- "$dir")"
+    dir_mode="$(stat -c %a -- "$dir")"
+    if [[ "$dir_owner" != "$(id -u)" ]]; then
+        hygiene_fail option_dir_owner_mismatch
+    fi
+    if [[ "$dir_mode" != "700" ]]; then
+        hygiene_fail option_dir_mode
+    fi
+}
+
+check_state_dir() {
+    local owner mode
+    if [[ -L "$STATE_DIR" ]]; then
+        hygiene_fail state_dir_symlink
+    fi
+    if [[ ! -d "$STATE_DIR" ]]; then
+        hygiene_fail state_dir_not_directory
+    fi
+    owner="$(stat -c %u -- "$STATE_DIR")"
+    mode="$(stat -c %a -- "$STATE_DIR")"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        hygiene_fail state_dir_owner_mismatch
+    fi
+    if [[ "$mode" != "700" ]]; then
+        hygiene_fail state_dir_mode
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Bounded SQL. sql_local / sql_peer are the only functions allowed to invoke
+# the mariadb client. SQL goes to the client on stdin (nothing sensitive on
+# argv), credentials come from the option file, and the whole invocation is
+# bounded by timeout --signal=KILL plus connect/statement timeouts.
+# ---------------------------------------------------------------------------
+
+SQL_OUT=""
+SQL_ERR=""
+SQL_CLIENT_RC=0
+
+# sql_run OPTION_FILE SQL
+# Returns 0 on success, 2 on wall-clock timeout, 3 on any other client
+# failure. Unparseable output is the caller's concern (exit 13).
+sql_run() {
+    local optfile="$1" sql="$2" rc=0 errfile
+    errfile="$(mktemp "$STATE_DIR/.tmp.stderr.XXXXXX")"
+    SQL_OUT=""
+    SQL_ERR=""
+    # errexit-safe status capture: never toggle set -e here (it is global, and
+    # re-enabling it before a nonzero return would kill the caller).
+    SQL_OUT="$(printf '%s\n' "$sql" | timeout --signal=KILL "$CFG_COMMAND_TIMEOUT_S" mariadb \
+        --defaults-extra-file="$optfile" \
+        --connect-timeout="$CFG_CONNECT_TIMEOUT_S" \
+        --max-statement-time="$CFG_STATEMENT_TIMEOUT_S" \
+        --batch --skip-column-names 2>"$errfile")" || rc=$?
+    SQL_CLIENT_RC="$rc"
+    SQL_ERR="$(head -n 1 -- "$errfile" | cut -c1-200)"
+    rm -f -- "$errfile"
+    case "$rc" in
+        0) return 0 ;;
+        # GNU timeout reports 124 for graceful termination and 137 when the
+        # KILL signal takes down the whole group; 143 covers a SIGTERM default.
+        124 | 137 | 143) return 2 ;;
+        *) return 3 ;;
+    esac
+}
+
+sql_local() { sql_run "$CFG_LOCAL_OPTION_FILE" "$1"; }
+sql_peer() { sql_run "$CFG_PEER_OPTION_FILE" "$1"; }
+
+# One bounded round trip per node: every variable read for `check` in a single
+# client invocation so the evidence is mutually consistent. The applied
+# position is ALWAYS read through its own `SELECT @@global.gtid_slave_pos`
+# statement - it is never taken from SHOW ALL SLAVES STATUS, whose
+# Gtid_Slave_Pos column is ignored even when present. Seconds_Behind_Master is
+# never requested and never read. SHOW ALL SLAVES STATUS (not the ordinary
+# SHOW REPLICA STATUS) is used because it carries Connection_name and the
+# per-channel columns for multi-source topologies.
+LOCAL_READ_SQL='SELECT @@global.server_id,@@global.gtid_domain_id,@@global.gtid_strict_mode,@@global.log_bin,@@global.log_slave_updates,@@global.binlog_format,@@global.slave_skip_errors,@@global.pid_file;
+SELECT @@global.gtid_binlog_pos;
+SELECT @@global.gtid_binlog_state;
+SELECT @@global.gtid_slave_pos;
+SHOW ALL SLAVES STATUS\G'
+
+PEER_READ_SQL='SELECT @@global.server_id,@@global.gtid_domain_id;
+SELECT @@global.gtid_binlog_pos;
+SELECT @@global.gtid_binlog_state;
+SELECT @@global.gtid_slave_pos'
+
+# ---------------------------------------------------------------------------
+# GTID vector parsing (POSIX awk only: no gawk extensions, no strtonum, no big
+# integer arithmetic - works under mawk and gawk alike).
+#
+# Grammar (strict, MariaDB gtid-set syntax):
+#   vector  := "" | element ("," element)*
+#   element := piece1 (":" piece)*
+#   piece1  := D "-" S "-" N | D "-" S "-" N "-" N2
+#   piece   := N | N "-" N2
+# Numbers are canonical decimals (no leading zeros). Bounds:
+#   domain    0..4294967295
+#   server_id 1..4294967295
+#   seq       1..18446744073709551615
+#
+# KIND selects the duplicate rule:
+#   position (gtid_binlog_pos, gtid_slave_pos, Gtid_IO_Pos): a domain may
+#     appear at most once - a second occurrence is ambiguous evidence and a
+#     parse error.
+#   state (gtid_binlog_state): keyed by (domain_id, server_id); several
+#     server_ids in one domain are structurally LEGITIMATE (multi-origin
+#     history) and surface as quarantine evidence at the evaluation layer,
+#     while a duplicated (domain_id, server_id) pair is a parse error.
+# Continuation intervals in one element imply missing sequence numbers and
+# emit a GAP row; overlapping intervals are a parse error.
+#
+# Output rows: "R domain server lo hi" per range, "G domain server from to"
+# per gap. awk prints a message to stderr and exits 1 on any error.
+# ---------------------------------------------------------------------------
+
+GTID_PARSE_AWK='
+function fail(msg) { print "gtid_parse_error: " msg > "/dev/stderr"; exit 1 }
+function is_num(t) { return (t ~ /^(0|[1-9][0-9]*)$/) }
+function le_big(a, b,   i, la, lb, ca, cb) {
+    la = length(a); lb = length(b)
+    if (la != lb) return la < lb
+    for (i = 1; i <= la; i++) {
+        ca = substr(a, i, 1); cb = substr(b, i, 1)
+        if (ca != cb) return (ca < cb)
+    }
+    return 1
+}
+function check_num(t, lo, hi, what) {
+    if (!is_num(t)) fail(what "_not_canonical_decimal")
+    if (!le_big(lo, t)) fail(what "_below_min")
+    if (!le_big(t, hi)) fail(what "_above_max")
+}
+BEGIN {
+    if (KIND != "position" && KIND != "state") fail("unknown_vector_kind")
+    MAXU32 = "4294967295"; MAXSEQ = "18446744073709551615"
+    vec = VEC
+    if (vec == "") exit 0
+    ne = split(vec, els, ",")
+    for (e = 1; e <= ne; e++) {
+        el = els[e]
+        if (el == "") fail("empty_element")
+        np = split(el, pcs, ":")
+        prev_hi = ""
+        for (p = 1; p <= np; p++) {
+            nf = split(pcs[p], f, "-")
+            if (p == 1) {
+                if (nf != 3 && nf != 4) fail("bad_field_count")
+                d = f[1]; s = f[2]
+                lo = f[3]
+                hi = (nf == 4) ? f[4] : f[3]
+            } else {
+                if (nf != 1 && nf != 2) fail("bad_interval_piece")
+                lo = f[1]
+                hi = (nf == 2) ? f[2] : f[1]
+            }
+            check_num(d, "0", MAXU32, "domain")
+            check_num(s, "1", MAXU32, "server_id")
+            check_num(lo, "1", MAXSEQ, "seq")
+            check_num(hi, "1", MAXSEQ, "seq")
+            if (!le_big(lo, hi)) fail("interval_reversed")
+            if (p == 1) {
+                if (KIND == "state") {
+                    key = d "-" s
+                    if (key in seen_key) fail("duplicate_origin")
+                } else {
+                    key = d
+                    if (key in seen_key) fail("duplicate_domain")
+                }
+                seen_key[key] = 1
+            } else {
+                if (le_big(lo, prev_hi)) fail("interval_overlap")
+                print "G", d, s, prev_hi, lo
+            }
+            print "R", d, s, lo, hi
+            prev_hi = hi
+        }
+    }
+}
+'
+
+# gtid_parse_rows KIND VECTOR: prints parse rows on stdout. Returns 1 with
+# awk's message on stderr when the vector is not strictly parseable.
+gtid_parse_rows() {
+    local kind="$1"
+    case "$kind" in
+        position | state) ;;
+        *) return 1 ;;
+    esac
+    awk -v KIND="$kind" -v VEC="$2" "$GTID_PARSE_AWK"
+}
+
+# gtid_covered LOCAL_KIND LOCAL TARGET_KIND TARGET: origin-aware frontier
+# coverage over (domain, server_id, seq) tuples. The target is covered iff
+# every target range has a LOCAL range with the SAME (domain, server_id) whose
+# end reaches at least as far. Extra local origins/domains never break
+# coverage; a wrong origin (same domain, different server_id) never covers.
+# gtid_current_pos is never an accepted target at this layer - callers pass
+# explicit vectors. KIND is position or state per the parser rules.
+gtid_covered() {
+    awk -v LKIND="$1" -v LOCALV="$2" -v TKIND="$3" -v TARGETV="$4" '
+function fail(msg) { print "gtid_parse_error: " msg > "/dev/stderr"; exit 1 }
+function is_num(t) { return (t ~ /^(0|[1-9][0-9]*)$/) }
+function le_big(a, b,   i, la, lb, ca, cb) {
+    la = length(a); lb = length(b)
+    if (la != lb) return la < lb
+    for (i = 1; i <= la; i++) {
+        ca = substr(a, i, 1); cb = substr(b, i, 1)
+        if (ca != cb) return (ca < cb)
+    }
+    return 1
+}
+function check_num(t, lo, hi, what) {
+    if (!is_num(t)) fail(what "_not_canonical_decimal")
+    if (!le_big(lo, t)) fail(what "_below_min")
+    if (!le_big(t, hi)) fail(what "_above_max")
+}
+function parse_vec(vec, tag, kind,   ne, els, e, el, np, pcs, p, nf, f, d, s, lo, hi, k, key) {
+    if (kind != "position" && kind != "state") fail("unknown_vector_kind")
+    if (vec == "") return
+    ne = split(vec, els, ",")
+    for (e = 1; e <= ne; e++) {
+        el = els[e]
+        if (el == "") fail("empty_element")
+        np = split(el, pcs, ":")
+        for (p = 1; p <= np; p++) {
+            nf = split(pcs[p], f, "-")
+            if (p == 1) {
+                if (nf != 3 && nf != 4) fail("bad_field_count")
+                d = f[1]; s = f[2]
+                lo = f[3]
+                hi = (nf == 4) ? f[4] : f[3]
+            } else {
+                if (nf != 1 && nf != 2) fail("bad_interval_piece")
+                lo = f[1]
+                hi = (nf == 2) ? f[2] : f[1]
+            }
+            check_num(d, "0", MAXU32, "domain")
+            check_num(s, "1", MAXU32, "server_id")
+            check_num(lo, "1", MAXSEQ, "seq")
+            check_num(hi, "1", MAXSEQ, "seq")
+            if (!le_big(lo, hi)) fail("interval_reversed")
+            if (p == 1) {
+                if (kind == "state") {
+                    key = tag "-o-" d "-" s
+                    if (key in seen_key) fail("duplicate_origin")
+                } else {
+                    key = tag "-d-" d
+                    if (key in seen_key) fail("duplicate_domain")
+                }
+                seen_key[key] = 1
+            } else {
+                if (le_big(lo, prev_hi[tag])) fail("interval_overlap")
+            }
+            k = ++nrange[tag]
+            range_d[tag "-" k] = d; range_s[tag "-" k] = s
+            range_lo[tag "-" k] = lo; range_hi[tag "-" k] = hi
+            prev_hi[tag] = hi
+        }
+    }
+}
+BEGIN {
+    MAXU32 = "4294967295"; MAXSEQ = "18446744073709551615"
+    parse_vec(LOCALV, "L", LKIND)
+    parse_vec(TARGETV, "T", TKIND)
+    covered = 1
+    for (t = 1; t <= nrange["T"]; t++) {
+        ok = 0
+        for (l = 1; l <= nrange["L"]; l++) {
+            if (range_d["L-" l] == range_d["T-" t] &&
+                range_s["L-" l] == range_s["T-" t] &&
+                le_big(range_hi["T-" t], range_hi["L-" l])) { ok = 1; break }
+        }
+        if (!ok) { covered = 0; break }
+    }
+    print covered ? "covered=yes" : "covered=no"
+}
+'
+}
+
+# ---------------------------------------------------------------------------
+# SHOW ALL SLAVES STATUS parsing (vertical \G output, BY FIELD NAME).
+# Unknown fields are ignored; required fields must appear exactly once with
+# parseable values; any other line is unparseable evidence. Exactly one
+# replication channel is expected in the strict two-node model - a second row
+# is multiple rows of evidence we cannot attribute and is refused. On failure
+# the program prints "__error__=<reason>" to stdout and exits 1.
+# ---------------------------------------------------------------------------
+
+REPLICA_PARSE_AWK='
+function fail(msg) { print "__error__=" msg; exit 1 }
+BEGIN {
+    rows = 0
+    while ((getline line) > 0) {
+        if (line == "") continue
+        sub(/^[ \t]+/, "", line)
+        if (line == "") continue
+        if (line ~ /^\*+[[:space:]]*[0-9]+\.[[:space:]]row[[:space:]]*\*+$/) {
+            rows++
+            if (rows > 1) fail("replica_status_multiple_rows")
+            continue
+        }
+        pos = index(line, ":")
+        if (pos < 2) fail("replica_status_unparseable_line")
+        name = substr(line, 1, pos - 1)
+        if (name !~ /^[A-Za-z_][A-Za-z0-9_]*$/) fail("replica_status_unparseable_field")
+        rest = substr(line, pos + 1)
+        if (substr(rest, 1, 1) == " ") rest = substr(rest, 2)
+        if (name in seen) fail("replica_status_duplicate_field")
+        seen[name] = 1
+        print name "=" rest
+    }
+}
+'
+
+# ---------------------------------------------------------------------------
+# Quarantine latch and dirty-history state under STATE_DIR.
+#
+# quarantine.record      active latch, written atomically, PERMANENT until
+#                        quarantine-clear --i-have-reconciled-history
+# quarantine.cleared.*   rotated record kept for forensics
+# quarantine.audit       append-only audit of latch and clear events
+# dirty.<id>.record      open dirty-history record (write-enabling operation
+#                        whose passive closure was never verified); survives
+#                        Gruezi restarts, DB restarts and deactivation
+# receipt.op_seq         monotonic one-shot consumption state for receipts
+# ---------------------------------------------------------------------------
+
+quarantine_active() { [[ -f "$STATE_DIR/quarantine.record" ]]; }
+
+dirty_records() {
+    local f
+    for f in "$STATE_DIR"/dirty.*.record; do
+        [[ -e "$f" ]] || break
+        printf '%s\n' "$f"
+    done
+}
+
+dirty_open() { [[ -n "$(dirty_records)" ]]; }
+
+write_quarantine_record() {
+    local reason="$1" incarnation="$2" binlog_state="$3" slave_pos="$4" io_pos="$5"
+    local instance generation
+    instance="$(safe_value "${GRUEZI_INSTANCE_ID:-}")"
+    generation="$(safe_value "${GRUEZI_GENERATION:-}")"
+    {
+        printf 'reason=%s\n' "$reason"
+        printf 'detected_at=%s\n' "$(utc_now)"
+        printf 'db_incarnation=%s\n' "$incarnation"
+        printf 'gruezi_instance_id=%s\n' "$instance"
+        printf 'gruezi_generation=%s\n' "$generation"
+        printf 'gtid_binlog_state=%s\n' "$binlog_state"
+        printf 'gtid_slave_pos=%s\n' "$slave_pos"
+        printf 'gtid_io_pos=%s\n' "$io_pos"
+    } | atomic_write "$STATE_DIR/quarantine.record"
+    append_audit "event=latched reason=$reason instance=$instance generation=$generation"
+}
+
+# ---------------------------------------------------------------------------
+# DB incarnation: the pid file named by @@global.pid_file plus the /proc start
+# time of that pid. Stable within one server process and different after a
+# restart. If any part of that exact identity is unavailable the result is
+# literally UNKNOWN - there is no time-derived approximation (a `now - uptime`
+# fallback would be forgeable and unstable).
+# ---------------------------------------------------------------------------
+
+derive_db_incarnation() {
+    local pidfile="$1" pid line rest starttime
+    if [[ -z "$pidfile" || "$pidfile" == "NULL" ]]; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    if [[ ! -f "$pidfile" || -L "$pidfile" ]]; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    IFS= read -r pid <"$pidfile" || true
+    if ! is_canonical_uint "$pid" || [[ "$pid" == "0" ]]; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    if [[ ! -r "/proc/$pid/stat" ]]; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    IFS= read -r line <"/proc/$pid/stat" || true
+    # /proc/<pid>/stat field 22 is starttime; the comm field (2) may contain
+    # spaces and parentheses, so parse only after the LAST ")".
+    case "$line" in
+        *") "*) rest="${line##*) }" ;;
+        *) printf 'UNKNOWN'; return 0 ;;
+    esac
+    # Fields after ") " start at field 3 (state), so starttime is the 20th.
+    # Extracted one field at a time: `read` would dump every excess field into
+    # the last variable and corrupt the value.
+    starttime="$(awk '{ print $20; exit }' <<<"$rest")"
+    if ! is_canonical_uint "$starttime"; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    printf '%s-%s' "$pid" "$starttime"
+}
+
+# ---------------------------------------------------------------------------
+# Eligibility evaluation. Every finding becomes a named reason; findings are
+# split into latch-class (positive divergence evidence) and ineligible-class
+# (operational/config conditions).
+# ---------------------------------------------------------------------------
+
+REASONS=()
+LATCH_REASONS=()
+INELIGIBLE_REASONS=()
+
+add_latch() {
+    REASONS+=("$1")
+    LATCH_REASONS+=("$1")
+}
+
+add_ineligible() {
+    REASONS+=("$1")
+    INELIGIBLE_REASONS+=("$1")
+}
+
+# vec_semantic_check KIND ROWS: validate one parsed vector against the
+# configured domain model. KIND is a label used in reports.
+#
+# Model: domains allowed exactly {OWN_DOMAIN, PEER_DOMAIN}; each domain has
+# exactly one expected origin (server_id). Anything else is positive evidence
+# of foreign or conflicting origins and latches quarantine. A missing required
+# domain in gtid_binlog_state is ineligible (a fresh node can legitimately not
+# have history yet), never silently ignored.
+vec_semantic_check() {
+    local kind="$1" rows="$2" row tag d s lo hi expected key
+    local seen_own=0 seen_peer=0
+    local -A origin_seen=() domain_origins=()
+    while IFS=' ' read -r tag d s lo hi; do
+        [[ "$tag" == "R" ]] || continue
+        if [[ "$d" == "$CFG_OWN_DOMAIN" ]]; then
+            expected="$CFG_OWN_SERVER_ID"
+            seen_own=1
+        elif [[ "$d" == "$CFG_PEER_DOMAIN" ]]; then
+            expected="$CFG_PEER_SERVER_ID"
+            seen_peer=1
+        else
+            add_latch origin_conflict
+            continue
+        fi
+        if [[ "$s" != "$expected" ]]; then
+            add_latch origin_conflict
+        fi
+        # gtid_binlog_state is keyed by (domain_id, server_id) and may hold
+        # several server_ids in one domain; that multi-origin state is a
+        # quarantine signal (same (domain, seq) under different server_id is
+        # visible exactly here), never something to average away.
+        if [[ "$kind" == "gtid_binlog_state" ]]; then
+            key="$d/$s"
+            if [[ -z "${origin_seen[$key]:-}" ]]; then
+                origin_seen[$key]=1
+                domain_origins[$d]=$((${domain_origins[$d]:-0} + 1))
+            fi
+        fi
+    done <<<"$rows"
+    if [[ "$kind" == "gtid_binlog_state" ]]; then
+        for key in "${!domain_origins[@]}"; do
+            if ((domain_origins[$key] > 1)); then
+                add_latch origin_conflict
+            fi
+        done
+    fi
+    if [[ "$kind" == "gtid_binlog_state" ]]; then
+        if ((seen_own == 0 || seen_peer == 0)); then
+            add_ineligible missing_required_domain
+        fi
+    fi
+}
+
+# Run the full local read and strict parse. On failure sets CHECK_FATAL_REASON
+# and returns 1 (caller maps to exit 12/13). On success fills the CHECK_*
+# evidence variables.
+CHECK_FATAL_REASON=""
+V_SERVER_ID=""
+V_DOMAIN=""
+V_STRICT=""
+V_LOG_BIN=""
+V_LOG_SLAVE_UPDATES=""
+V_BINLOG_FORMAT=""
+V_SLAVE_SKIP_ERRORS=""
+V_PID_FILE=""
+V_BINLOG_POS=""
+V_BINLOG_STATE=""
+V_SLAVE_POS=""
+V_IO_RUNNING=""
+V_SQL_RUNNING=""
+V_IO_ERRNO=""
+V_SQL_ERRNO=""
+V_USING_GTID=""
+V_IO_POS=""
+V_CONNECTION_NAME=""
+V_HAVE_CONNECTION_NAME=0
+V_FILTERS="none"
+R_STATE_ROWS=""
+R_SLAVE_POS_ROWS=""
+R_IO_POS_ROWS=""
+DB_INCARNATION="UNKNOWN"
+
+parse_local_state() {
+    local rows=() line_count row fields=()
+    CHECK_FATAL_REASON=""
+    mapfile -t rows <<<"$SQL_OUT"
+    line_count="${#rows[@]}"
+    if ((line_count < 4)); then
+        CHECK_FATAL_REASON=output_unparseable
+        return 1
+    fi
+    if ((line_count == 4)); then
+        CHECK_FATAL_REASON=replica_status_missing
+        return 1
+    fi
+    # Split the first row on tabs preserving empty fields (bash `read` would
+    # collapse consecutive IFS whitespace and silently shift columns).
+    row="${rows[0]}"
+    while [[ "$row" == *$'\t'* ]]; do
+        fields+=("${row%%$'\t'*}")
+        row="${row#*$'\t'}"
+    done
+    fields+=("$row")
+    if ((${#fields[@]} != 8)); then
+        CHECK_FATAL_REASON=output_unparseable
+        return 1
+    fi
+    V_SERVER_ID="${fields[0]}"
+    V_DOMAIN="${fields[1]}"
+    V_STRICT="${fields[2]}"
+    V_LOG_BIN="${fields[3]}"
+    V_LOG_SLAVE_UPDATES="${fields[4]}"
+    V_BINLOG_FORMAT="${fields[5]}"
+    V_SLAVE_SKIP_ERRORS="${fields[6]}"
+    V_PID_FILE="${fields[7]}"
+    V_BINLOG_POS="${rows[1]}"
+    V_BINLOG_STATE="${rows[2]}"
+    V_SLAVE_POS="${rows[3]}"
+
+    is_canonical_uint "$V_SERVER_ID" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
+    is_canonical_uint "$V_DOMAIN" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
+    case "$V_STRICT" in
+        ON | OFF) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    case "$V_LOG_BIN" in
+        ON | OFF) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    case "$V_LOG_SLAVE_UPDATES" in
+        ON | OFF) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    case "$V_BINLOG_FORMAT" in
+        STATEMENT | ROW | MIXED) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    # slave_skip_errors is OFF or a non-empty error list; empty is unparseable.
+    if [[ -z "$V_SLAVE_SKIP_ERRORS" ]]; then
+        CHECK_FATAL_REASON=output_unparseable
+        return 1
+    fi
+    if [[ -n "$V_PID_FILE" && ! "$V_PID_FILE" =~ ^/[A-Za-z0-9_./-]+$ ]]; then
+        CHECK_FATAL_REASON=output_unparseable
+        return 1
+    fi
+
+    if ! R_STATE_ROWS="$(gtid_parse_rows state "$V_BINLOG_STATE")"; then
+        CHECK_FATAL_REASON=gtid_parse_error
+        return 1
+    fi
+    if ! R_SLAVE_POS_ROWS="$(gtid_parse_rows position "$V_SLAVE_POS")"; then
+        CHECK_FATAL_REASON=gtid_parse_error
+        return 1
+    fi
+    if ! gtid_parse_rows position "$V_BINLOG_POS" >/dev/null; then
+        CHECK_FATAL_REASON=gtid_parse_error
+        return 1
+    fi
+
+    # SHOW ALL SLAVES STATUS, parsed by field name. Remaining lines of the
+    # batch. Exactly one channel: a second row is unattributable evidence.
+    local replica_lines replica_parsed replica_rc=0 name value
+    replica_lines="$(printf '%s\n' "${rows[@]:4}")"
+    replica_parsed="$(printf '%s\n' "$replica_lines" | awk "$REPLICA_PARSE_AWK")" || replica_rc=$?
+    if ((replica_rc != 0)); then
+        if [[ "$replica_parsed" == __error__=* ]]; then
+            CHECK_FATAL_REASON="${replica_parsed#__error__=}"
+            CHECK_FATAL_REASON="${CHECK_FATAL_REASON%%$'\n'*}"
+        else
+            CHECK_FATAL_REASON=output_unparseable
+        fi
+        return 1
+    fi
+    if [[ -z "$replica_parsed" ]]; then
+        CHECK_FATAL_REASON=replica_status_missing
+        return 1
+    fi
+    while IFS='=' read -r name value; do
+        case "$name" in
+            Slave_IO_Running) V_IO_RUNNING="$value" ;;
+            Slave_SQL_Running) V_SQL_RUNNING="$value" ;;
+            Last_IO_Errno) V_IO_ERRNO="$value" ;;
+            Last_SQL_Errno) V_SQL_ERRNO="$value" ;;
+            Using_Gtid) V_USING_GTID="$value" ;;
+            Gtid_IO_Pos) V_IO_POS="$value" ;;
+            Connection_name)
+                V_CONNECTION_NAME="$value"
+                V_HAVE_CONNECTION_NAME=1
+                ;;
+            Gtid_Slave_Pos) ;; # BANNED: applied position comes from its own SELECT.
+            Seconds_Behind_Master) ;; # BANNED as evidence - never read.
+            Replicate_*)
+                if [[ -n "$value" ]]; then
+                    V_FILTERS="set"
+                fi
+                ;;
+        esac
+    done <<<"$replica_parsed"
+
+    local req
+    for req in V_IO_RUNNING V_SQL_RUNNING V_IO_ERRNO V_SQL_ERRNO V_USING_GTID V_IO_POS; do
+        if [[ -z "${!req}" ]]; then
+            CHECK_FATAL_REASON=output_unparseable
+            return 1
+        fi
+    done
+    if ((V_HAVE_CONNECTION_NAME == 0)); then
+        CHECK_FATAL_REASON=output_unparseable
+        return 1
+    fi
+    if [[ -n "$V_CONNECTION_NAME" && ! "$V_CONNECTION_NAME" =~ ^[A-Za-z0-9_]+$ ]]; then
+        CHECK_FATAL_REASON=output_unparseable
+        return 1
+    fi
+    case "$V_IO_RUNNING" in
+        Yes | No | Connecting) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    case "$V_SQL_RUNNING" in
+        Yes | No) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    is_canonical_uint "$V_IO_ERRNO" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
+    is_canonical_uint "$V_SQL_ERRNO" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
+    case "$V_USING_GTID" in
+        No | Current_Pos | Slave_Pos) ;;
+        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
+    esac
+    if ! R_IO_POS_ROWS="$(gtid_parse_rows position "$V_IO_POS")"; then
+        CHECK_FATAL_REASON=gtid_parse_error
+        return 1
+    fi
+    DB_INCARNATION="$(derive_db_incarnation "$V_PID_FILE")"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+
+report_pair() { printf '%s=%s\n' "$1" "$2"; }
+
+run_check() {
+    local rc=0 exit_code r
+
+    if quarantine_active; then
+        add_latch quarantine_latched
+    fi
+    if dirty_open; then
+        add_latch dirty_history_open
+    fi
+
+    sql_local "$LOCAL_READ_SQL" || rc=$?
+    if ((rc != 0)); then
+        if ((rc == 2)); then
+            report_pair reason mariadb_timeout
+            exit "$EXIT_TIMEOUT"
+        fi
+        report_pair reason mariadb_client_failed
+        report_pair client_rc "$SQL_CLIENT_RC"
+        exit "$EXIT_UNKNOWN"
+    fi
+
+    if ! parse_local_state; then
+        report_pair reason "$CHECK_FATAL_REASON"
+        exit "$EXIT_UNKNOWN"
+    fi
+
+    # Identity: the live server must be who the config says it is.
+    if [[ "$V_SERVER_ID" != "$CFG_OWN_SERVER_ID" || "$V_DOMAIN" != "$CFG_OWN_DOMAIN" ]]; then
+        report_pair reason identity_mismatch
+        report_pair server_id "$V_SERVER_ID"
+        report_pair gtid_domain_id "$V_DOMAIN"
+        exit "$EXIT_UNKNOWN"
+    fi
+
+    # Latch-class evidence: permanent quarantine is reserved for positive
+    # history-integrity evidence (SQL errors, strict-mode violations, origin
+    # conflicts, binlog loss, open dirty history, prior latches).
+    if [[ "$V_STRICT" != "ON" ]]; then
+        add_latch gtid_strict_mode_violation
+    fi
+    if [[ "$V_SQL_ERRNO" != "0" ]]; then
+        add_latch replication_error_sql
+    fi
+    vec_semantic_check gtid_binlog_state "$R_STATE_ROWS"
+    vec_semantic_check gtid_slave_pos "$R_SLAVE_POS_ROWS"
+    vec_semantic_check gtid_io_pos "$R_IO_POS_ROWS"
+    # RESET MASTER / binlog loss: with log_slave_updates=ON every applied
+    # transaction is also in the local binlog, so a gtid_slave_pos entry the
+    # binlog cannot cover is shrunken history, not lag.
+    if [[ "$V_LOG_SLAVE_UPDATES" == "ON" ]] && [[ -n "$R_SLAVE_POS_ROWS" ]]; then
+        if [[ "$(gtid_covered state "$V_BINLOG_STATE" position "$V_SLAVE_POS")" != "covered=yes" ]]; then
+            add_latch history_loss
+        fi
+    fi
+
+    # Ineligible-class conditions.
+    if [[ "$V_LOG_BIN" != "ON" ]]; then
+        add_ineligible log_bin_off
+    fi
+    if [[ "$V_LOG_SLAVE_UPDATES" != "ON" ]]; then
+        add_ineligible log_slave_updates_off
+    fi
+    if [[ "$V_BINLOG_FORMAT" != "ROW" ]]; then
+        add_ineligible binlog_format_not_row
+    fi
+    if [[ "$V_SLAVE_SKIP_ERRORS" != "OFF" ]]; then
+        add_ineligible slave_skip_errors_set
+    fi
+    if [[ "$V_FILTERS" != "none" ]]; then
+        add_ineligible replication_filter_set
+    fi
+    if [[ "$V_USING_GTID" == "No" ]]; then
+        add_ineligible gtid_replication_not_in_use
+    fi
+    # Transient IO trouble (thread down or a nonzero Last_IO_Errno with a
+    # clean SQL thread) is INELIGIBLE, never a permanent latch: a healed IO
+    # path must return to eligible without any operator action.
+    if [[ "$V_IO_RUNNING" != "Yes" ]]; then
+        add_ineligible replica_io_thread_not_running
+    fi
+    if [[ "$V_IO_ERRNO" != "0" && "$V_SQL_ERRNO" == "0" ]]; then
+        add_ineligible replication_error_io
+    fi
+    if [[ "$V_SQL_RUNNING" != "Yes" && "$V_SQL_ERRNO" == "0" ]]; then
+        add_ineligible replica_sql_thread_not_running
+    fi
+    # Relay backlog: the parsed Gtid_IO_Pos vector versus the separately
+    # queried gtid_slave_pos vector, origin-aware. Equality is the healthy
+    # case; anything the applied position does not cover is backlog.
+    if [[ "$(gtid_covered position "$V_SLAVE_POS" position "$V_IO_POS")" != "covered=yes" ]]; then
+        add_ineligible relay_backlog
+    fi
+
+    # Verdict. Positive evidence (or a prior latch) is never outweighed by a
+    # currently clean state: GTID equality never clears a latch.
+    exit_code="$EXIT_OK"
+    if ((${#LATCH_REASONS[@]} > 0)); then
+        exit_code="$EXIT_QUARANTINED"
+    elif ((${#INELIGIBLE_REASONS[@]} > 0)); then
+        exit_code="$EXIT_INELIGIBLE"
+    fi
+
+    if [[ "$exit_code" == "$EXIT_QUARANTINED" ]] && ! quarantine_active; then
+        write_quarantine_record "${LATCH_REASONS[0]}" "$DB_INCARNATION" \
+            "$V_BINLOG_STATE" "$V_SLAVE_POS" "$V_IO_POS"
+    fi
+
+    # Read-only eligibility report as key=value lines.
+    local rpo0="available" divergence="unknown"
+    if [[ "$V_LOG_BIN" != "ON" || "$V_LOG_SLAVE_UPDATES" != "ON" ]]; then
+        rpo0="unavailable"
+    fi
+    if ((${#LATCH_REASONS[@]} > 0)); then
+        divergence="detected"
+    fi
+    if ((exit_code == EXIT_OK)); then
+        report_pair eligible yes
+    else
+        report_pair eligible no
+    fi
+    report_pair server_id "$V_SERVER_ID"
+    report_pair gtid_domain_id "$V_DOMAIN"
+    report_pair peer_server_id "$CFG_PEER_SERVER_ID"
+    report_pair peer_domain "$CFG_PEER_DOMAIN"
+    report_pair gtid_strict_mode "$V_STRICT"
+    report_pair log_bin "$V_LOG_BIN"
+    report_pair log_slave_updates "$V_LOG_SLAVE_UPDATES"
+    report_pair binlog_format "$V_BINLOG_FORMAT"
+    report_pair slave_skip_errors "$V_SLAVE_SKIP_ERRORS"
+    report_pair replica_io_running "$V_IO_RUNNING"
+    report_pair replica_sql_running "$V_SQL_RUNNING"
+    report_pair connection_name "$V_CONNECTION_NAME"
+    report_pair last_io_errno "$V_IO_ERRNO"
+    report_pair last_sql_errno "$V_SQL_ERRNO"
+    report_pair using_gtid "$V_USING_GTID"
+    report_pair replication_filters "$V_FILTERS"
+    report_pair gtid_binlog_pos "$V_BINLOG_POS"
+    report_pair gtid_binlog_state "$V_BINLOG_STATE"
+    report_pair gtid_slave_pos "$V_SLAVE_POS"
+    report_pair gtid_io_pos "$V_IO_POS"
+    report_pair db_incarnation "$DB_INCARNATION"
+    report_pair gruezi_instance_id "$(safe_value "${GRUEZI_INSTANCE_ID:-}")"
+    report_pair gruezi_generation "$(safe_value "${GRUEZI_GENERATION:-}")"
+    if dirty_open; then
+        report_pair dirty_history open
+    else
+        report_pair dirty_history none
+    fi
+    if quarantine_active; then
+        report_pair quarantine latched
+    else
+        report_pair quarantine none
+    fi
+    report_pair rpo0 "$rpo0"
+    report_pair divergence "$divergence"
+    report_pair history_integrity unknown
+    for r in "${REASONS[@]}"; do
+        report_pair reason "$r"
+    done
+    exit "$exit_code"
+}
+
+# ---------------------------------------------------------------------------
+# quarantine-status
+# ---------------------------------------------------------------------------
+
+run_quarantine_status() {
+    if (($# != 0)); then
+        printf 'reason=usage\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+    if dirty_open; then
+        report_pair dirty_history open
+    else
+        report_pair dirty_history none
+    fi
+    if quarantine_active; then
+        local record key value
+        record="$(cat "$STATE_DIR/quarantine.record")"
+        report_pair quarantine active
+        while IFS='=' read -r key value; do
+            case "$key" in
+                reason | detected_at | db_incarnation | gruezi_instance_id | gruezi_generation)
+                    report_pair "$key" "$value"
+                    ;;
+            esac
+        done <<<"$record"
+        exit "$EXIT_QUARANTINED"
+    fi
+    report_pair quarantine none
+    exit "$EXIT_OK"
+}
+
+# ---------------------------------------------------------------------------
+# quarantine-clear --i-have-reconciled-history --operator <id>
+# The only clear path, and it is an audited operator action: the flag names
+# the reconciliation responsibility and the operator identity is recorded.
+# Rotates the record to quarantine.cleared.<timestamp> and appends an audit
+# line. GTID equality or any automatic path can never do this.
+# ---------------------------------------------------------------------------
+
+run_quarantine_clear() {
+    local flag="" operator=""
+    while (($# > 0)); do
+        case "$1" in
+            --i-have-reconciled-history) flag=yes ;;
+            --operator=*) operator="${1#--operator=}" ;;
+            --operator)
+                if (($# < 2)); then
+                    printf 'reason=quarantine_clear_requires_flag_and_operator\n' >&2
+                    exit "$EXIT_USAGE"
+                fi
+                operator="$2"
+                shift
+                ;;
+            *)
+                printf 'reason=quarantine_clear_requires_flag_and_operator\n' >&2
+                exit "$EXIT_USAGE"
+                ;;
+        esac
+        shift
+    done
+    if [[ "$flag" != "yes" || -z "$operator" || ! "$operator" =~ ^[A-Za-z0-9_.:@-]+$ ]]; then
+        printf 'reason=quarantine_clear_requires_flag_and_operator\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+    if ! quarantine_active; then
+        report_pair quarantine none
+        exit "$EXIT_OK"
+    fi
+    local stamp prior reason instance
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    prior="quarantine.cleared.$stamp"
+    if [[ -e "$STATE_DIR/$prior" ]]; then
+        prior="quarantine.cleared.$stamp.$$"
+    fi
+    reason="$(sed -n 's/^reason=//p' "$STATE_DIR/quarantine.record" | head -n 1)"
+    instance="$(safe_value "${GRUEZI_INSTANCE_ID:-}")"
+    fsync_path "$STATE_DIR/quarantine.record"
+    mv -f -- "$STATE_DIR/quarantine.record" "$STATE_DIR/$prior"
+    append_audit "event=cleared cleared_at=$(utc_now) prior_record=$prior prior_reason=${reason:-unknown} operator=$operator operator_uid=$(id -u) instance=$instance"
+    report_pair quarantine cleared
+    report_pair prior_record "$prior"
+    exit "$EXIT_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Internal test-only surface. Guarded by GRUEZI_ADAPTER_TEST=1: a production
+# invocation refuses these commands outright. They never alter divergence or
+# quarantine semantics - they expose the pure helpers (GTID parsing, coverage,
+# state-record primitives and receipt verification) that task 8 wires into the
+# real flows.
+# ---------------------------------------------------------------------------
+
+require_test_guard() {
+    if [[ "${GRUEZI_ADAPTER_TEST:-}" != "1" ]]; then
+        printf 'reason=internal_command_refused_without_test_guard\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+}
+
+run_internal_gtid_parse() {
+    require_test_guard
+    if (($# != 2)); then
+        printf 'reason=usage\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+    local rows out="" gaps=0
+    if ! rows="$(gtid_parse_rows "$1" "$2")"; then
+        printf 'reason=gtid_parse_error\n' >&2
+        exit "$EXIT_UNKNOWN"
+    fi
+    if [[ -n "$rows" ]]; then
+        out="$(awk '$1 == "R" { printf "%s%s-%s-%s-%s", (seen ? "," : ""), $2, $3, $4, $5; seen = 1 }' <<<"$rows")"
+        gaps="$(awk '$1 == "G" { n++ } END { print n + 0 }' <<<"$rows")"
+    fi
+    printf 'vector=%s\n' "$out"
+    printf 'gaps=%s\n' "$gaps"
+    exit "$EXIT_OK"
+}
+
+run_internal_gtid_covers() {
+    require_test_guard
+    if (($# != 4)); then
+        printf 'reason=usage\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+    local result
+    if ! result="$(gtid_covered "$1" "$2" "$3" "$4")"; then
+        printf 'reason=gtid_parse_error\n' >&2
+        exit "$EXIT_UNKNOWN"
+    fi
+    printf '%s\n' "$result"
+    exit "$EXIT_OK"
+}
+
+run_internal_peer_vectors() {
+    require_test_guard
+    local rc=0
+    sql_peer "$PEER_READ_SQL" || rc=$?
+    if ((rc != 0)); then
+        if ((rc == 2)); then
+            printf 'reason=mariadb_timeout\n' >&2
+        else
+            printf 'reason=mariadb_client_failed\n' >&2
+        fi
+        exit "$EXIT_UNKNOWN"
+    fi
+    printf '%s\n' "$SQL_OUT"
+    exit "$EXIT_OK"
+}
+
+run_internal_dirty_open() {
+    require_test_guard
+    local id="" reason="" target_state="" target_pos=""
+    while (($# > 0)); do
+        case "$1" in
+            --id=*) id="${1#--id=}" ;;
+            --reason=*) reason="${1#--reason=}" ;;
+            --target-binlog-state=*) target_state="${1#--target-binlog-state=}" ;;
+            --target-slave-pos=*) target_pos="${1#--target-slave-pos=}" ;;
+            *) printf 'reason=usage\n' >&2; exit "$EXIT_USAGE" ;;
+        esac
+        shift
+    done
+    if [[ ! "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ -z "$reason" ]]; then
+        printf 'reason=usage\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+    {
+        printf 'id=%s\n' "$id"
+        printf 'reason=%s\n' "$(safe_value "$reason")"
+        printf 'status=open\n'
+        printf 'opened_at=%s\n' "$(utc_now)"
+        printf 'gruezi_instance_id=%s\n' "$(safe_value "${GRUEZI_INSTANCE_ID:-}")"
+        printf 'gruezi_generation=%s\n' "$(safe_value "${GRUEZI_GENERATION:-}")"
+        printf 'target_binlog_state=%s\n' "$(safe_value "$target_state")"
+        printf 'target_slave_pos=%s\n' "$(safe_value "$target_pos")"
+    } | atomic_write "$STATE_DIR/dirty.$id.record"
+    report_pair dirty_history open
+    report_pair id "$id"
+    exit "$EXIT_OK"
+}
+
+# The baseline cleanup path (Gruezi startup / deactivation maintenance) may
+# remove only transient temp files. Unresolved dirty-history and quarantine
+# state survive every cleanup by contract: baseline cleanup must preserve
+# unreplicated dirty history.
+run_internal_baseline_cleanup() {
+    require_test_guard
+    local f preserved_dirty=0 preserved_quarantine=no
+    for f in "$STATE_DIR"/.tmp.*; do
+        [[ -e "$f" ]] || break
+        rm -f -- "$f"
+    done
+    preserved_dirty="$(dirty_records | wc -l)"
+    if quarantine_active; then
+        preserved_quarantine=yes
+    fi
+    report_pair preserved_dirty "$preserved_dirty"
+    report_pair preserved_quarantine "$preserved_quarantine"
+    exit "$EXIT_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Release receipt primitives (task 8 consumes these; this is parse + verify +
+# one-shot op_seq consumption only - no activate/deactivate flows here).
+#
+# Receipt shape: one row of literal key=value fields:
+#   transfer_id, server_id, gruezi_instance_id, generation, db_incarnation,
+#   target_binlog_state, target_binlog_pos, target_slave_pos, release_nonce,
+#   op_seq, record_digest
+# record_digest is the sha256 of the canonical field tuple: the ten fields
+# above except record_digest, in that order, each as "key=value\n".
+#
+# Consumption semantics (F-01): op_seq single-use is a MUTATING rule. A
+# mutating verify (task 8 activate/deactivate) requires a strictly greater
+# op_seq than everything consumed for this (instance, incarnation); a
+# read-only verification of the active operation must be accepted at the same
+# op_seq when the receipt's generation is the active operation generation -
+# verification is idempotent, mutation is not. The state file records
+# active_generation so task 8 can express both.
+# ---------------------------------------------------------------------------
+
+RECEIPT_FIELDS=(transfer_id server_id gruezi_instance_id generation db_incarnation
+    target_binlog_state target_binlog_pos target_slave_pos release_nonce op_seq)
+
+receipt_fail() {
+    printf 'reason=%s\n' "$1" >&2
+    exit "$EXIT_UNKNOWN"
+}
+
+run_internal_receipt_verify() {
+    require_test_guard
+    local file="" mode="read"
+    local expect_transfer="" expect_server="" expect_instance=""
+    local expect_generation="" expect_incarnation="" expect_nonce=""
+    while (($# > 0)); do
+        case "$1" in
+            --file=*) file="${1#--file=}" ;;
+            --expect-transfer-id=*) expect_transfer="${1#--expect-transfer-id=}" ;;
+            --expect-server-id=*) expect_server="${1#--expect-server-id=}" ;;
+            --expect-instance=*) expect_instance="${1#--expect-instance=}" ;;
+            --expect-generation=*) expect_generation="${1#--expect-generation=}" ;;
+            --expect-incarnation=*) expect_incarnation="${1#--expect-incarnation=}" ;;
+            --expect-nonce=*) expect_nonce="${1#--expect-nonce=}" ;;
+            --mode=*) mode="${1#--mode=}" ;;
+            *) printf 'reason=usage\n' >&2; exit "$EXIT_USAGE" ;;
+        esac
+        shift
+    done
+    case "$mode" in
+        read | mutate) ;;
+        *) printf 'reason=usage\n' >&2; exit "$EXIT_USAGE" ;;
+    esac
+    if [[ -z "$file" || -z "$expect_transfer" || -z "$expect_server" || -z "$expect_instance" \
+        || -z "$expect_generation" || -z "$expect_incarnation" || -z "$expect_nonce" ]]; then
+        printf 'reason=usage\n' >&2
+        exit "$EXIT_USAGE"
+    fi
+    if [[ -L "$file" || ! -f "$file" ]]; then
+        receipt_fail receipt_not_regular
+    fi
+
+    local -A rec=()
+    local line key value field
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" == *=* ]] || receipt_fail receipt_unparseable
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ "$value" != *[!A-Za-z0-9_,.:@/+-]* ]] || receipt_fail receipt_unparseable
+        local known=0
+        for field in "${RECEIPT_FIELDS[@]}" record_digest; do
+            if [[ "$key" == "$field" ]]; then
+                known=1
+                break
+            fi
+        done
+        ((known == 1)) || receipt_fail receipt_unparseable
+        [[ -z "${rec[$key]:-}" ]] || receipt_fail receipt_unparseable
+        rec[$key]="$value"
+    done <"$file"
+    for field in "${RECEIPT_FIELDS[@]}" record_digest; do
+        [[ -n "${rec[$field]:-}" ]] || receipt_fail receipt_unparseable
+    done
+
+    # Recompute the digest over the canonical field tuple.
+    local canonical digest
+    canonical="$(
+        for field in "${RECEIPT_FIELDS[@]}"; do
+            printf '%s=%s\n' "$field" "${rec[$field]}"
+        done
+    )"
+    digest="$(printf '%s\n' "$canonical" | sha256sum | cut -d' ' -f1)"
+    if [[ "$digest" != "${rec[record_digest]}" ]]; then
+        receipt_fail receipt_digest_mismatch
+    fi
+
+    # Identity binding: the receipt must name exactly the expected identities.
+    [[ "${rec[transfer_id]}" == "$expect_transfer" ]] || receipt_fail receipt_identity_mismatch
+    [[ "${rec[server_id]}" == "$expect_server" ]] || receipt_fail receipt_identity_mismatch
+    [[ "${rec[gruezi_instance_id]}" == "$expect_instance" ]] || receipt_fail receipt_identity_mismatch
+    [[ "${rec[generation]}" == "$expect_generation" ]] || receipt_fail receipt_identity_mismatch
+    [[ "${rec[db_incarnation]}" == "$expect_incarnation" ]] || receipt_fail receipt_identity_mismatch
+    [[ "${rec[release_nonce]}" == "$expect_nonce" ]] || receipt_fail receipt_identity_mismatch
+    if [[ "${rec[db_incarnation]}" == "UNKNOWN" ]]; then
+        receipt_fail receipt_incarnation_unknown
+    fi
+
+    # op_seq is a canonical decimal in 1..2^64-1 and must be strictly greater
+    # than everything already consumed for this (instance, incarnation).
+    local seq="${rec[op_seq]}"
+    is_canonical_uint "$seq" || receipt_fail receipt_unparseable
+    [[ "$seq" != "0" ]] || receipt_fail receipt_unparseable
+    big_le "$seq" "$MAX_SEQ" || receipt_fail receipt_unparseable
+
+    if [[ -f "$STATE_DIR/receipt.op_seq" ]]; then
+        local state_instance state_incarnation state_seq state_generation
+        state_instance="$(sed -n 's/^gruezi_instance_id=//p' "$STATE_DIR/receipt.op_seq" | head -n 1)"
+        state_incarnation="$(sed -n 's/^db_incarnation=//p' "$STATE_DIR/receipt.op_seq" | head -n 1)"
+        state_seq="$(sed -n 's/^op_seq=//p' "$STATE_DIR/receipt.op_seq" | head -n 1)"
+        state_generation="$(sed -n 's/^active_generation=//p' "$STATE_DIR/receipt.op_seq" | head -n 1)"
+        is_canonical_uint "$state_seq" || receipt_fail receipt_unparseable
+        if [[ "$state_instance" == "${rec[gruezi_instance_id]}" \
+            && "$state_incarnation" == "${rec[db_incarnation]}" ]]; then
+            if [[ "$seq" == "$state_seq" && "$mode" == "read" \
+                && "${rec[generation]}" == "$state_generation" ]]; then
+                # Read-only verification of the active operation is
+                # idempotent: same op_seq at the active generation is fine.
+                :
+            elif big_le "$seq" "$state_seq"; then
+                # Mutating consumption is strictly single-use; an older or
+                # replayed op_seq is refused.
+                receipt_fail receipt_op_seq_stale
+            fi
+        fi
+    fi
+
+    if [[ "$mode" == "mutate" ]]; then
+        {
+            printf 'gruezi_instance_id=%s\n' "${rec[gruezi_instance_id]}"
+            printf 'db_incarnation=%s\n' "${rec[db_incarnation]}"
+            printf 'active_generation=%s\n' "${rec[generation]}"
+            printf 'op_seq=%s\n' "$seq"
+        } | atomic_write "$STATE_DIR/receipt.op_seq"
+    fi
+    report_pair receipt verified
+    report_pair mode "$mode"
+    report_pair op_seq "$seq"
+    exit "$EXIT_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+    if (($# == 0)); then
+        usage >&2
+        exit "$EXIT_USAGE"
+    fi
+    local command="$1"
+    shift
+    case "$command" in
+        help | --help | -h)
+            usage
+            exit "$EXIT_OK"
+            ;;
+        check | quarantine-status | quarantine-clear | \
+            internal-gtid-parse | internal-gtid-covers | internal-peer-vectors | \
+            internal-dirty-open | internal-baseline-cleanup | internal-receipt-verify)
+            ;;
+        *)
+            usage >&2
+            exit "$EXIT_USAGE"
+            ;;
+    esac
+
+    # Internal commands are refused before anything else runs in an
+    # environment without the test guard.
+    case "$command" in
+        internal-*) require_test_guard ;;
+    esac
+
+    # The adapter is inert as root: the packaged actuator identity owns the
+    # credentials and the state, and root execution would defeat every DAC
+    # claim this script makes.
+    if [[ "$(id -u)" == "0" ]]; then
+        printf 'reason=root_execution_refused\n' >&2
+        exit "$EXIT_UNKNOWN"
+    fi
+
+    local config_path="${GRUEZI_MARIADB_ADAPTER_CONF:-/etc/gruezi/mariadb-adapter.conf}"
+    load_config "$config_path"
+    check_state_dir
+    check_option_file "$CFG_LOCAL_OPTION_FILE"
+    check_option_file "$CFG_PEER_OPTION_FILE"
+
+    case "$command" in
+        check) run_check ;;
+        quarantine-status) run_quarantine_status ;;
+        quarantine-clear) run_quarantine_clear "$@" ;;
+        internal-gtid-parse) run_internal_gtid_parse "$@" ;;
+        internal-gtid-covers) run_internal_gtid_covers "$@" ;;
+        internal-peer-vectors) run_internal_peer_vectors "$@" ;;
+        internal-dirty-open) run_internal_dirty_open "$@" ;;
+        internal-baseline-cleanup) run_internal_baseline_cleanup "$@" ;;
+        internal-receipt-verify) run_internal_receipt_verify "$@" ;;
+    esac
+}
+
+main "$@"

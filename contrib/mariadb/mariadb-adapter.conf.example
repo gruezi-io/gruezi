@@ -1,0 +1,42 @@
+# gruezi-mariadb-adapter configuration - credential-free example.
+#
+# This file is DATA, never shell: it is parsed as literal key=value lines with
+# a closed key set. Every key is required exactly once. Unknown keys,
+# duplicate keys, relative paths, and any shell metacharacter ($, `, ;, |, &,
+# quotes, whitespace, ...) are rejected. Comments (#) and blank lines are the
+# only other accepted lines.
+#
+# Install as /etc/gruezi/mariadb-adapter.conf (or point
+# GRUEZI_MARIADB_ADAPTER_CONF at another path). Keep it owned by the adapter's
+# execution UID and not writable by group or other.
+#
+# The option files named below hold ALL credentials (user/password/host) in
+# MySQL option-file syntax and must be regular non-symlink files with mode
+# 0600, owned by the adapter's execution UID, inside a mode-0700 directory
+# owned by the same UID. This protects the credentials from other UIDs;
+# same-UID isolation is explicitly out of scope here.
+
+# Identity of the two-node pair: one GTID domain per node, one writer per
+# domain. server_ids and domains must differ between the two nodes.
+OWN_SERVER_ID=1
+PEER_SERVER_ID=2
+OWN_DOMAIN=0
+PEER_DOMAIN=1
+
+# Option files (all credentials live here, never on any command line).
+LOCAL_OPTION_FILE=/etc/gruezi/mariadb/local.cnf
+PEER_OPTION_FILE=/etc/gruezi/mariadb/peer.cnf
+
+# Persistent adapter state (quarantine, dirty history, receipt consumption).
+# Must exist as a mode-0700 directory owned by the adapter's execution UID.
+STATE_DIR=/var/lib/gruezi/mariadb-adapter
+
+# Bounded SQL, in seconds. Every mariadb client call runs under
+# timeout --signal=KILL COMMAND_TIMEOUT_S with the connect and statement
+# timeouts set below. All must be 1..86400.
+CONNECT_TIMEOUT_S=2
+STATEMENT_TIMEOUT_S=5
+COMMAND_TIMEOUT_S=8
+
+# Upper bound for future bounded MASTER_GTID_WAIT catch-up (task 8).
+MAX_APPLY_WAIT_S=10
