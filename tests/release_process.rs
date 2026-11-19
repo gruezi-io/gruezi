@@ -6,6 +6,9 @@
 
 mod release_support;
 
+#[path = "release_support/gh_contract.rs"]
+mod gh_contract;
+
 use anyhow::{Result, anyhow};
 use release_support::{ReleaseFixture, text, write_executable};
 use std::{fs, process::Output};
@@ -14,11 +17,9 @@ const REFUSAL_MARKER: &str = "bump: ";
 const RETRY_PUSH: &str = "git push origin HEAD:refs/heads/develop";
 
 fn configure_release_gh(fixture: &ReleaseFixture, mode: &str) -> Result<()> {
+    let contract = include_str!("release_support/gh_contract.sh");
     let script = format!(
-        r#"#!/bin/bash
-set -eu
-ctl="$(cd "$(dirname "$0")" && pwd -P)"
-printf '%s\n' "$*" >> "$ctl/gh.log"
+        r#"{contract}
 case "${{1:-}} ${{2:-}}" in
   "repo view")
     [[ "{mode}" != api-error ]] || {{ echo "fixture API outage" >&2; exit 1; }}

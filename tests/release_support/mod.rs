@@ -79,8 +79,8 @@ test)
 esac
 "#;
 
-/// Fake `gh`: a publication boundary that only records that it was reached.
-const FAKE_GH: &str = "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/gh.log\"\n";
+/// Shared gh argument contract, also used by the scripted release fake.
+const FAKE_GH: &str = include_str!("gh_contract.sh");
 
 pub struct ReleaseFixture {
     root: PathBuf,

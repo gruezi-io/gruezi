@@ -208,14 +208,14 @@ release:
     }
     trap recovery ERR
 
-    gh workflow run release.yml --ref develop \
+    gh workflow run release.yml -R "${repo}" --ref develop \
         -f "expected_sha=${sha}" -f "dispatch_id=${dispatch_id}"
     run=""
     for _ in $(seq 30); do
         run="$(
-            gh run list --workflow release.yml --branch develop --event workflow_dispatch --limit 100 \
-                --json databaseId,name,workflowName,event,headSha,headBranch,url,repository \
-                --jq '.[] | select(.name == "'"${marker}"'" and .workflowName == "Release" and .event == "workflow_dispatch" and .headBranch == "develop" and .headSha == "'"${sha}"'" and .repository.full_name == "'"${repo}"'") | .databaseId' |
+            gh run list -R "${repo}" --workflow release.yml --branch develop --event workflow_dispatch --limit 100 \
+                --json databaseId,name,workflowName,event,headSha,headBranch,url \
+                --jq '.[] | select(.name == "'"${marker}"'" and .workflowName == "Release" and .event == "workflow_dispatch" and .headBranch == "develop" and .headSha == "'"${sha}"'") | .databaseId' |
                 head -n 1
         )"
         [[ -n "${run}" ]] && break
@@ -223,8 +223,8 @@ release:
     done
     [[ -n "${run}" ]] || { echo "release: no run appeared for ${marker}" >&2; exit 1; }
     url="$(
-        gh run view "${run}" --json databaseId,name,workflowName,event,headSha,headBranch,url,repository \
-            --jq 'select(.name == "'"${marker}"'" and .workflowName == "Release" and .event == "workflow_dispatch" and .headBranch == "develop" and .headSha == "'"${sha}"'" and .repository.full_name == "'"${repo}"'") | .url'
+        gh run view "${run}" -R "${repo}" --json databaseId,name,workflowName,event,headSha,headBranch,url \
+            --jq 'select(.name == "'"${marker}"'" and .workflowName == "Release" and .event == "workflow_dispatch" and .headBranch == "develop" and .headSha == "'"${sha}"'") | .url'
     )"
     [[ -n "${url}" ]] || { echo "release: correlated run ${run} failed identity validation" >&2; exit 1; }
     trap - ERR
@@ -232,9 +232,9 @@ release:
     gh run watch "${run}" --exit-status || { recovery; exit 1; }
 
     ci="$(
-        gh run list --workflow build.yml --branch develop --event push --commit "${sha}" --limit 100 \
-            --json databaseId,workflowName,event,headSha,headBranch,repository \
-            --jq '.[] | select(.workflowName == "Test & Build" and .event == "push" and .headBranch == "develop" and .headSha == "'"${sha}"'" and .repository.full_name == "'"${repo}"'") | .databaseId' |
+        gh run list -R "${repo}" --workflow build.yml --branch develop --event push --commit "${sha}" --limit 100 \
+            --json databaseId,workflowName,event,headSha,headBranch \
+            --jq '.[] | select(.workflowName == "Test & Build" and .event == "push" and .headBranch == "develop" and .headSha == "'"${sha}"'") | .databaseId' |
             head -n 1
     )"
     [[ -n "${ci}" ]] || { echo "release: no trusted Test & Build run for ${sha}" >&2; exit 1; }
