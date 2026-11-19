@@ -103,10 +103,22 @@ fn snapshot_lines(status: &gruezi::status::StatusResponse) -> Vec<String> {
             ha.resource.last_error
         ));
         lines.push(format!(
-            "  Authority: {} source={} term={}",
+            "  Authority: {} source={} term={} expires_in_ms={:?} grant_expires_in_ms={:?} fencing={}",
             ha.authority.state,
             ha.authority.source.map_or("none", |source| source.as_str()),
-            ha.authority.term
+            ha.authority.term,
+            ha.authority.expires_in_ms,
+            ha.authority.grant_expires_in_ms,
+            ha.authority.fencing.as_str()
+        ));
+        lines.push(format!("  Failure Policy: {}", ha.failure_policy));
+        lines.push(format!(
+            "  Watchdog: mode={} armed={} effective_timeout_ms={:?} last_feed_ago_ms={:?} unprotected={}",
+            ha.watchdog.mode,
+            ha.watchdog.armed,
+            ha.watchdog.effective_timeout_ms,
+            ha.watchdog.last_feed_ago_ms,
+            ha.watchdog.unprotected
         ));
         lines.push(format!(
             "  Safety: {} ({})",
@@ -162,6 +174,14 @@ fn snapshot_lines(status: &gruezi::status::StatusResponse) -> Vec<String> {
             ha.last_transition_ms_ago
                 .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms}ms"))
         ));
+        if let Some(transition) = ha.last_transition {
+            lines.push(format!(
+                "  Last Transition Detail: reason={} trigger={} ago_ms={}",
+                transition.reason,
+                transition.trigger.as_str(),
+                transition.ago_ms
+            ));
+        }
     }
 
     lines
@@ -179,7 +199,7 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
         let session_rejections = rejection_pairs(&ha.peer_session.rejections);
 
         format!(
-            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} safety={} safety_why={:?} reason={} last_transition_reason={} peer_alive={} peer_node={} peer_state={} peer_reachable={} session_established={} session_rejections={:?} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
+            "[{timestamp}] node={} elected_role={:?} owned={} resource={} confirmed={} observed_ago_ms={:?} last_error={:?} authority={} authority_source={} term={} authority_expires_in_ms={:?} grant_expires_in_ms={:?} fencing={} failure_policy={} watchdog_mode={} watchdog_armed={} watchdog_effective_timeout_ms={:?} watchdog_last_feed_ago_ms={:?} watchdog_unprotected={} safety={} safety_why={:?} reason={} last_transition_reason={} last_transition_trigger={} last_transition_ago_ms={} peer_alive={} peer_node={} peer_state={} peer_reachable={} session_established={} session_rejections={:?} seq={} sent={} recv={} invalid={} auth_failures={} duplicate_node_id_packets={} last_peer_seen={} last_transition={}",
             ha.node_id,
             ha.state,
             ha.owned,
@@ -190,11 +210,26 @@ fn format_watch_line(timestamp: &str, status: &gruezi::status::StatusResponse) -
             ha.authority.state,
             ha.authority.source.map_or("none", |source| source.as_str()),
             ha.authority.term,
+            ha.authority.expires_in_ms,
+            ha.authority.grant_expires_in_ms,
+            ha.authority.fencing.as_str(),
+            ha.failure_policy,
+            ha.watchdog.mode,
+            ha.watchdog.armed,
+            ha.watchdog.effective_timeout_ms,
+            ha.watchdog.last_feed_ago_ms,
+            ha.watchdog.unprotected,
             ha.safety.level.as_str(),
             ha.safety.why,
             ha.decision_reason,
             ha.last_transition_reason
                 .map_or_else(|| "unknown".to_owned(), |reason| reason.to_string()),
+            ha.last_transition
+                .map_or("unknown", |transition| transition.trigger.as_str()),
+            ha.last_transition.map_or_else(
+                || "unknown".to_owned(),
+                |transition| transition.ago_ms.to_string()
+            ),
             ha.peer_alive,
             peer_node_id,
             peer_state,
@@ -223,9 +258,10 @@ mod tests {
         HaDecisionReason, HaState, HaStatus, PeerRejections, PeerSessionStatus,
     };
     use crate::gruezi::status::StatusResponse;
+    use crate::gruezi::watchdog::WatchdogStatus;
 
     fn sample_status() -> StatusResponse {
-        StatusResponse::ha(HaStatus {
+        let mut status = HaStatus {
             node_id: "gruezi-a".to_owned(),
             group_id: "lab-ha".to_owned(),
             bind: "0.0.0.0:9375".to_owned(),
@@ -258,13 +294,26 @@ mod tests {
                 },
             },
             ..HaStatus::new("gruezi-a", "lab-ha", "0.0.0.0:9375", "192.0.2.11:9375")
-        })
+        };
+        status.failure_policy = "strict".to_owned();
+        status.watchdog = WatchdogStatus {
+            mode: "automatic".to_owned(),
+            armed: true,
+            effective_timeout_ms: Some(5_000),
+            last_feed_ago_ms: Some(250),
+            unprotected: false,
+        };
+        status.authority.expires_in_ms = Some(4_000);
+        status.authority.grant_expires_in_ms = Some(3_000);
+        status.authority.fencing = crate::gruezi::ownership::FencingState::Confirmed;
+        StatusResponse::ha(status)
     }
 
     #[test]
     fn snapshot_includes_ha_counters_and_timers() {
         let lines = snapshot_lines(&sample_status());
         let output = lines.join("\n");
+        println!("{output}");
         assert!(output.contains("Group ID: lab-ha"));
         assert!(output.contains("Dead Timeout: 3000ms"));
         assert!(output.contains("Last Peer Seen: 17ms"));
@@ -276,6 +325,12 @@ mod tests {
         assert!(output.contains("Owned: false"));
         assert!(output.contains("Resource: releasing confirmed=false"));
         assert!(output.contains("Authority: none source=none term=0"));
+        assert!(output.contains("expires_in_ms=Some(4000)"));
+        assert!(output.contains("grant_expires_in_ms=Some(3000)"));
+        assert!(output.contains("fencing=confirmed"));
+        assert!(output.contains("Failure Policy: strict"));
+        assert!(output.contains("Watchdog: mode=automatic armed=true"));
+        assert!(output.contains("effective_timeout_ms=Some(5000)"));
         assert!(output.contains("Safety: uncertain"));
         assert!(output.contains("Peer Session: reachable=true session_established=true"));
         assert!(output.contains("Session Rejections: wrong_source=0"));
@@ -286,6 +341,7 @@ mod tests {
     #[test]
     fn watch_line_is_timestamped_and_compact() {
         let line = format_watch_line("2026-03-10T12:00:00+01:00", &sample_status());
+        println!("{line}");
         assert!(line.contains("[2026-03-10T12:00:00+01:00]"));
         assert!(line.contains("node=gruezi-a"));
         assert!(line.contains("elected_role=Active"));
@@ -301,5 +357,36 @@ mod tests {
         assert!(line.contains("bad_tag=2"));
         assert!(line.contains("last_peer_seen=17ms"));
         assert!(line.contains("last_transition=250ms"));
+        assert!(line.contains("authority_expires_in_ms=Some(4000)"));
+        assert!(line.contains("grant_expires_in_ms=Some(3000)"));
+        assert!(line.contains("fencing=confirmed"));
+        assert!(line.contains("failure_policy=strict"));
+        assert!(line.contains("watchdog_mode=automatic"));
+        assert!(line.contains("watchdog_armed=true"));
+        assert!(line.contains("watchdog_unprotected=false"));
+        assert!(line.contains("last_transition_trigger=unknown"));
+    }
+
+    #[test]
+    fn snapshot_and_watch_render_unarmed_watchdog() {
+        let mut status = sample_status();
+        if let Some(ha) = status.ha.as_mut() {
+            ha.watchdog = WatchdogStatus {
+                mode: "required".to_owned(),
+                armed: false,
+                effective_timeout_ms: None,
+                last_feed_ago_ms: None,
+                unprotected: true,
+            };
+        }
+        let snapshot = snapshot_lines(&status).join("\n");
+        let watch = format_watch_line("2026-03-10T12:00:00+01:00", &status);
+        println!("{snapshot}\n{watch}");
+        assert!(snapshot.contains(
+            "Watchdog: mode=required armed=false effective_timeout_ms=None last_feed_ago_ms=None unprotected=true"
+        ));
+        assert!(watch.contains("watchdog_mode=required"));
+        assert!(watch.contains("watchdog_armed=false"));
+        assert!(watch.contains("watchdog_unprotected=true"));
     }
 }
