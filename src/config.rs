@@ -204,6 +204,15 @@ impl Config {
                 if authority.grant_ttl_ms == 0 {
                     bail!("ha.authority.grant_ttl_ms must be positive");
                 }
+                // The grant lifetime is grant_ttl_ms minus this sum; a non-positive lifetime
+                // makes every check result expire on arrival, leaving the node stuck pending.
+                let lifetime_floor =
+                    self.ha.withdraw_timeout_ms + u64::from(self.ha.watchdog.safety_margin_ms);
+                if authority.grant_ttl_ms <= lifetime_floor {
+                    bail!(
+                        "ha.authority.grant_ttl_ms must be greater than ha.withdraw_timeout_ms + ha.watchdog.safety_margin_ms"
+                    );
+                }
             }
             (Some(FailurePolicy::External), None) => {
                 bail!("ha.authority is required for ha.failure_policy external");
@@ -761,6 +770,28 @@ ha:
         "  failure_policy: external\n  authority: {check_command: /check, interval_ms: 0, grant_ttl_ms: 10000}",
         "ha.authority.interval_ms"
     );
+    invalid_config!(
+        authority_rejects_grant_ttl_equal_to_lifetime_floor,
+        "  failure_policy: strict",
+        "  failure_policy: external\n  authority: {check_command: /check, grant_ttl_ms: 7000}",
+        "ha.authority.grant_ttl_ms"
+    );
+    invalid_config!(
+        authority_rejects_grant_ttl_below_lifetime_floor_with_custom_margin,
+        "  failure_policy: strict",
+        "  failure_policy: external\n  watchdog: {safety_margin_ms: 6000}\n  authority: {check_command: /check, grant_ttl_ms: 10000}",
+        "ha.authority.grant_ttl_ms"
+    );
+
+    #[test]
+    fn authority_accepts_grant_ttl_above_lifetime_floor() -> Result<()> {
+        Config::from_yaml_str(&MINIMAL_HA.replace(
+            "failure_policy: strict",
+            "failure_policy: external\n  authority: {check_command: /check, grant_ttl_ms: 7001}",
+        ))?;
+        Ok(())
+    }
+
     invalid_config!(
         watchdog_rejects_unknown_mode,
         "  group_id: test",
