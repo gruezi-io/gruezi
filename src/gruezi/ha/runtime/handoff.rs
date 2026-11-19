@@ -192,7 +192,8 @@ impl Handoff {
         match self.phase {
             Phase::Releasing(_) | Phase::Released(_) | Phase::Returning(_) | Phase::Returned(_) => {
                 decision.state = HaState::Standby;
-                decision.reason = if matches!(self.phase, Phase::Returning(_)) {
+                decision.reason = if matches!(self.phase, Phase::Returning(_) | Phase::Returned(_))
+                {
                     HaDecisionReason::AddressActionFailed
                 } else {
                     peer.map_or(HaDecisionReason::GracefulShutdown, |peer| {

@@ -56,6 +56,7 @@ impl ExternalHarness {
             a,
             SimulatedKernel::new_shared(),
             AuthorityCommandRunner::Scripted(script_a.clone()),
+            WatchdogDevice::default(),
         );
         let node_b = spawn_with_authority(
             Side::B,
@@ -63,6 +64,7 @@ impl ExternalHarness {
             b,
             SimulatedKernel::new_shared(),
             AuthorityCommandRunner::Scripted(script_b.clone()),
+            WatchdogDevice::default(),
         );
         script_lock(&script_a).fenced_kernel = Some(node_b.kernel.clone());
         script_lock(&script_b).fenced_kernel = Some(node_a.kernel.clone());
@@ -95,6 +97,63 @@ impl ExternalHarness {
 
     async fn stop(self) -> Result<()> {
         self.pair.stop().await
+    }
+
+    async fn restart(&mut self, side: Side) {
+        let (node, script) = match side {
+            Side::A => (&mut self.pair.node_a, self.a.clone()),
+            Side::B => (&mut self.pair.node_b, self.b.clone()),
+        };
+        node.crash();
+        settle(Duration::ZERO).await;
+        let kernel = node.kernel.clone();
+        *node = spawn_with_authority(
+            side,
+            self.pair.net.restart_endpoint(side),
+            external_config(side),
+            kernel,
+            AuthorityCommandRunner::Scripted(script),
+            WatchdogDevice::default(),
+        );
+    }
+}
+
+impl I4Harness for ExternalHarness {
+    fn begin_i4(&mut self) {
+        self.pair.node_a.begin_shutdown();
+        self.grant_b();
+    }
+
+    fn set_drop(&mut self, side: Side, rule: DropRule) {
+        self.pair.net.set_drop(side, rule);
+    }
+
+    fn set_duplicate(&mut self, side: Side, count: usize) {
+        self.pair.net.set_duplicate(side, count);
+    }
+
+    fn set_reorder(&mut self, side: Side, count: usize) {
+        self.pair.net.set_reorder(side, count);
+    }
+
+    fn crash(&mut self, side: Side) {
+        match side {
+            Side::A => self.pair.node_a.crash(),
+            Side::B => self.pair.node_b.crash(),
+        }
+    }
+
+    fn assert_safe(&self, row: &str) {
+        assert_no_two_kernel_owners(&self.pair, row);
+    }
+
+    fn assert_order(&self) {
+        assert_advert_order(&self.pair.net);
+    }
+
+    fn clear_drops(&mut self) {
+        self.pair.net.set_drop(Side::A, DropRule::None);
+        self.pair.net.set_drop(Side::B, DropRule::None);
     }
 }
 
@@ -379,13 +438,7 @@ async fn restart_then_failed_withdrawal(cooperative: bool, row: &str) -> Result<
         settle(Duration::ZERO).await;
     }
     assert_no_acquisition(&harness.pair.node_b);
-    harness.pair.node_a = spawn_with_authority(
-        Side::A,
-        harness.pair.net.restart_endpoint(Side::A),
-        external_config(Side::A),
-        harness.pair.node_a.kernel.clone(),
-        AuthorityCommandRunner::Scripted(harness.a.clone()),
-    );
+    harness.restart(Side::A).await;
     settle(BOOT_WINDOW).await;
     assert_external_owner(&harness.pair.node_a, &harness.pair.node_b);
     harness.print(row, "restarted A reacquired under its grant");
@@ -452,13 +505,7 @@ async fn matrix_external_recovery_failback() -> Result<()> {
     script_lock(&harness.b).fence = ScriptedOutcome::Exit(true);
     settle(BOOT_WINDOW).await;
     assert_external_owner(&harness.pair.node_b, &harness.pair.node_a);
-    harness.pair.node_a = spawn_with_authority(
-        Side::A,
-        harness.pair.net.restart_endpoint(Side::A),
-        external_config(Side::A),
-        harness.pair.node_a.kernel.clone(),
-        AuthorityCommandRunner::Scripted(harness.a.clone()),
-    );
+    harness.restart(Side::A).await;
     settle(BOOT_WINDOW).await;
     assert_external_owner(&harness.pair.node_b, &harness.pair.node_a);
     harness.pair.node_b.begin_shutdown();
@@ -657,13 +704,7 @@ async fn matrix_external_peer_activity_invalidates_inflight_fence() -> Result<()
         harness.pair.node_b.snapshot().authority.fencing,
         FencingState::Requested
     );
-    harness.pair.node_a = spawn_with_authority(
-        Side::A,
-        harness.pair.net.restart_endpoint(Side::A),
-        external_config(Side::A),
-        harness.pair.node_a.kernel.clone(),
-        AuthorityCommandRunner::Scripted(harness.a.clone()),
-    );
+    harness.restart(Side::A).await;
     // The new peer establishes at 14.5s. Delay the in-flight completion until
     // after this authenticated activity, which must invalidate that proof.
     settle(Duration::from_secs(3)).await;
@@ -681,71 +722,15 @@ async fn matrix_external_peer_activity_invalidates_inflight_fence() -> Result<()
 
 #[tokio::test(start_paused = true)]
 async fn matrix_external_i4_loss_duplicate_reorder_crash_restart() -> Result<()> {
-    let events = [
-        "loss-a",
-        "loss-b",
-        "duplicate",
-        "reorder",
-        "crash-a",
-        "restart-a",
-        "restart-b",
-    ];
-    let mut explored = 0_u64;
-    for first in events {
-        for second in events {
-            let mut harness = ExternalHarness::boot();
-            settle(BOOT_WINDOW).await;
-            harness.pair.node_a.begin_shutdown();
-            harness.grant_b();
-            let schedule = format!("external/{first}/{second}");
-            for event in [first, second] {
-                match event {
-                    "loss-a" => harness.pair.net.set_drop(Side::A, DropRule::All),
-                    "loss-b" => harness.pair.net.set_drop(Side::B, DropRule::All),
-                    "duplicate" => {
-                        harness.pair.net.set_duplicate(Side::A, 2);
-                        harness.pair.net.set_duplicate(Side::B, 2);
-                    }
-                    "reorder" => {
-                        harness.pair.net.set_reorder(Side::A, 1);
-                        harness.pair.net.set_reorder(Side::B, 1);
-                    }
-                    "crash-a" => harness.pair.node_a.crash(),
-                    "restart-a" | "restart-b" => {
-                        let (side, node, script) = if event == "restart-a" {
-                            (Side::A, &mut harness.pair.node_a, harness.a.clone())
-                        } else {
-                            (Side::B, &mut harness.pair.node_b, harness.b.clone())
-                        };
-                        node.crash();
-                        settle(Duration::ZERO).await;
-                        *node = spawn_with_authority(
-                            side,
-                            harness.pair.net.restart_endpoint(side),
-                            external_config(side),
-                            node.kernel.clone(),
-                            AuthorityCommandRunner::Scripted(script),
-                        );
-                    }
-                    _ => return Err(anyhow!("unknown external schedule event")),
-                }
-                for _ in 0..16 {
-                    settle(Duration::from_millis(250)).await;
-                    assert_no_two_kernel_owners(&harness.pair, &schedule);
-                }
-            }
-            harness.pair.net.set_drop(Side::A, DropRule::None);
-            harness.pair.net.set_drop(Side::B, DropRule::None);
-            settle(BOOT_WINDOW).await;
-            assert_no_two_kernel_owners(&harness.pair, &schedule);
-            assert_advert_order(&harness.pair.net);
-            harness.stop().await?;
-            explored += 1;
-        }
-    }
-    assert_eq!(explored, 49);
+    run_i4_schedules(
+        ExternalHarness::boot,
+        |harness, side| Box::pin(harness.restart(side)),
+        |harness| Box::pin(harness.stop()),
+        "external",
+    )
+    .await?;
     println!(
-        "EXTERNAL I4: {explored} loss/duplicate/reorder/crash/restart schedules; no two kernel owners"
+        "EXTERNAL I4: 49 loss/duplicate/reorder/crash/restart schedules; no two kernel owners"
     );
     Ok(())
 }

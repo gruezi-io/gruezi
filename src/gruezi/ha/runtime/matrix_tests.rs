@@ -24,11 +24,13 @@ use crate::{
         },
         hooks::HaHooks,
         ownership::AuthoritySource,
+        watchdog::WatchdogDevice,
     },
 };
 use anyhow::{Context, Result, anyhow};
 use std::{
     future::Future,
+    pin::Pin,
     sync::{Arc, Mutex, PoisonError},
     task::{Poll, Waker},
 };
@@ -228,6 +230,123 @@ impl Harness {
     }
 }
 
+trait I4Harness {
+    fn begin_i4(&mut self);
+    fn set_drop(&mut self, side: Side, rule: DropRule);
+    fn set_duplicate(&mut self, side: Side, count: usize);
+    fn set_reorder(&mut self, side: Side, count: usize);
+    fn crash(&mut self, side: Side);
+    fn assert_safe(&self, row: &str);
+    fn assert_order(&self);
+    fn clear_drops(&mut self);
+}
+
+impl I4Harness for Harness {
+    fn begin_i4(&mut self) {
+        self.node_a.begin_shutdown();
+    }
+
+    fn set_drop(&mut self, side: Side, rule: DropRule) {
+        self.net.set_drop(side, rule);
+    }
+
+    fn set_duplicate(&mut self, side: Side, count: usize) {
+        self.net.set_duplicate(side, count);
+    }
+
+    fn set_reorder(&mut self, side: Side, count: usize) {
+        self.net.set_reorder(side, count);
+    }
+
+    fn crash(&mut self, side: Side) {
+        match side {
+            Side::A => self.node_a.crash(),
+            Side::B => self.node_b.crash(),
+        }
+    }
+
+    fn assert_safe(&self, row: &str) {
+        assert_no_two_kernel_owners(self, row);
+    }
+
+    fn assert_order(&self) {
+        assert_advert_order(&self.net);
+    }
+
+    fn clear_drops(&mut self) {
+        self.net.set_drop(Side::A, DropRule::None);
+        self.net.set_drop(Side::B, DropRule::None);
+    }
+}
+
+async fn run_i4_schedules<H, Boot, Restart, Stop>(
+    mut boot: Boot,
+    mut restart: Restart,
+    mut stop: Stop,
+    prefix: &str,
+) -> Result<()>
+where
+    H: I4Harness,
+    Boot: FnMut() -> H,
+    Restart: for<'a> FnMut(&'a mut H, Side) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
+    Stop: FnMut(H) -> Pin<Box<dyn Future<Output = Result<()>>>>,
+{
+    let events = [
+        "loss-a",
+        "loss-b",
+        "duplicate",
+        "reorder",
+        "crash-a",
+        "restart-a",
+        "restart-b",
+    ];
+    let mut explored = 0_u64;
+    for first in events {
+        for second in events {
+            let mut harness = boot();
+            settle(BOOT_WINDOW).await;
+            harness.begin_i4();
+            let schedule = if prefix.is_empty() {
+                format!("{first}/{second}")
+            } else {
+                format!("{prefix}/{first}/{second}")
+            };
+            for event in [first, second] {
+                match event {
+                    "loss-a" => harness.set_drop(Side::A, DropRule::All),
+                    "loss-b" => harness.set_drop(Side::B, DropRule::All),
+                    "duplicate" => {
+                        harness.set_duplicate(Side::A, 2);
+                        harness.set_duplicate(Side::B, 2);
+                    }
+                    "reorder" => {
+                        harness.set_reorder(Side::A, 1);
+                        harness.set_reorder(Side::B, 1);
+                    }
+                    "crash-a" => harness.crash(Side::A),
+                    "restart-a" => restart(&mut harness, Side::A).await,
+                    "restart-b" => restart(&mut harness, Side::B).await,
+                    _ => return Err(anyhow!("unknown deterministic schedule event: {event}")),
+                }
+                for _ in 0..16 {
+                    settle(Duration::from_millis(250)).await;
+                    harness.assert_safe(&schedule);
+                }
+            }
+            harness.clear_drops();
+            for _ in 0..20 {
+                settle(Duration::from_millis(250)).await;
+                harness.assert_safe(&schedule);
+            }
+            harness.assert_order();
+            stop(harness).await?;
+            explored += 1;
+        }
+    }
+    assert_eq!(explored, 49);
+    Ok(())
+}
+
 fn spawn_config(
     side: Side,
     endpoint: InMemoryEndpoint,
@@ -240,6 +359,7 @@ fn spawn_config(
         runtime,
         kernel,
         super::authority_commands::AuthorityCommandRunner::System,
+        WatchdogDevice::default(),
     )
 }
 
@@ -249,6 +369,7 @@ fn spawn_with_authority(
     runtime: HaRuntimeConfig,
     kernel: Arc<Mutex<SimulatedKernel>>,
     authority_runner: super::authority_commands::AuthorityCommandRunner,
+    watchdog: WatchdogDevice,
 ) -> Node {
     let name = match side {
         Side::A => "node-a",
@@ -262,11 +383,12 @@ fn spawn_with_authority(
     ));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let freeze = FreezeGate::default();
-    let task = tokio::spawn(freeze.clone().run(super::run_with_authority_commands(
+    let task = tokio::spawn(freeze.clone().run(super::run_with_watchdog(
         runtime,
         Transport::InMemory(endpoint),
         CommandRunner::Simulated(kernel.clone()),
         authority_runner,
+        watchdog,
         Some(status_tx),
         async move {
             let _ = shutdown_rx.await;
@@ -1423,61 +1545,22 @@ async fn matrix_handoff_new_session_cancels_inflight_transfer_grant() -> Result<
 /// reorder, crash and process restart, applied around a real strict handoff.
 #[tokio::test(start_paused = true)]
 async fn matrix_handoff_i4_bounded_schedule_enumeration() -> Result<()> {
-    let events = [
-        "loss-a",
-        "loss-b",
-        "duplicate",
-        "reorder",
-        "crash-a",
-        "restart-a",
-        "restart-b",
-    ];
-    let mut explored = 0_u64;
-    for first in events {
-        for second in events {
-            let mut config_a = node_config(Side::A, FailurePolicy::Strict);
-            config_a.withdraw_timeout_ms = 60_000;
-            let mut harness =
-                Harness::boot_configs(config_a, node_config(Side::B, FailurePolicy::Strict));
-            settle(BOOT_WINDOW).await;
-            harness.node_a.begin_shutdown();
-            let schedule = format!("{first}/{second}");
-            for event in [first, second] {
-                match event {
-                    "loss-a" => harness.net.set_drop(Side::A, DropRule::All),
-                    "loss-b" => harness.net.set_drop(Side::B, DropRule::All),
-                    "duplicate" => {
-                        harness.net.set_duplicate(Side::A, 2);
-                        harness.net.set_duplicate(Side::B, 2);
-                    }
-                    "reorder" => {
-                        harness.net.set_reorder(Side::A, 1);
-                        harness.net.set_reorder(Side::B, 1);
-                    }
-                    "crash-a" => harness.node_a.crash(),
-                    "restart-a" => harness.restart(Side::A, FailurePolicy::Strict, false).await,
-                    "restart-b" => harness.restart(Side::B, FailurePolicy::Strict, false).await,
-                    _ => return Err(anyhow!("unknown deterministic schedule event: {event}")),
-                }
-                // Sample on both sides of every advert and consent boundary.
-                for _ in 0..16 {
-                    settle(Duration::from_millis(250)).await;
-                    assert_no_two_kernel_owners(&harness, &schedule);
-                }
-            }
-            harness.net.set_drop(Side::A, DropRule::None);
-            harness.net.set_drop(Side::B, DropRule::None);
-            for _ in 0..20 {
-                settle(Duration::from_millis(250)).await;
-                assert_no_two_kernel_owners(&harness, &schedule);
-            }
-            assert_advert_order(&harness.net);
-            harness.stop().await?;
-            explored += 1;
-        }
-    }
+    let mut config_a = node_config(Side::A, FailurePolicy::Strict);
+    config_a.withdraw_timeout_ms = 60_000;
+    run_i4_schedules(
+        || {
+            Harness::boot_configs(
+                config_a.clone(),
+                node_config(Side::B, FailurePolicy::Strict),
+            )
+        },
+        |harness, side| Box::pin(harness.restart(side, FailurePolicy::Strict, false)),
+        |harness| Box::pin(harness.stop()),
+        "",
+    )
+    .await?;
     println!(
-        "I4 ENUMERATION: explored_schedules={explored}; two-owner_states=0; alphabet=loss/duplication/reordering/crash/restart; kernel snapshots at every send and 250ms fake-time boundary"
+        "I4 ENUMERATION: explored_schedules=49; two-owner_states=0; alphabet=loss/duplication/reordering/crash/restart; kernel snapshots at every send and 250ms fake-time boundary"
     );
     Ok(())
 }

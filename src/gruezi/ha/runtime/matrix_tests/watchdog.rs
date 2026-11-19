@@ -78,38 +78,15 @@ fn spawn(
     } else {
         AuthorityCommandRunner::System
     };
-    let name = match side {
-        Side::A => "node-a",
-        Side::B => "node-b",
-    };
-    let (status_tx, status_rx) = watch::channel(HaStatus::new(
-        runtime.node_id.clone(),
-        runtime.group_id.clone(),
-        runtime.bind.clone(),
-        runtime.peer.clone(),
-    ));
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let kernel = SimulatedKernel::new_shared();
-    let freeze = FreezeGate::default();
-    let task = tokio::spawn(freeze.clone().run(super::super::run_with_watchdog(
+    super::spawn_with_authority(
+        side,
+        endpoint,
         runtime,
-        Transport::InMemory(endpoint),
-        CommandRunner::Simulated(kernel.clone()),
+        kernel,
         authority,
         WatchdogDevice::Fake(watchdog),
-        Some(status_tx),
-        async move {
-            let _ = shutdown_rx.await;
-        },
-    )));
-    Node {
-        name,
-        status_rx,
-        kernel,
-        shutdown_tx: Some(shutdown_tx),
-        task,
-        freeze,
-    }
+    )
 }
 
 async fn arm_failure(policy: FailurePolicy) -> Result<()> {

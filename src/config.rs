@@ -175,8 +175,16 @@ impl Config {
             #[cfg(target_os = "linux")]
             {
                 let budget = u128::from(self.ha.advert_interval_ms)
-                    + u128::from(self.ha.command_timeout_ms)
-                    + u128::from(self.ha.withdraw_timeout_ms)
+                    + u128::from(
+                        self.ha
+                            .command_timeout_ms
+                            .max(crate::gruezi::addresses::COMMAND_TIMEOUT_MS),
+                    )
+                    + u128::from(
+                        self.ha
+                            .withdraw_timeout_ms
+                            .max(crate::gruezi::addresses::WITHDRAW_TIMEOUT_MS),
+                    )
                     + u128::from(watchdog.safety_margin_ms);
                 if budget >= u128::from(watchdog.timeout_ms) {
                     bail!(
