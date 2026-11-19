@@ -27,7 +27,7 @@ systems.
 | KV mode | Planned | No Raft or key-value runtime is shipped. |
 | DNS and agent | Planned | No service discovery runtime is shipped. |
 | FreeBSD backend | Planned | The next platform step is an `ifconfig` resource backend. |
-| macOS and Windows product behavior | Unsupported | CI portability is not a product support promise. |
+| macOS and Windows product behavior | Unsupported | CI and release artifacts target Linux only. |
 
 ## HA quick start
 

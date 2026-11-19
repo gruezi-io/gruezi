@@ -183,21 +183,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - build: linux
-            os: ubuntu-latest
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
 
-          - build: linux
-            os: ubuntu-24.04-arm
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-
-          - build: macos
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-
-          - build: macos
-            os: macos-latest
-            target: aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -218,34 +208,27 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Linux-only prerequisites
       - name: Install system deps (musl)
-        if: matrix.build == 'linux'
         run: |
           sudo apt-get update -y
           sudo apt-get install -y musl-dev musl-tools
 
       # Pinned, so a candidate built later packages the same way; update deliberately.
       - name: Install packaging tools (RPM/DEB)
-        if: matrix.build == 'linux'
         run: |
           cargo install cargo-generate-rpm --version 0.21.0 --locked
           cargo install cargo-deb --version 3.8.0 --locked
 
-      # Build once for Linux (musl)
       - name: Build Linux (musl)
-        if: matrix.build == 'linux'
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip Linux binary
-        if: matrix.build == 'linux'
         run: |
           BIN="target/${{ matrix.target }}/release/${{ steps.package.outputs.name }}"
           ls -al "$BIN"
           strip -s "$BIN" || true
 
       - name: Generate RPM
-        if: matrix.build == 'linux'
         run: |
           cargo generate-rpm --target "${{ matrix.target }}"
           RPM_PATH="$(find "target/${{ matrix.target }}/generate-rpm" -type f -name '*.rpm' -print -quit)"
@@ -253,17 +236,11 @@ jobs:
           echo "RPM: $RPM_PATH"
 
       - name: Generate DEB (musl static)
-        if: matrix.build == 'linux'
         run: |
           cargo deb --no-build --target "${{ matrix.target }}"
           DEB_PATH="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
           echo "DEB_ASSET=$DEB_PATH" >> "$GITHUB_ENV"
           echo "DEB: $DEB_PATH"
-
-      # Non-Linux builds (macOS)
-      - name: Build
-        if: matrix.build != 'linux'
-        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build archive
         shell: bash
@@ -367,7 +344,7 @@ jobs:
       - name: Check the inventory
         shell: bash
         env:
-          EXPECTED: dist-x86_64-unknown-linux-musl=3 dist-aarch64-unknown-linux-musl=3 dist-x86_64-apple-darwin=1 dist-aarch64-apple-darwin=1
+          EXPECTED: dist-x86_64-unknown-linux-musl=3 dist-aarch64-unknown-linux-musl=3
         run: |
           set -euo pipefail
           for entry in ${EXPECTED}; do
@@ -390,7 +367,7 @@ jobs:
         env:
           VERSION: ${{ needs.guard.outputs.version }}
           RUST: ${{ needs.crate.outputs.rust }}
-          EXPECTED: dist-x86_64-unknown-linux-musl=3 dist-aarch64-unknown-linux-musl=3 dist-x86_64-apple-darwin=1 dist-aarch64-apple-darwin=1
+          EXPECTED: dist-x86_64-unknown-linux-musl=3 dist-aarch64-unknown-linux-musl=3
         run: |
           set -euo pipefail
           mkdir dist manifest
@@ -538,7 +515,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ needs.guard.outputs.tag }}
           draft: false
@@ -652,7 +629,7 @@ jobs:
       - name: Get a crates.io token (Trusted Publishing)
         id: auth
         if: steps.crate.outputs.needed == 'true'
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Publish to crates.io
         if: steps.crate.outputs.needed == 'true'

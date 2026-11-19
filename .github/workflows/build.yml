@@ -20,20 +20,9 @@ jobs:
 
   build:
     name: Build
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     needs:
       - test
-
-    strategy:
-      matrix:
-        include:
-          - build: linux
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-
-          - build: macos
-            os: macos-latest
-            target: x86_64-apple-darwin
 
     steps:
       - name: Checkout
@@ -52,18 +41,12 @@ jobs:
       - name: Install Rust
         uses: ./.github/actions/rust-toolchain
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-musl
 
       - run: sudo apt -y install musl-dev musl-tools
-        if: matrix.build == 'linux'
 
       - name: Build (Linux musl)
-        if: matrix.build == 'linux'
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Build
-        if: matrix.build != 'linux'
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
   # One aggregate check for branch protection and the release flow: it passes only
   # when every gating job succeeded, so the required check never depends on job or

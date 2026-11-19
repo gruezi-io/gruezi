@@ -182,7 +182,8 @@ Work, including dependency updates (`just update`), lands on `sandbox`. When its
 | `just release-republish X.Y.Z` | Recovery: publish an existing tag again with `main`'s workflow |
 | `just protect-branches` | Apply the branch protection (**CI OK** on `main`, signed commits, linear history and resolved review conversations) and the rule that release tags are never moved or deleted |
 
-The candidate run builds the archive, RPM and DEB for Linux x86_64 and aarch64 (musl) and the archives for macOS x86_64 and aarch64, packages and verifies the crate, keeps everything
+The candidate run builds the archive, RPM and DEB for Linux x86_64 and aarch64
+(musl), packages and verifies the crate, keeps everything
 with a manifest of SHA-256 sums, and attests the build provenance of every file. The tag
 run publishes those files to the GitHub release with notes made from the commit
 subjects since the previous release, marks it Latest only while it is the highest
