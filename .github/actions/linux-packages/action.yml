@@ -1,0 +1,110 @@
+name: Linux packages
+description: >-
+  Build the RPM and DEB of an already built release binary and check them against it.
+  The packaging tools are pinned so a package made later is made the same way; update
+  them deliberately. Expects the repository to be checked out and the binary built for
+  the target on a runner that is native for it.
+inputs:
+  target:
+    description: Rust target the binary was built for.
+    required: true
+  out:
+    description: Directory that receives the .rpm and .deb files.
+    required: false
+    default: dist
+runs:
+  using: composite
+  steps:
+    - id: info
+      uses: ./.github/actions/crate-info
+
+    - id: tools
+      name: Install packaging tools (RPM/DEB)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo install cargo-generate-rpm --version 0.21.0 --locked
+        cargo install cargo-deb --version 3.8.0 --locked
+        # The check below unpacks the RPM.
+        for tool in rpm rpm2archive tar; do
+          if ! command -v "$tool" >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends rpm rpm2cpio tar
+            break
+          fi
+        done
+
+    - id: package
+      name: Package the binary
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        NAME: ${{ steps.info.outputs.name }}
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        strip -s "target/${TARGET}/release/${NAME}"
+        # Clear what an earlier run left, so only this run's packages are collected.
+        rm -rf "target/${TARGET}/generate-rpm" "target/${TARGET}/debian"
+        cargo generate-rpm --target "${TARGET}"
+        cargo deb --no-build --target "${TARGET}"
+        mkdir -p "${OUT}"
+        cp "target/${TARGET}/generate-rpm/"*.rpm "target/${TARGET}/debian/"*.deb "${OUT}/"
+        ls -al "${OUT}"
+
+    # Exactly one DEB and one RPM, for this version and architecture, installing the
+    # binary, unit and config, with the binary that was built and smoke-tested.
+    - id: check
+      name: Check the packages
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        NAME: ${{ steps.info.outputs.name }}
+        VERSION: ${{ steps.info.outputs.version }}
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        case "${TARGET}" in
+          x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;;
+          aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
+          *) echo "::error::Unsupported target ${TARGET}."; exit 1 ;;
+        esac
+        shopt -s nullglob
+        debs=("${OUT}"/*.deb)
+        rpms=("${OUT}"/*.rpm)
+        if [[ ${#debs[@]} -ne 1 || ${#rpms[@]} -ne 1 ]]; then
+          echo "::error::Expected exactly one .deb and one .rpm in ${OUT}."
+          exit 1
+        fi
+        deb="${debs[0]}"
+        rpm="${rpms[0]}"
+        expect() {
+          if [[ "$2" != "$3" ]]; then
+            echo "::error::$1 is '$2', expected '$3'."
+            exit 1
+          fi
+        }
+        expect "The .deb version" "$(dpkg-deb --field "${deb}" Version)" "${VERSION}-1"
+        expect "The .deb architecture" "$(dpkg-deb --field "${deb}" Architecture)" "${deb_arch}"
+        expect "The .rpm version" "$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "${rpm}")" "${VERSION}-1"
+        expect "The .rpm architecture" "$(rpm -qp --queryformat '%{ARCH}' "${rpm}")" "${rpm_arch}"
+        work="$(mktemp -d)"
+        trap 'rm -rf "${work}"' EXIT
+        mkdir "${work}/deb" "${work}/rpm"
+        dpkg-deb -x "${deb}" "${work}/deb"
+        rpm_path="$(realpath "${rpm}")"
+        (cd "${work}/rpm" && rpm2archive -n - < "${rpm_path}" | tar -xf -)
+        built="target/${TARGET}/release/${NAME}"
+        for kind in deb rpm; do
+          for asset in "usr/bin/${NAME}" "etc/systemd/system/${NAME}.service" "etc/${NAME}/${NAME}.env"; do
+            if [[ ! -f "${work}/${kind}/${asset}" ]]; then
+              echo "::error::The .${kind} does not install /${asset}."
+              exit 1
+            fi
+          done
+          if ! cmp -s "${built}" "${work}/${kind}/usr/bin/${NAME}"; then
+            echo "::error::The .${kind} carries a different binary than the one built."
+            exit 1
+          fi
+        done
+        echo "Packages are valid: ${deb} ${rpm}"

@@ -65,5 +65,11 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
 
+      # The release recipe tests run the real just recipes under zsh and bash with jq.
+      - name: Install release test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends just zsh jq
+
       - name: test
         run: cargo test --locked

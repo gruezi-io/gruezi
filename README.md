@@ -90,6 +90,7 @@ intentionally produce dual ownership during a partition.
 * [Raft storage](docs/RAFT-STORAGE.md), storage evaluation
 * [Compatibility](docs/COMPATIBILITY.md), Patroni etcd3 surface
 * [Contributing](CONTRIBUTING.md), development and test workflow
+* [Releasing](RELEASING.md), version bumps, exact-SHA publication, and recovery
 * [CLI architecture](CLI_ARCHITECTURE.md), command and telemetry layout
 * [Packaging](contrib/README.md), package and systemd assets
 

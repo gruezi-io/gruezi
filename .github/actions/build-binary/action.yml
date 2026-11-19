@@ -1,0 +1,65 @@
+name: Build binary
+description: >-
+  Install Rust and the target's prerequisites, then build the locked release binary and
+  run it. Expects the repository to be checked out on a runner that is native for the
+  target.
+inputs:
+  target:
+    description: Rust target triple.
+    required: true
+  toolchain:
+    description: stable, or an exact version such as 1.98.1.
+    required: false
+    default: stable
+outputs:
+  name:
+    description: Package (binary) name.
+    value: ${{ steps.info.outputs.name }}
+  version:
+    description: Package version.
+    value: ${{ steps.info.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - id: info
+      uses: ./.github/actions/crate-info
+
+    - id: toolchain
+      uses: ./.github/actions/rust-toolchain
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        targets: ${{ inputs.target }}
+
+    - id: musl
+      name: Install system deps (musl)
+      if: contains(inputs.target, 'musl')
+      shell: bash
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y musl-dev musl-tools
+
+    - id: build
+      name: Build
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: cargo build --release --locked --target "${TARGET}"
+
+    # A binary that builds but does not run, or reports another name or version, fails
+    # here. The runner is native for the target, so the binary can run.
+    - id: smoke
+      name: Run the binary
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        NAME: ${{ steps.info.outputs.name }}
+        VERSION: ${{ steps.info.outputs.version }}
+      run: |
+        set -euo pipefail
+        out="$("target/${TARGET}/release/${NAME}" --version)"
+        echo "${out}"
+        read -r reported_name reported_version _ <<<"${out}"
+        if [[ "${reported_name}" != "${NAME}" || "${reported_version}" != "${VERSION}" ]]; then
+          echo "::error::The binary reports '${reported_name} ${reported_version}', expected '${NAME} ${VERSION}'."
+          exit 1
+        fi

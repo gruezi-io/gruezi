@@ -1,184 +1,167 @@
 ---
 name: Release
+# allow: SIZE_OK — one workflow file owns the whole release pipeline; its jobs are the natural split.
 
+# One dispatch publishes exactly the commit it names: nothing is bumped, committed,
+# branched or staged along the way. The run is started by `just release` on develop
+# with the commit's full SHA and a unique dispatch marker; the guard refuses anything
+# but that exact commit, whose own Test & Build already succeeded. What publishes is
+# what this run builds and verifies here. `main` is moved by the local recipe only
+# after this run has succeeded; the workflow never touches it.
 on:
-  push:
-    tags:
-      - '*'
   workflow_dispatch:
     inputs:
-      publish:
-        description: >-
-          Recovery: an existing X.Y.Z tag whose publishing failed. Run on main; it checks
-          the tag like its own run would and publishes the tag's candidate artifacts.
-        required: false
-        default: ''
+      expected_sha:
+        description: Full commit SHA of the commit to publish.
+        required: true
+      dispatch_id:
+        description: Nonsecret unique marker of this invocation.
+        required: true
 
-# Read-only by default. Jobs ask for more only where they need it: the manifest job
-# signs build provenance, the GitHub release job writes the release, and the crates.io
-# job requests a short-lived publish token through OIDC (Trusted Publishing).
+run-name: Release ${{ inputs.expected_sha }} dispatch ${{ inputs.dispatch_id }}
+
+# One release at a time. A pending dispatch waits its turn instead of being
+# cancelled: it is a real release request whose author is watching it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+# Read-only by default. The GitHub release job writes the release and attests its
+# files; the publish job requests a short-lived crates.io token through OIDC (Trusted
+# Publishing). No environment is bound to a publishing job and no registry secret is
+# stored.
 permissions:
   contents: read
 
 jobs:
-  # Classifies the run for the jobs below.
-  # - `candidate`: a manual (workflow_dispatch) run on a branch, which `just deploy`
-  #   starts on the release candidate before any tag exists. It runs the whole
-  #   pipeline (tests, every build and package, the crate packaged and verified) and
-  #   keeps the artifacts plus a manifest of their SHA-256 sums, publishing nothing.
-  # - `release`: a pushed X.Y.Z tag. It builds nothing. The signed tag names its
-  #   candidate run; the guard checks that run and the tag's commit, and the jobs
-  #   below publish exactly the manifest's files, so what ships is what was tested.
-  # - `recover`: a manual run on main with `publish: X.Y.Z`, for a tag whose publishing
-  #   failed in a way re-running its jobs cannot fix (a bug in the publish steps of the
-  #   tagged workflow, or GitHub's 30-day re-run limit). It applies the same checks to
-  #   that tag and publishes its candidate artifacts with main's workflow; the tag
-  #   itself never changes.
-  # - `test-tag`: any other tag, or a manual run on a tag: tests and builds only.
-  # A manual run on main without `publish` is a candidate run too (`just release-dry-run`
-  # starts one on the current branch): it builds and packages, publishing nothing.
-  # A tag may only be published when its commit is on main, carries the tag's version
-  # and passed Test & Build and its candidate run; a hand-pushed or stray tag stops here.
   guard:
     name: Release guard
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
     outputs:
-      kind: ${{ steps.classify.outputs.kind }}
-      version: ${{ steps.classify.outputs.version }}
-      tag: ${{ steps.classify.outputs.tag }}
-      commit: ${{ steps.release.outputs.commit }}
-      candidate_run: ${{ steps.release.outputs.candidate_run }}
+      name: ${{ steps.info.outputs.name }}
+      version: ${{ steps.info.outputs.version }}
+      rust: ${{ steps.rust.outputs.version }}
     steps:
+      # The workflow's own commit is checked out explicitly, so every job and file
+      # below belongs to the dispatched SHA.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Classify the run
-        id: classify
+      - name: Read the package name and version
+        id: info
+        uses: ./.github/actions/crate-info
+
+      # `stable` moves every few weeks and a failed-job re-run can run a leg hours
+      # later, so the compiler is resolved once here. Every job of this run installs
+      # exactly this version and sets RUSTUP_TOOLCHAIN to it.
+      - name: Resolve the Rust toolchain for this run
+        id: rust
         shell: bash
-        env:
-          EVENT: ${{ github.event_name }}
-          PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
-          tag=""
-          if [[ "${EVENT}" == workflow_dispatch && -n "${PUBLISH:-}" ]]; then
-            if [[ "${GITHUB_REF}" != refs/heads/main || ! "${PUBLISH}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::A recovery run needs an X.Y.Z tag in 'publish' and must run on main."
-              exit 1
-            fi
-            kind=recover
-            tag="${PUBLISH}"
-            version="${PUBLISH}"
-          elif [[ "${EVENT}" == workflow_dispatch && "${GITHUB_REF}" == refs/heads/* ]]; then
-            kind=candidate
-          elif [[ "${EVENT}" == push && "${GITHUB_REF}" == refs/tags/* && "${GITHUB_REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            kind=release
-            tag="${GITHUB_REF_NAME}"
-          else
-            kind=test-tag
-            # Test builds are named after the ref; only safe characters reach file names.
-            version="test"
-            if [[ "${GITHUB_REF_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-              version="${GITHUB_REF_NAME}"
-            fi
-          fi
-          if [[ "${kind}" != test-tag && ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Cargo.toml has no X.Y.Z version (found '${version}')."
+          rustup toolchain install stable --profile minimal
+          version="$(rustc +stable --version | awk '{print $2}')"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not resolve stable to an exact version."
             exit 1
           fi
-          {
-            echo "kind=${kind}"
-            echo "version=${version}"
-            echo "tag=${tag}"
-          } >> "$GITHUB_OUTPUT"
-          echo "${EVENT} on ${GITHUB_REF} classified as ${kind} (version ${version}${tag:+, tag ${tag}})."
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "This release is built with Rust ${version}."
 
-      # Everything is read through the API, so it holds for any tag, however far main
-      # has moved on since.
-      - name: Require the tag's commit, version, Test & Build run and candidate run
-        id: release
-        if: steps.classify.outputs.kind == 'release' || steps.classify.outputs.kind == 'recover'
+      - name: Check the dispatched commit can be released
+        id: check
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          PACKAGE_VERSION: ${{ steps.info.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/heads/develop ]]; then
+            echo "::error::Run the release on develop (got ${GITHUB_REF})."
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected_sha must be a full lowercase commit SHA."
+            exit 1
+          fi
+          if [[ "${EXPECTED_SHA}" != "${GITHUB_SHA}" || "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+            echo "::error::This run is for a different commit than expected_sha; dispatch again."
+            exit 1
+          fi
+          if [[ ! "${DISPATCH_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::dispatch_id must use only letters, digits, dot, underscore and dash."
+            exit 1
+          fi
+          version="${PACKAGE_VERSION}"
+          if [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Cargo.toml has no canonical X.Y.Z version; bump the version first."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::error::main has commits that develop does not; merge main into develop first."
+            exit 1
+          fi
+          echo "Dispatch ${DISPATCH_ID} checks out ${version} at ${EXPECTED_SHA}."
+
+      - name: Check the target tag
+        id: tag
+        uses: ./.github/actions/release-version-gate
+        with:
+          version: ${{ steps.info.outputs.version }}
+          token: ${{ github.token }}
+
+      # `CI OK` is Test & Build's aggregate of every gating job, and the run that
+      # produced it must be this repository's build.yml push run for exactly this
+      # commit on develop. A check of the right name on another commit, run, fork or
+      # event proves nothing.
+      - name: Require trusted Test & Build on this commit
+        id: ci
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.classify.outputs.tag }}
-          KIND: ${{ steps.classify.outputs.kind }}
-        shell: bash
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
-          # The signed tag names the candidate run whose artifacts it releases.
-          read -r type object <<<"$(gh api "repos/${repo}/git/ref/tags/${TAG}" --jq '"\(.object.type) \(.object.sha)"')"
-          if [[ "${type}" != tag ]]; then
-            echo "::error::${TAG} is not an annotated tag; refusing to release."
+          raw="$(gh api "repos/${repo}/actions/workflows/build.yml/runs?branch=develop&event=push&head_sha=${GITHUB_SHA}")" ||
+            { echo "::error::Could not list the Test & Build runs."; exit 1; }
+          runs="$(jq -s --arg sha "${GITHUB_SHA}" --arg repo "${repo}" \
+            '[.[].workflow_runs[] | select(.path == ".github/workflows/build.yml" and .event == "push" and .head_branch == "develop" and .head_sha == $sha and (.repository | objects | .full_name == $repo))] | sort_by(.id) | reverse' \
+            <<<"${raw}")"
+          run_id="$(jq -r '.[0].id // empty' <<<"${runs}")"
+          if [[ -z "${run_id}" ]]; then
+            echo "::error::No completed Test & Build run of ${GITHUB_SHA} on develop; wait for CI."
             exit 1
           fi
-          read -r verified commit <<<"$(gh api "repos/${repo}/git/tags/${object}" --jq '"\(.verification.verified) \(.object.sha)"')"
-          message="$(gh api "repos/${repo}/git/tags/${object}" --jq '.message')"
-          if [[ "${verified}" != true ]]; then
-            echo "::error::The signature of tag ${TAG} is not verified by GitHub; refusing to release."
+          jobs="$(gh api "repos/${repo}/actions/runs/${run_id}/jobs?filter=latest")" ||
+            { echo "::error::Could not list the jobs of run ${run_id}."; exit 1; }
+          ok="$(jq --arg sha "${GITHUB_SHA}" \
+            '[.jobs[] | select(.name == "CI OK" and .head_sha == $sha and .status == "completed" and .conclusion == "success")] | length' \
+            <<<"${jobs}")"
+          if [[ "${ok}" != 1 ]]; then
+            echo "::error::Run ${run_id} has no successful CI OK job for ${GITHUB_SHA}."
             exit 1
           fi
-          if [[ "${KIND}" == release && "${commit}" != "${GITHUB_SHA}" ]]; then
-            echo "::error::Tag ${TAG} points at ${commit}, but this run is for ${GITHUB_SHA}."
-            exit 1
-          fi
-          status="$(gh api "repos/${repo}/compare/${commit}...main" --jq '.status')"
-          if [[ "${status}" != identical && "${status}" != ahead ]]; then
-            echo "::error::Tag ${TAG} points at ${commit}, which is not on main (${status}); refusing to release."
-            exit 1
-          fi
-          version="$(gh api "repos/${repo}/contents/Cargo.toml?ref=${commit}" --jq '.content' | base64 -d | awk -F'"' '/^version = /{print $2; exit}')"
-          if [[ "${version}" != "${TAG}" ]]; then
-            echo "::error::Tag ${TAG} does not match the package version ${version} at ${commit}; refusing to release."
-            exit 1
-          fi
-          passed="$(gh run list --repo "${repo}" --workflow build.yml \
-            --commit "${commit}" --event push --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')"
-          if [[ -z "${passed}" ]]; then
-            echo "::error::${commit} has no successful Test & Build run; refusing to release ${TAG}."
-            exit 1
-          fi
-          candidate_run="$(sed -n 's/^Candidate run: \([0-9][0-9]*\)$/\1/p' <<<"${message}" | head -n 1)"
-          if [[ -z "${candidate_run}" ]]; then
-            echo "::error::Tag ${TAG} names no candidate run; refusing to publish untested artifacts."
-            exit 1
-          fi
-          read -r head_sha event conclusion path <<<"$(gh api "repos/${repo}/actions/runs/${candidate_run}" \
-            --jq '"\(.head_sha) \(.event) \(.conclusion) \(.path)"')"
-          if [[ "${head_sha}" != "${commit}" || "${event}" != workflow_dispatch || "${conclusion}" != success || "${path}" != .github/workflows/release.yml* ]]; then
-            echo "::error::Run ${candidate_run} is not a successful candidate run of ${commit} (${head_sha} ${event} ${conclusion} ${path})."
-            exit 1
-          fi
-          {
-            echo "commit=${commit}"
-            echo "candidate_run=${candidate_run}"
-          } >> "$GITHUB_OUTPUT"
-          echo "Tag ${TAG}: ${commit} is on main, passed Test & Build (run ${passed}) and candidate run ${candidate_run}."
-
-  # Publishing (release, recover) reuses the candidate run's results: it neither tests
-  # nor builds.
-  test:
-    needs: guard
-    if: needs.guard.outputs.kind == 'candidate' || needs.guard.outputs.kind == 'test-tag'
-    uses: ./.github/workflows/test.yml
+          echo "Test & Build run ${run_id} passed CI OK for ${GITHUB_SHA}."
 
   build:
-    name: Build and package
+    name: Build and package (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    needs:
-      - guard
-      - test
-    if: needs.guard.outputs.kind == 'candidate' || needs.guard.outputs.kind == 'test-tag'
+    timeout-minutes: 60
+    needs: [guard]
     env:
       VERSION: ${{ needs.guard.outputs.version }}
-
+      NAME: ${{ needs.guard.outputs.name }}
+      RUSTUP_TOOLCHAIN: ${{ needs.guard.outputs.rust }}
     strategy:
       fail-fast: false
       matrix:
@@ -193,309 +176,208 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Get package name from Cargo.toml
-        id: package
-        shell: bash
-        run: |
-          PACKAGE_NAME=$(awk -F '"' '/^name = / {print $2; exit}' Cargo.toml)
-          echo "name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
-          echo "Package name: $PACKAGE_NAME"
-
-      - name: Install Rust
-        uses: ./.github/actions/rust-toolchain
+      - name: Build the binary
+        uses: ./.github/actions/build-binary
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          toolchain: ${{ needs.guard.outputs.rust }}
 
-      - name: Install system deps (musl)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y musl-dev musl-tools
+      - name: Build and check the Linux packages
+        uses: ./.github/actions/linux-packages
+        with:
+          target: ${{ matrix.target }}
 
-      # Pinned, so a candidate built later packages the same way; update deliberately.
-      - name: Install packaging tools (RPM/DEB)
-        run: |
-          cargo install cargo-generate-rpm --version 0.21.0 --locked
-          cargo install cargo-deb --version 3.8.0 --locked
-
-      - name: Build Linux (musl)
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Strip Linux binary
-        run: |
-          BIN="target/${{ matrix.target }}/release/${{ steps.package.outputs.name }}"
-          ls -al "$BIN"
-          strip -s "$BIN" || true
-
-      - name: Generate RPM
-        run: |
-          cargo generate-rpm --target "${{ matrix.target }}"
-          RPM_PATH="$(find "target/${{ matrix.target }}/generate-rpm" -type f -name '*.rpm' -print -quit)"
-          echo "RPM_ASSET=$RPM_PATH" >> "$GITHUB_ENV"
-          echo "RPM: $RPM_PATH"
-
-      - name: Generate DEB (musl static)
-        run: |
-          cargo deb --no-build --target "${{ matrix.target }}"
-          DEB_PATH="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
-          echo "DEB_ASSET=$DEB_PATH" >> "$GITHUB_ENV"
-          echo "DEB: $DEB_PATH"
-
-      - name: Build archive
+      - name: Build the archive
+        id: archive
         shell: bash
-        run: |
-          binary_name="${{ steps.package.outputs.name }}"
-          dirname="$binary_name-${VERSION}-${{ matrix.target }}"
-          mkdir "$dirname"
-
-          mv "target/${{ matrix.target }}/release/$binary_name" "$dirname"
-          tar -czf "$dirname.tar.gz" "$dirname"
-          echo "ASSET=$dirname.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Collect the release assets
-        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          mkdir dist
-          for asset in "${ASSET}" "${RPM_ASSET:-}" "${DEB_ASSET:-}"; do
-            [[ -z "${asset}" ]] || cp "${asset}" dist/
-          done
-          ls -al dist
+          dirname="${NAME}-${VERSION}-${TARGET}"
+          mkdir "${dirname}"
+          mv "target/${TARGET}/release/${NAME}" "${dirname}/"
+          tar -czf "dist/${dirname}.tar.gz" "${dirname}"
 
-      # The release tag publishes exactly these files, downloaded from this run.
-      - name: Upload the release assets
+      - name: Upload the release files
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
+          retention-days: 90
           if-no-files-found: error
 
-  # Package the crate once, with cargo's verification build, and keep it: the release
-  # uploads the same bytes (cargo packaging is reproducible with the same toolchain)
-  # without building again.
   crate:
     name: Crate package
     runs-on: ubuntu-latest
-    needs: guard
-    if: needs.guard.outputs.kind == 'candidate' || needs.guard.outputs.kind == 'test-tag'
+    timeout-minutes: 20
+    needs: [guard]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ needs.guard.outputs.rust }}
     outputs:
-      rust: ${{ steps.package.outputs.rust }}
+      sha256: ${{ steps.sum.outputs.sha256 }}
     steps:
-      - name: Checkout sources
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Install Rust
-        uses: ./.github/actions/rust-toolchain
-
-      # The artifact holds the crate alone: every file the release depends on is in the
-      # manifest's checksum lists. The toolchain version travels as a job output.
+      # Cargo's own verification build, and the registry's own publish checks. The
+      # exact bytes are kept: the release publishes them and the publish job proves
+      # its repackage produced the same bytes.
       - name: Package and verify the crate
         id: package
         shell: bash
         run: |
           set -euo pipefail
           cargo package --locked
+          cargo publish --dry-run --locked
+
+      - name: Checksum the crate
+        id: sum
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir crate
           cp target/package/*.crate crate/
-          ls -al crate
-          echo "rust=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum crate/*.crate | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Upload the crate
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crate
           path: crate/*
+          retention-days: 90
           if-no-files-found: error
 
-  # The candidate's manifest: the SHA-256 of every release file and of the crate, the
-  # version, the commit, the toolchain and the artifacts the release needs. `just
-  # deploy` checks it and those artifacts before tagging, and the release publishes
-  # exactly the files it lists.
-  manifest:
-    name: Release manifest
-    runs-on: ubuntu-latest
-    needs:
-      - guard
-      - build
-      - crate
-    if: needs.guard.outputs.kind == 'candidate'
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    steps:
-      - name: Download this run's assets
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: dist-*
-          path: artifacts
-
-      - name: Download this run's crate
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: crate
-          path: crate
-
-      # Every build of the matrix must be here with all its files, so a lost artifact
-      # can never produce a partial release. Keep this in step with the build matrix.
-      - name: Check the inventory
-        shell: bash
-        env:
-          EXPECTED: dist-x86_64-unknown-linux-musl=3 dist-aarch64-unknown-linux-musl=3
-        run: |
-          set -euo pipefail
-          for entry in ${EXPECTED}; do
-            name="${entry%=*}"
-            count="$(find "artifacts/${name}" -maxdepth 1 -type f 2>/dev/null | wc -l)"
-            if [[ "${count}" -ne "${entry#*=}" ]]; then
-              echo "::error::Artifact ${name} has ${count} files, expected ${entry#*=}."
-              exit 1
-            fi
-          done
-          actual="$(find artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ')"
-          wanted="$(for entry in ${EXPECTED}; do echo "${entry%=*}"; done | sort | tr '\n' ' ')"
-          if [[ "${actual}" != "${wanted}" ]]; then
-            echo "::error::Found artifacts ${actual}, expected ${wanted}."
-            exit 1
-          fi
-
-      - name: Write the manifest
-        shell: bash
-        env:
-          VERSION: ${{ needs.guard.outputs.version }}
-          RUST: ${{ needs.crate.outputs.rust }}
-          EXPECTED: dist-x86_64-unknown-linux-musl=3 dist-aarch64-unknown-linux-musl=3
-        run: |
-          set -euo pipefail
-          mkdir dist manifest
-          find artifacts -type f -exec cp -n {} dist/ \;
-          (cd dist && sha256sum -- *) > manifest/SHA256SUMS
-          total=0
-          for entry in ${EXPECTED}; do total=$((total + ${entry#*=})); done
-          if [[ "$(wc -l < manifest/SHA256SUMS)" -ne "${total}" ]]; then
-            echo "::error::Expected ${total} release files (a name collision?), got $(wc -l < manifest/SHA256SUMS)."
-            exit 1
-          fi
-          (cd crate && sha256sum -- *.crate) > manifest/CRATE.SHA256
-          if [[ ! "${RUST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::The crate job reported no toolchain version (got '${RUST}')."
-            exit 1
-          fi
-          {
-            echo "VERSION=${VERSION}"
-            echo "COMMIT=${GITHUB_SHA}"
-            echo "RUST=${RUST}"
-          } > manifest/release.env
-          # The artifacts the release publishes from; just deploy checks they all remain.
-          { for entry in ${EXPECTED}; do echo "${entry%=*}"; done; echo crate; } > manifest/ARTIFACTS
-          cat manifest/*
-
-      # A signed statement that this run built exactly these bytes. The release publishes
-      # the same files, and crates.io receives a crate with the same checksum, so
-      # `gh attestation verify <file> --repo <owner>/<repo>` works on what users download.
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/*
-            crate/*.crate
-
-      - name: Upload the manifest
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-manifest
-          path: manifest/*
-          if-no-files-found: error
-
-  # Only release tags (X.Y.Z) that passed the guard publish, and only the files of
-  # their candidate run's manifest: nothing is rebuilt after CI. Safe to re-run: the
-  # release is updated in place, existing assets are overwritten and stray ones removed;
-  # it is GitHub's Latest release only when the tag is the highest promoted release at
-  # that moment, so a late or recovered older tag never takes the Latest flag.
-  release:
+  github:
     name: GitHub release
     runs-on: ubuntu-latest
-    needs: guard
-    if: needs.guard.outputs.kind == 'release' || needs.guard.outputs.kind == 'recover'
-    concurrency:
-      group: gruezi-production-release
-      cancel-in-progress: false
-      queue: max
+    timeout-minutes: 30
+    needs: [guard, build, crate]
     permissions:
       contents: write
-      actions: read
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.guard.outputs.version }}
+      NAME: ${{ needs.guard.outputs.name }}
+      COMMIT: ${{ github.sha }}
     steps:
       # Full history and tags: the release notes list the commits since the previous
       # release.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download the candidate run's manifest
+      - name: Download the release files
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          run-id: ${{ needs.guard.outputs.candidate_run }}
-          github-token: ${{ github.token }}
-          name: release-manifest
-          path: ${{ runner.temp }}/manifest
-
-      - name: Download the candidate run's assets
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          run-id: ${{ needs.guard.outputs.candidate_run }}
-          github-token: ${{ github.token }}
           pattern: dist-*
           merge-multiple: true
           path: ${{ runner.temp }}/dist
 
-      - name: Check the assets against the manifest
+      - name: Download the verified crate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crate
+          path: ${{ runner.temp }}/crate
+
+      # Exactly the supported downloads, each built by one of the two native jobs:
+      # two archives, two DEBs and two RPMs. Nothing is published from an inventory
+      # that is missing a file, carries a stray one, or was replaced after the build.
+      - name: Check the release files
+        id: inventory
         shell: bash
-        env:
-          TAG_VERSION: ${{ needs.guard.outputs.version }}
-          TAG_COMMIT: ${{ needs.guard.outputs.commit }}
         run: |
           set -euo pipefail
-          cd "${RUNNER_TEMP}"
-          . manifest/release.env
-          if [[ "${VERSION}" != "${TAG_VERSION}" || "${COMMIT}" != "${TAG_COMMIT}" ]]; then
-            echo "::error::The candidate manifest is for ${VERSION} at ${COMMIT}, not ${TAG_VERSION} at ${TAG_COMMIT}."
+          expected="$(
+            {
+              for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+                echo "${NAME}-${VERSION}-${target}.tar.gz"
+              done
+              echo "${NAME}_${VERSION}-1_amd64.deb"
+              echo "${NAME}_${VERSION}-1_arm64.deb"
+              echo "${NAME}-${VERSION}-1.x86_64.rpm"
+              echo "${NAME}-${VERSION}-1.aarch64.rpm"
+            } | sort
+          )"
+          actual="$(find "${RUNNER_TEMP}/dist" -maxdepth 1 -type f -printf '%f\n' | sort)"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "::error::The release files are not exactly the expected set."
+            diff <(echo "${expected}") <(echo "${actual}") || true
             exit 1
           fi
-          listed="$(awk '{print $2}' manifest/SHA256SUMS | sort)"
-          present="$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)"
-          if [[ "${listed}" != "${present}" ]]; then
-            echo "::error::The downloaded assets do not match the manifest."
-            diff <(echo "${listed}") <(echo "${present}") || true
+
+      # The crate the release verifies is the crate this run packaged and checked.
+      - name: Check the verified crate
+        id: crate
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.crate.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The crate job reported no checksum."
             exit 1
           fi
-          (cd dist && sha256sum -c ../manifest/SHA256SUMS)
-          cp manifest/SHA256SUMS dist/
+          shopt -s nullglob
+          files=("${RUNNER_TEMP}"/crate/*.crate)
+          if [[ ${#files[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one verified crate."
+            exit 1
+          fi
+          if [[ "$(sha256sum "${files[0]}" | awk '{print $1}')" != "${EXPECTED}" ]]; then
+            echo "::error::The downloaded crate does not match the crate job's checksum."
+            exit 1
+          fi
+          echo "The verified crate ${files[0]##*/} is the one this run packaged."
+
+      - name: Write the checksums
+        id: sums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/dist"
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # A signed statement that this run built exactly these bytes. What users download
+      # and the separately published crate carry the same attestation.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/dist/*
+            ${{ runner.temp }}/crate/*.crate
 
       # The notes are the commit subjects since the previous release (the version bump
-      # itself left out), so they need no hand-kept changelog and every re-run writes the
+      # itself left out), so no changelog is kept by hand and every re-run writes the
       # same text.
       - name: Write the release notes
+        id: notes
         shell: bash
-        env:
-          TAG: ${{ needs.guard.outputs.tag }}
         run: |
           set -euo pipefail
-          previous="$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' "refs/tags/${TAG}^" 2>/dev/null || true)"
-          range="refs/tags/${TAG}"
-          [[ -z "${previous}" ]] || range="${previous}..refs/tags/${TAG}"
-          changes="$(git log --no-merges --format='- %s (%h)' "${range}" | grep -vE '^- bump version to [0-9]+\.[0-9]+\.[0-9]+ ' || true)"
+          previous="$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' "${GITHUB_SHA}" 2>/dev/null || true)"
+          range="${GITHUB_SHA}"
+          [[ -z "${previous}" ]] || range="${previous}..${GITHUB_SHA}"
+          changes="$(git log --no-merges --format='- %s (%h)' "${range}" | grep -viE '^- (bump version to|Bump version to) [0-9]+\.[0-9]+\.[0-9]+ ' || true)"
           {
             echo "## Changes"
             echo
             echo "${changes:-- Only the version bump.}"
             if [[ -n "${previous}" ]]; then
               echo
-              echo "**Full changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${TAG}"
+              echo "**Full changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${VERSION}"
             fi
             echo
             echo "## Verify a download"
@@ -507,148 +389,274 @@ jobs:
           } > "${RUNNER_TEMP}/notes.md"
           cat "${RUNNER_TEMP}/notes.md"
 
-      - name: Is this the latest release
-        id: latest
-        uses: ./.github/actions/release-is-latest
-        with:
-          tag: ${{ needs.guard.outputs.tag }}
-          token: ${{ github.token }}
-
-      - name: Release
-        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
-        with:
-          tag_name: ${{ needs.guard.outputs.tag }}
-          draft: false
-          make_latest: ${{ steps.latest.outputs.latest }}
-          body_path: ${{ runner.temp }}/notes.md
-          files: ${{ runner.temp }}/dist/*
-
-      - name: Keep exactly the manifest's files on the release
+      # What exists already decides what this job may touch. A published release is
+      # never edited; only its target and bytes are verified below. A draft is the
+      # half of a previous attempt at this commit and is replaced; anything else is
+      # not ours to touch.
+      - name: Look up any existing release
+        id: existing
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.guard.outputs.tag }}
         run: |
           set -euo pipefail
-          expected="$(find "${RUNNER_TEMP}/dist" -maxdepth 1 -type f -printf '%f\n' | sort)"
-          while read -r asset; do
-            [[ -n "${asset}" ]] || continue
-            if ! grep -qxF "${asset}" <<<"${expected}"; then
-              echo "Removing ${asset}, which is not in the candidate manifest."
-              gh release delete-asset "${TAG}" "${asset}" --repo "${GITHUB_REPOSITORY}" --yes
+          state=absent
+          pages=()
+          for page in 1 2 3 4 5; do
+            out="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")" ||
+              { echo "::error::GitHub could not list releases."; exit 1; }
+            pages+=("${out}")
+            if [[ "$(jq length <<<"${out}")" -lt 100 ]]; then break; fi
+          done
+          rows="$(jq -sc --arg tag "${VERSION}" '[.[][] | select(.tag_name == $tag)]' <<<"$(printf '%s\n' "${pages[@]}")")"
+          count="$(jq length <<<"${rows}")"
+          if [[ "${count}" == 1 ]]; then
+            id="$(jq -r '.[0].id' <<<"${rows}")"
+            if [[ "$(jq -r '.[0].draft' <<<"${rows}")" == true ]]; then
+              state=draft
+            else
+              state=public
             fi
-          done < <(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')
-          actual="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' | sort)"
-          if [[ "${actual}" != "${expected}" ]]; then
-            echo "::error::Release ${TAG} holds $(tr '\n' ' ' <<<"${actual}"), expected $(tr '\n' ' ' <<<"${expected}")."
+            echo "id=${id}" >> "$GITHUB_OUTPUT"
+          elif [[ "${count}" != 0 ]]; then
+            echo "::error::GitHub reports ${count} releases for ${VERSION}."
             exit 1
           fi
+          echo "state=${state}" >> "$GITHUB_OUTPUT"
+          echo "Release ${VERSION} is ${state}."
 
-  # Upload the crate the candidate run packaged and verified, after the GitHub release,
-  # from a clean checkout of the tag. cargo cannot upload a prepared .crate, so the
-  # candidate's toolchain repackages the same source without building (cargo packaging
-  # is reproducible), and the crate is uploaded only when its checksum matches the
-  # manifest. The upload token comes from crates.io Trusted Publishing: a short-lived
-  # token minted through OIDC for this workflow, revoked when the job ends; no registry
-  # secret is stored. Safe to re-run: a version crates.io already has is accepted only
-  # with the candidate's checksum.
-  publish:
-    name: Publish
-    runs-on: ubuntu-latest
-    needs:
-      - guard
-      - release
-    if: needs.guard.outputs.kind == 'release' || needs.guard.outputs.kind == 'recover'
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-    steps:
-      - name: Checkout the tag's sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Replace an existing draft
+        id: draft
+        if: steps.existing.outputs.state == 'draft'
+        shell: bash
+        env:
+          RELEASE_ID: ${{ steps.existing.outputs.id }}
+        run: |
+          set -euo pipefail
+          target="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '.target_commitish')"
+          if [[ "${target}" != "${COMMIT}" ]]; then
+            echo "::error::The draft for ${VERSION} targets ${target}, not ${COMMIT}; not touching it."
+            exit 1
+          fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" ||
+            { echo "::error::Could not remove the stale draft."; exit 1; }
+
+      # Publishing creates the tag, so its absence and the version's place in the
+      # release order are rechecked immediately before that happens. This also stops
+      # a stale re-run after a newer version has been released.
+      - name: Recheck the target tag
+        id: gate
+        if: steps.existing.outputs.state != 'public'
+        uses: ./.github/actions/release-version-gate
         with:
-          ref: refs/tags/${{ needs.guard.outputs.tag }}
-          persist-credentials: false
+          version: ${{ needs.guard.outputs.version }}
+          token: ${{ github.token }}
 
-      # Outside the checkout: cargo refuses to package a working tree with files git
-      # does not know about.
-      - name: Download the candidate run's manifest
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          run-id: ${{ needs.guard.outputs.candidate_run }}
-          github-token: ${{ github.token }}
-          name: release-manifest
-          path: ${{ runner.temp }}/manifest
-
-      # Inline rather than the local rust-toolchain action: this checkout is the tag's,
-      # and tags made before that action existed must still be recoverable.
-      - name: Install the candidate's toolchain
+      # Assets go on a draft first: publishing creates the tag at the tested commit, and
+      # a release accepts no uploads afterwards. A re-run rewrites its own draft's bytes
+      # before publishing again.
+      - name: Create the draft release
+        id: create
+        if: steps.existing.outputs.state != 'public'
         shell: bash
         run: |
           set -euo pipefail
-          . "${RUNNER_TEMP}/manifest/release.env"
+          gh release create "${VERSION}" "${RUNNER_TEMP}"/dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --target "${COMMIT}" \
+            --title "${VERSION}" \
+            --notes-file "${RUNNER_TEMP}/notes.md" ||
+            { echo "::error::Could not create the draft release."; exit 1; }
+
+      - name: Publish the release
+        id: publish
+        if: steps.existing.outputs.state != 'public'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "${VERSION}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest ||
+            { echo "::error::Could not publish the release."; exit 1; }
+
+      # What a user can download must be exactly what this run built, and the tag must
+      # sit on the tested commit. This runs every time, including when a re-run finds
+      # the release already published.
+      - name: Verify the published release
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}")"
+          type="$(jq -r '.object.type' <<<"${ref}")"
+          sha="$(jq -r '.object.sha' <<<"${ref}")"
+          if [[ "${type}" == tag ]]; then
+            sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq '.object.sha')"
+          fi
+          if [[ "${type}" != commit && "${type}" != tag ]]; then
+            echo "::error::Tag ${VERSION} points at an unexpected object type."
+            exit 1
+          fi
+          if [[ "${sha}" != "${COMMIT}" ]]; then
+            echo "::error::Tag ${VERSION} points at ${sha}, not at ${COMMIT}."
+            exit 1
+          fi
+          names="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" --jq '[.assets[].name] | sort | join("\n")')"
+          expected="$(find "${RUNNER_TEMP}/dist" -maxdepth 1 -type f -printf '%f\n' | sort)"
+          if [[ "${names}" != "${expected}" ]]; then
+            echo "::error::Release ${VERSION} does not hold exactly this run's files."
+            diff <(echo "${expected}") <(echo "${names}") || true
+            exit 1
+          fi
+          published="${RUNNER_TEMP}/published"
+          rm -rf "${published}"
+          gh release download "${VERSION}" --repo "${GITHUB_REPOSITORY}" --dir "${published}" ||
+            { echo "::error::Could not download the published files."; exit 1; }
+          if ! diff <(cd "${RUNNER_TEMP}/dist" && sha256sum -- * | sort -k2) \
+                    <(cd "${published}" && sha256sum -- * | sort -k2); then
+            echo "::error::The published files differ from what this run built."
+            exit 1
+          fi
+          echo "Release ${VERSION} is on ${COMMIT} with $(wc -l <<<"${expected}") verified files."
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [guard, github, crate]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
+      NAME: ${{ needs.guard.outputs.name }}
+      RUSTUP_TOOLCHAIN: ${{ needs.guard.outputs.rust }}
+      RUST: ${{ needs.guard.outputs.rust }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the release toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
           if [[ ! "${RUST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::The manifest names no exact toolchain (got '${RUST}')."
+            echo "::error::The release names no exact toolchain."
             exit 1
           fi
           rustup toolchain install "${RUST}" --profile minimal
-          rustup default "${RUST}"
           rustc --version
 
-      - name: Compare with crates.io and repackage
-        id: crate
+      # Outside the checkout: cargo refuses to package a working tree with files git
+      # does not know about, and this crate was verified by the crate job.
+      - name: Download the verified crate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crate
+          path: ${{ runner.temp }}/crate
+
+      - name: Check the verified crate
+        id: downloaded
         shell: bash
         env:
-          VERSION: ${{ needs.guard.outputs.version }}
+          EXPECTED: ${{ needs.crate.outputs.sha256 }}
         run: |
           set -euo pipefail
-          crate="$(awk -F'"' '/^name = /{print $2; exit}' Cargo.toml)"
-          expected="$(awk '{print $1}' "${RUNNER_TEMP}/manifest/CRATE.SHA256")"
-          existing="$(curl -sf -A "${crate}-release" "https://crates.io/api/v1/crates/${crate}/${VERSION}" | jq -r '.version.checksum // empty' || true)"
-          {
-            echo "crate=${crate}"
-            echo "expected=${expected}"
-          } >> "$GITHUB_OUTPUT"
-          if [[ -n "${existing}" ]]; then
-            if [[ "${existing}" != "${expected}" ]]; then
-              echo "::error::crates.io already has ${crate} ${VERSION} with checksum ${existing}, not the candidate's ${expected}."
-              exit 1
-            fi
-            echo "${crate} ${VERSION} is already on crates.io with the candidate's checksum; nothing to publish."
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          cargo package --no-verify --locked
-          actual="$(sha256sum "target/package/${crate}-${VERSION}.crate" | awk '{print $1}')"
-          if [[ "${actual}" != "${expected}" ]]; then
-            echo "::error::Repackaged crate checksum ${actual} differs from the candidate's ${expected}; not publishing."
+          shopt -s nullglob
+          files=("${RUNNER_TEMP}"/crate/*.crate)
+          if [[ ${#files[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one verified crate."
             exit 1
           fi
-          echo "needed=true" >> "$GITHUB_OUTPUT"
+          if [[ "$(sha256sum "${files[0]}" | awk '{print $1}')" != "${EXPECTED}" ]]; then
+            echo "::error::The downloaded crate does not match the crate job's checksum."
+            exit 1
+          fi
 
+      # cargo cannot upload a prepared .crate, so the same sources are repackaged with
+      # the same compiler and uploaded only when the bytes match the verified crate.
+      - name: Reproduce the verified crate
+        id: repackage
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.crate.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cargo package --no-verify --locked ||
+            { echo "::error::Could not repackage the crate."; exit 1; }
+          actual="$(sha256sum "target/package/${NAME}-${VERSION}.crate" | awk '{print $1}')"
+          if [[ "${actual}" != "${EXPECTED}" ]]; then
+            echo "::error::The repackaged crate differs from the verified crate; not publishing."
+            exit 1
+          fi
+          echo "The repackaged crate matches the verified crate."
+
+      # Only a definite 404 means "not published yet": any other registry answer is
+      # an error, not an absence.
+      - name: Check crates.io
+        id: registry
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.crate.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          body="${RUNNER_TEMP}/registry.json"
+          code="$(curl -sS -A "${NAME}-release" -o "${body}" -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/${NAME}/${VERSION}")" ||
+            { echo "::error::crates.io could not be reached."; exit 1; }
+          if [[ "${code}" == 200 ]]; then
+            got="$(jq -r '.version.checksum // empty' "${body}")"
+            if [[ "${got}" != "${EXPECTED}" ]]; then
+              echo "::error::crates.io has ${NAME} ${VERSION} with a different checksum."
+              exit 1
+            fi
+            echo "${NAME} ${VERSION} is already on crates.io with the verified checksum."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${code}" == 404 ]]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::crates.io answered HTTP ${code}."
+            exit 1
+          fi
+
+      # Short-lived token from crates.io Trusted Publishing; no registry secret is
+      # stored. It is only minted when the version is absent.
       - name: Get a crates.io token (Trusted Publishing)
         id: auth
-        if: steps.crate.outputs.needed == 'true'
+        if: steps.registry.outputs.needed == 'true'
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Publish to crates.io
-        if: steps.crate.outputs.needed == 'true'
+        id: publish
+        if: steps.registry.outputs.needed == 'true'
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          CRATE: ${{ steps.crate.outputs.crate }}
-          EXPECTED: ${{ steps.crate.outputs.expected }}
-          VERSION: ${{ needs.guard.outputs.version }}
+          EXPECTED: ${{ needs.crate.outputs.sha256 }}
         run: |
           set -euo pipefail
-          cargo publish --no-verify --locked
+          cargo publish --locked --no-verify ||
+            { echo "::error::crates.io did not accept the crate."; exit 1; }
+          body="${RUNNER_TEMP}/registry.json"
           for _ in $(seq 30); do
-            got="$(curl -sf -A "${CRATE}-release" "https://crates.io/api/v1/crates/${CRATE}/${VERSION}" | jq -r '.version.checksum // empty' || true)"
-            if [[ "${got}" == "${EXPECTED}" ]]; then
-              echo "crates.io has ${CRATE} ${VERSION} with checksum ${EXPECTED}."
-              exit 0
+            code="$(curl -sS -A "${NAME}-release" -o "${body}" -w '%{http_code}' \
+              "https://crates.io/api/v1/crates/${NAME}/${VERSION}")" ||
+              { echo "::error::crates.io could not be reached after publishing."; exit 1; }
+            if [[ "${code}" == 200 ]]; then
+              got="$(jq -r '.version.checksum // empty' "${body}")"
+              if [[ "${got}" == "${EXPECTED}" ]]; then
+                echo "crates.io has ${NAME} ${VERSION} with the verified checksum."
+                exit 0
+              fi
+              echo "::error::crates.io reports a different checksum for ${NAME} ${VERSION}."
+              exit 1
+            fi
+            if [[ "${code}" != 404 ]]; then
+              echo "::error::crates.io answered HTTP ${code} after publishing."
+              exit 1
             fi
             sleep 10
           done
-          echo "::error::crates.io does not report ${CRATE} ${VERSION} with checksum ${EXPECTED} yet."
+          echo "::error::crates.io does not report ${NAME} ${VERSION} yet."
           exit 1

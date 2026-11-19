@@ -1,0 +1,59 @@
+name: Release version gate
+description: >-
+  Refuse to publish a version whose tag exists or which is not above every canonical
+  X.Y.Z release tag. Only an explicit API 404 counts as an absent tag; any other
+  answer fails. Called before the release is published (when GitHub creates the tag)
+  and again immediately before that publication.
+inputs:
+  version:
+    description: Canonical X.Y.Z package version to publish.
+    required: true
+  token:
+    description: A token that can read the repository.
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # The tag's HTTP status distinguishes "not there" from "could not ask": a
+        # failing gh can still carry the status line, and only a definite 404 is an
+        # absence.
+        headers="$(gh api -i "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" 2>/dev/null || true)"
+        status="$(sed -n 's#^HTTP/[^ ]* \([0-9][0-9][0-9]\).*#\1#p' <<<"${headers}")"
+        status="${status%%$'\n'*}"
+        if [[ -z "${status}" ]]; then
+          echo "::error::Could not look up tag ${VERSION}."
+          exit 1
+        fi
+        if [[ "${status}" != 404 ]]; then
+          if [[ "${status}" == 200 ]]; then
+            echo "::error::${VERSION} is already tagged; bump the version first."
+          else
+            echo "::error::GitHub answered HTTP ${status} for tag ${VERSION}."
+          fi
+          exit 1
+        fi
+        # Version order is numeric: 0.9.9 < 0.10.0. Noncanonical tags are not
+        # releases and are ignored.
+        tags="$(gh api "repos/${GITHUB_REPOSITORY}/tags")" ||
+          { echo "::error::Could not list the release tags."; exit 1; }
+        highest="$(jq -r '.[].name' <<<"${tags}" |
+          grep -E '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' |
+          sort -V | tail -n 1 || true)"
+        if [[ -n "${highest}" ]]; then
+          if [[ "${highest}" == "${VERSION}" ]]; then
+            echo "::error::${VERSION} is already tagged; bump the version first."
+            exit 1
+          fi
+          if [[ "$(printf '%s\n%s\n' "${highest}" "${VERSION}" | sort -V | tail -n 1)" != "${VERSION}" ]]; then
+            echo "::error::${VERSION} is not above the latest release ${highest}; bump the version."
+            exit 1
+          fi
+        fi
+        echo "Tag ${VERSION} is absent and ${VERSION} is above ${highest:-every release tag}."
