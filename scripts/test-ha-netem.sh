@@ -214,7 +214,7 @@ EOF
     check_command: '$SCENARIO_DIR/check-$node'
     fence_command: '$SCENARIO_DIR/fence'
     interval_ms: 200
-    grant_ttl_ms: 6000
+    grant_ttl_ms: 15000
 EOF
     fi
     mv "$temporary" "$path"
