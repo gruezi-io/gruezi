@@ -21,7 +21,7 @@ systems.
 | Authenticated HA packets | Implemented | HMAC-SHA-256, peer pinning, sessions, and replay protection are tested. |
 | Explicit failure policies | Implemented | Strict, available, and external policies are implemented and covered by tests. |
 | Watchdog fencing | Experimental | Linux and fake-device paths are tested, including the Rocky softdog helper and a real VM reset. |
-| External grant happy path | Experimental | Two-node grant acquisition, renewal beyond 20 seconds, stale-grant withdrawal, and lone-node fencing behavior are tested. |
+| External grant happy path | Experimental | Two-node grant acquisition, renewal beyond 20 seconds, stale-grant withdrawal, and the lone-node `fencing: requested` state are tested. |
 | `gruezi peers` listing | Experimental | The command exists, but peer discovery currently returns an empty list. |
 | Direct `start` flags | Unsupported | `gruezi start --bind/--peers/--node-id` is a stub. Use YAML only. |
 | KV mode | Planned | No Raft or key-value runtime is shipped. |

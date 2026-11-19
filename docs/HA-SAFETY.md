@@ -25,19 +25,24 @@ authority, witness, or fencing system.
   in `available`.
 * **external** requires an external grant and, when needed, confirmed release
   or fencing. Peer silence alone grants nothing.
+  A valid two-node grant renewed ownership beyond 20 seconds in task 26.
+  With `grant_ttl_ms: 15000`, `withdraw_timeout_ms: 5000`, and a 2000 ms
+  safety margin, stale authority withdraws at the 8000 ms cutoff
+  (`15000 - 5000 - 2000`). Fencing is reported as `requested` until confirmed.
 
 Authenticated HMAC packets, ownership confirmation, and all three policies are
 **Implemented**. The Linux watchdog is **Experimental** because the acceptance
 depends on a real device and host reset. The shipped Rocky helper passes,
 including a real VM reset. External grant behavior is **Experimental**, with
-two-node acquisition, renewal, stale-grant withdrawal, and lone-node fencing
-covered by task 26.
+  two-node acquisition, renewal, stale-grant withdrawal, and the lone-node
+  `fencing: requested` state covered by task 26. A lone node remains unowned;
+  fencing is requested but not confirmed.
 
 ## Failure matrix
 
 | Failure | strict | available | external |
 | --- | --- | --- | --- |
-| Startup | Both nodes coordinate. A lone node stays unavailable. | Connected nodes coordinate. An isolated node may promote after its deadline. | A valid grant is required. |
+| Startup | Both nodes coordinate. A lone node stays unavailable. | Connected nodes coordinate. An isolated node may promote after its deadline. | A lone node stays unowned with fencing `requested`; a valid grant alone does not establish bootstrap. |
 | Graceful failover | Safe release, confirmed absence, then acquire, with a brief gap. | Safe handoff when the session is fresh. | Release or confirmed fencing is required before acquire. |
 | Active host crash | Standby does not promote. VIP is unavailable until peer return or operator action. | Standby promotes after the follower deadline. | No promotion without grant and release or fencing proof. |
 | Standby host crash | Owner loses consent and withdraws. VIP is unavailable. | Owner continues. | Owner continues only while its grant remains valid. |
@@ -145,14 +150,9 @@ shows dual ownership (A+B), the documented unsafe overlap.
 
 Observed results that differ from the table above or from the design:
 
-* **available, frozen owner resumed (fixed by todo 24).** At 2d531e7, after
-  SIGCONT both nodes yielded at the same moment, the VIP was absent for about
-  one second, then the higher priority node reacquired. Now the resumed owner
-  detects its own stall, withdraws without advertising its stale claim, and
-  waits until the peer acknowledges that; the visible incumbent B keeps the
-  VIP with no gap. `test-ha-netem.sh process-freeze available` PASSes 3/3 on
-  gruezi-a (kernel 264), and an 80-sample trace after SIGCONT never shows
-  both kernels holding the VIP.
+* **Available process freeze.** The fixed binary passes
+  `test-ha-netem.sh process-freeze available` 3/3 with the incumbent rule.
+  Evidence: `.omo/evidence/task-24-gruezi-ha-safety-roadmap.txt`.
 * **External grant lifetime and release proof.** Configuration rejects a grant
   TTL that cannot cover withdrawal and safety margin. A release proof is
   discarded when the peer restarts or reacquires, so a successor requires
@@ -176,12 +176,36 @@ Observed results that differ from the table above or from the design:
 Full per-row observations, the discarded first-pass results and the cleanup
 verification are in `.omo/evidence/task-17-gruezi-ha-safety-roadmap.md`.
 
-The current claim map is: HA election over UDP is **Implemented** by
-`tests/ha_mode.rs`; the status API is **Implemented** by
-`src/gruezi/api.rs:76`, including
-`status_json_preserves_every_existing_field_and_health`; transition hooks are
-**Implemented** by `tests/ha_hooks.rs`; VIP ownership, authenticated packets,
-policies, status, and watchdog behavior are **Implemented** or **Experimental**
-as labelled above, with evidence in tasks 6 through 17 and 20 through 28.
-`gruezi peers` remains **Experimental** because
-`src/gruezi/peers.rs:list_peers` returns an empty list.
+The exact claim map is:
+
+* HA election over UDP, **Implemented**: `tests/ha_mode.rs`, especially
+  `higher_priority_node_wins_over_udp` and
+  `status_api_reflects_live_ha_state`.
+* Read-only status API, **Implemented**:
+  `src/gruezi/api.rs:76`, test
+  `status_json_preserves_every_existing_field_and_health` in task 7 evidence.
+* Transition hooks, **Implemented**: `tests/ha_hooks.rs` and task 6 evidence.
+* VIP ownership confirmation, **Implemented**:
+  `ownership::tests::partial_acquisition_yields_uncertain_never_present`,
+  `delayed_add_then_demote_ends_absent`, and task 6 evidence.
+* Authenticated HA packets, **Implemented**:
+  `protocol::tests::hmac_sha256_matches_rfc4231_test_vectors`,
+  `tag_is_hmac_over_context_and_every_preceding_byte`, and the session replay
+  tests in task 9 evidence.
+* All three policies, **Implemented**:
+  `matrix_strict_*`, `matrix_available_*`, and `matrix_external_*` in tasks 10
+  and 12 evidence.
+* Watchdog fencing, **Experimental**:
+  `matrix_strict_watchdog_arm_fails`,
+  `matrix_available_watchdog_arm_fails`, and
+  `matrix_external_watchdog_arm_fails` in task 13 evidence, plus the Rocky
+  helper run in task 22 evidence.
+* `gruezi peers` listing, **Experimental**:
+  `src/gruezi/peers.rs:list_peers`, which returns an empty list.
+
+The policy matrix evidence is scoped to task 24 for available process freeze,
+task 27 for the three failed-withdrawal rows, task 26 for all ten external
+rows, and the two consecutive 30/30 all-policy runs at
+`/home/ansible/t28/trace-head-full-1/run.out` and
+`/home/ansible/t28/trace-head-full-2/run.out`. The task 28 artifact is cited
+only for its stale-binary root-cause lesson until it reports DONE.

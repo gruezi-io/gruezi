@@ -31,15 +31,27 @@ operation.
 
 **Acceptance criteria:**
 
-* Deterministic policy tests cover the documented rows, and the netem matrix
-  passes after the freeze and failed-withdrawal fixes. Evidence:
-  `matrix_available_thawed_owner_yields_to_incumbent`,
-  `.omo/evidence/task-24-gruezi-ha-safety-roadmap.txt`, and
-  `.omo/evidence/task-27-gruezi-ha-safety-roadmap.txt`.
+* Deterministic policy tests cover the documented rows. Available process
+  freeze is 3/3 PASS in
+  `.omo/evidence/task-24-gruezi-ha-safety-roadmap.txt`; the three
+  failed-withdrawal rows pass in
+  `.omo/evidence/task-27-gruezi-ha-safety-roadmap.txt`; all ten external rows
+  pass in `.omo/evidence/task-26-gruezi-ha-safety-roadmap.txt`. Two consecutive
+  full 30/30 runs are recorded at
+  `/home/ansible/t28/trace-head-full-1/run.out` and
+  `/home/ansible/t28/trace-head-full-2/run.out`.
 * Strict mode never promotes after arbitrary simulated peer silence.
+  Evidence: `matrix_strict_active_crash`,
+  `matrix_strict_full_partition` in
+  `.omo/evidence/task-10-gruezi-ha-safety-roadmap.txt`.
 * Available mode records `assumed` and demonstrates the documented partition
-  outcome.
-* Required watchdog arm failure produces zero resource additions.
+  outcome. Evidence: `matrix_available_full_partition` in
+  `.omo/evidence/task-10-gruezi-ha-safety-roadmap.txt`.
+* Required watchdog arm failure produces zero resource additions. Evidence:
+  `matrix_strict_watchdog_arm_fails`,
+  `matrix_available_watchdog_arm_fails`, and
+  `matrix_external_watchdog_arm_fails` in
+  `.omo/evidence/task-13-gruezi-ha-safety-roadmap.txt`.
 * Fault injection proves a frozen owner stops feeding and the resource is
   withdrawn or the host resets. Evidence:
   `.omo/evidence/task-13-gruezi-ha-safety-roadmap.txt` and
