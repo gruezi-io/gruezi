@@ -7,7 +7,53 @@
     gruezi_prepare_install_podman: false
     gruezi_prepare_load_softdog: false
     gruezi_ha_peer_port: 9375
+    # Modules the HA lab needs from the RUNNING kernel: ha-drop.yml compiles
+    # `-p udp -m udp -m comment -j DROP` through iptables-nft, which requires
+    # nf_tables/nft_compat plus the xt_udp and xt_comment matches. The Rocky 10
+    # cloud-image kernel shipped without kernel-modules-extra for the running
+    # kernel and failed with `Extension udp revision 0 not supported` until the
+    # extra modules were installed or the VM booted the kernel dnf installed.
+    gruezi_prepare_netfilter_modules:
+      - nf_tables
+      - nft_compat
+      - ip_tables
+      - iptable_filter
+      - iptable_nat
+      - nft_nat
+      - xt_udp
+      - xt_comment
   tasks:
+    - name: Check running-kernel netfilter modules
+      ansible.builtin.shell: |
+        set -u
+        kernel=$(uname -r)
+        missing=''
+        for module in {{ gruezi_prepare_netfilter_modules | join(' ') }}; do
+          if [ -d "/sys/module/${module}" ] || modprobe -n -q "${module}" >/dev/null 2>&1; then
+            continue
+          fi
+          missing="${missing} ${module}"
+        done
+        if [ -n "${missing}" ]; then
+          printf 'kernel %s does not provide netfilter module(s):%s\n' "${kernel}" "${missing}"
+          exit 1
+        fi
+        printf 'kernel %s provides all required netfilter modules\n' "${kernel}"
+      args:
+        executable: /bin/bash
+      register: gruezi_netfilter_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the running kernel lacks a netfilter module
+      ansible.builtin.fail:
+        msg: >-
+          {{ gruezi_netfilter_check.stdout | trim }}.
+          Install kernel-modules-extra for the running kernel (dnf install
+          'kernel-modules-extra-$(uname -r)') or reboot onto the kernel dnf
+          installed, then re-run this playbook.
+      when: gruezi_netfilter_check.rc != 0
+
     - name: Install HA lab packages
       ansible.builtin.dnf:
         name: >-

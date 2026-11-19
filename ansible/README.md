@@ -177,6 +177,9 @@ Operational notes:
 - `--limit` is the easiest way to create asymmetric impairment on only one host
 - `ha-drop.yml` is the safer choice for one-way packet loss on a live lab that shares the same NIC for SSH and HA traffic
 - after applying or clearing an impairment, validate the result with `gruezi status --watch` or by checking `http://127.0.0.1:9376/status` on each node
+- on the nftables backend (`iptables v1.8.11 (nf_tables)`), `nft list ruleset` lists the ha-drop rule WITHOUT its
+  iptables comment: `iptables -S OUTPUT` carries `--comment gruezi-ha-drop`, while the nft view only shows
+  `ip daddr <peer> udp dport 9375 ... drop`. Assert the comment in the iptables view and match the nft view by dport
 - a full partition in a 2-node HA pair can produce dual-active ownership until connectivity is restored
 - collected artifacts are written locally under `ansible/artifacts/<label>/`
 - each collection stores one file per host for `/status`, `tc qdisc show`, `ip address show`, `iptables -S OUTPUT`, `nft list ruleset`, and the recent `gruezi.log` tail
