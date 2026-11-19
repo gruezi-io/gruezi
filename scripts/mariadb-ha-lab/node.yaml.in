@@ -1,0 +1,22 @@
+mode: ha
+node:
+  id: node-@NODE@
+ha:
+  failure_policy: available
+  peer_id: node-@PEER@
+  bind: @IP@:9375
+  peer: @PEER_IP@:9375
+  interface: eth0
+  addresses: [10.249.15.100/24]
+  group_id: mariadb-lab
+  priority: @PRIORITY@
+  preempt: false
+  advert_interval_ms: 200
+  dead_factor: 3
+  hold_down_ms: 400
+  jitter_ms: 0
+  command_timeout_ms: 1000
+  withdraw_timeout_ms: 5000
+  auth:
+    key: @KEY@
+@HOOKS@
