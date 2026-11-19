@@ -82,5 +82,93 @@ both nodes, update both configurations, then start both nodes. An upgrade uses
 the same procedure: stop both, upgrade both, start both. A strict pair has an
 outage during that procedure.
 
+## Validation status
+
+Acceptance run on two Proxmox VMs (Rocky Linux 10, kernel 6.12.0-264.16.1.el10_3,
+same L2 segment, VIP on eth0) at repository commit 2d531e7. Each live row
+deployed the policy with Ansible, injected the fault with ansible ad-hoc
+commands or the ha-netem and ha-drop playbooks, and waited (bounded) until
+both nodes matched the expected kernel VIP check (`ip -o addr show dev eth0`)
+and the /status fields `state`, `owned`, `authority.source`, `safety.level`
+and `resource.state`. The same ten scenarios also ran in the isolated
+namespace matrix (`scripts/test-ha-netem.sh all`) on both VMs: 28 of 30 PASS
+on each kernel (kernel 211 on gruezi-a, kernel 264 on gruezi-b). A FAIL stays a
+FAIL here until its fix todo closes.
+
+Live rows (A is gruezi-a, priority 150; B is gruezi-b, priority 100):
+
+| Policy | Scenario | Live | Netem matrix | Kernel VIP owner observed | Evidence (local, gitignored) |
+| --- | --- | --- | --- | --- | --- |
+| strict | startup | PASS | PASS | A | `strict-startup-after/observations.txt` |
+| strict | graceful-failover | PASS | PASS | none | `strict-graceful-failover-after/observations.txt` |
+| strict | active-crash | PASS | PASS | A | `strict-active-crash-after/observations.txt` |
+| strict | standby-crash | PASS | PASS | none | `strict-standby-crash-after/observations.txt` |
+| strict | full-partition | PASS | PASS | none | `strict-full-partition-after/observations.txt` |
+| strict | a-to-b-loss | PASS | PASS | none | `strict-a-to-b-loss-after/observations.txt` |
+| strict | b-to-a-loss | PASS | PASS | none | `strict-b-to-a-loss-after/observations.txt` |
+| strict | process-freeze | PASS | PASS | A | `strict-process-freeze-after/observations.txt` |
+| strict | failed-withdrawal | PASS | PASS | A | `strict-failed-withdrawal-after/observations.txt` |
+| strict | recovery-failback | PASS | PASS | A | `strict-recovery-failback-after/observations.txt` |
+| available | startup | PASS | PASS | A | `available-startup-after/observations.txt` |
+| available | graceful-failover | PASS | PASS | B | `available-graceful-failover-after/observations.txt` |
+| available | active-crash | PASS | PASS | A+B | `available-active-crash-after/observations.txt` |
+| available | standby-crash | PASS | PASS | A | `available-standby-crash-after/observations.txt` |
+| available | full-partition | PASS | PASS | A+B | `available-full-partition-after/observations.txt` |
+| available | a-to-b-loss | PASS | PASS | B | `available-a-to-b-loss-after/observations.txt` |
+| available | b-to-a-loss | PASS | PASS | A | `available-b-to-a-loss-after/observations.txt` |
+| available | recovery-failback | PASS | PASS | A | `available-recovery-failback-after/observations.txt` |
+| available | process-freeze | FAIL | FAIL | A | `available-process-freeze-after/observations.txt` |
+| available | failed-withdrawal | PASS | FAIL | A | `available-failed-withdrawal-after/observations.txt` |
+| external | startup | PASS | PASS | A | `external-startup-after/observations.txt` |
+| external | graceful-failover | PASS | PASS | B | `external-graceful-failover-after/observations.txt` |
+| external | active-crash | PASS | PASS | B | `external-active-crash-after/observations.txt` |
+| external | standby-crash | PASS | PASS | A | `external-standby-crash-after/observations.txt` |
+| external | full-partition | PASS | PASS | A | `external-full-partition-after/observations.txt` |
+| external | a-to-b-loss | PASS | PASS | A | `external-a-to-b-loss-after/observations.txt` |
+| external | b-to-a-loss | PASS | PASS | A | `external-b-to-a-loss-after/observations.txt` |
+| external | process-freeze | PASS | PASS | A | `external-process-freeze-after/observations.txt` |
+| external | recovery-failback | PASS | PASS | A | `external-recovery-failback-after/observations.txt` |
+| external | failed-withdrawal, A restarted after SIGKILL | PASS | PASS | A | `external-failed-withdrawal-sigkill-restart-after/observations.txt` |
+| external | failed-withdrawal, A restarted after SIGTERM | FAIL | n/a | A+B | `external-failed-withdrawal-sigterm-restart-after/observations.txt` |
+
+In the Kernel VIP owner column "none" means neither kernel holds the VIP. For
+strict that is a PASS: withdrawal and the absent VIP are the intended outcome.
+After a crash or freeze of an owner the VIP stays in the host kernel (a
+residual VIP) while its status is unavailable. The available partition row
+shows dual ownership (A+B), the documented unsafe overlap.
+
+Observed results that differ from the table above or from the planned design:
+
+* **available, frozen owner resumed (FAIL).** After SIGCONT both nodes yield at
+  the same moment, the VIP is absent for about one second, then the higher
+  priority node reacquires. One kernel VIP remains, but the documented result
+  was a single yielding side. Open fix todo 24 in the roadmap plan.
+* **external, stale release proof (FAIL, safety).** If the owner is stopped with
+  SIGTERM, restarted, reacquires the VIP and then fails to withdraw it, a
+  successor holding a fresh grant still acquired the VIP without fencing
+  (both kernels held the VIP). The same flow after SIGKILL stayed blocked.
+  Open fix todo 23.
+* **available failed withdrawal.** Passes live with a forced cooperative
+  handoff (stop B, restart B with higher priority and preempt); the
+  `test-ha-netem.sh` flow for this row fails on both kernels. Open fix todo 25.
+* **external grant lifetime.** A `grant_ttl_ms` not greater than
+  `withdraw_timeout_ms + safety_margin_ms` produces no grant and no error.
+  Open fix todo 21.
+* **Watchdog (softdog) on gruezi-b.** Behavior PASS with an adjusted copy of the
+  script: armed after ownership, fed past the 15 s timeout, disarmed after
+  confirmed VIP absence, and an actual VM reset after SIGSTOP of the owner
+  (new boot id, no VIP afterwards). The shipped
+  `scripts/test-watchdog-softdog.sh` FAILS on Rocky Linux 10 before arming
+  (secure_path, missing softdog sysfs parameters, missing `group_id`). Open fix
+  todo 22. The watchdog does not prevent overlap under `available`.
+* **MariaDB master-master lab on the VMs.** 9 of 9 PASS (podman 6.1.1,
+  rootless), including the unfenced direct write limitation and the partition
+  overlap. See the Database fencing section; this does not fence the database.
+* **Lab tooling fixes found by the run** (Ansible example values, iptables-nft,
+  quoting, collection on a dead node): open fix todo 20.
+
+Full per-row observations, the discarded first-pass results and the cleanup
+verification are in `.omo/evidence/task-17-gruezi-ha-safety-roadmap.md`.
+
 Everything in this document that is not already identified as current
 prototype behavior is Planned.
