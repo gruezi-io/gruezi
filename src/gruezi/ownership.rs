@@ -8,8 +8,8 @@ use crate::{
         application::{ApplicationOperation, ApplicationPhase, ApplicationState},
         ha::{HaDecisionReason, HaRuntimeConfig, HaState},
         hooks::{
-            ActivationMode, DeactivationMode, LifecycleContext, LifecycleEvent, LifecycleExecutor,
-            LifecycleKind, LifecycleOperation, LifecycleOutcome,
+            ActivationMode, DeactivationMode, HookContext, HookEvent, LifecycleContext,
+            LifecycleEvent, LifecycleExecutor, LifecycleKind, LifecycleOperation, LifecycleOutcome,
         },
         watchdog::{WatchdogDevice, WatchdogManager, WatchdogStatus},
     },
@@ -424,6 +424,19 @@ enum LifecyclePhase {
     RevokedSticky,
 }
 
+/// Coordinator-owned binding of the next actuator jobs (errata F-04/F-06,
+/// N-03): the cooperative transfer they serve, the operation modes that
+/// transfer implies, and the absolute cleanup deadline a revocation in the
+/// current coordinator iteration must respect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleBinding {
+    pub transfer_id: Option<u64>,
+    pub peer_nonce: Option<[u8; 16]>,
+    pub activation: ActivationMode,
+    pub deactivation: DeactivationMode,
+    pub deactivate_deadline: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingPromotion {
     generation: u64,
@@ -485,6 +498,13 @@ pub struct OwnershipController {
     application_timeout: Option<Duration>,
     lifecycle_executor: Option<LifecycleExecutor>,
     lifecycle_context: LifecycleContext,
+    activation_mode: ActivationMode,
+    deactivation_mode: DeactivationMode,
+    /// Worst-case resource-worker acquisition time `Q` (addresses.rs).
+    acquisition_budget: Duration,
+    /// After a failed activation or verification, no new activation starts
+    /// before this instant (one lifecycle timeout later).
+    activation_hold_until: Option<Instant>,
     application_baseline_pending: bool,
     #[cfg(test)]
     lifecycle_submissions: Vec<(LifecycleKind, u64, LifecycleContext)>,
@@ -545,6 +565,13 @@ impl OwnershipController {
                 db_incarnation: None,
                 notification: None,
             },
+            // Conservative until the coordinator binds a cooperative transfer:
+            // cold activation applies the adapter's strictest preconditions and
+            // revoke never publishes release evidence.
+            activation_mode: ActivationMode::Cold,
+            deactivation_mode: DeactivationMode::Revoke,
+            acquisition_budget: Duration::ZERO,
+            activation_hold_until: None,
             application_baseline_pending: false,
             #[cfg(test)]
             lifecycle_submissions: Vec::new(),
@@ -564,9 +591,50 @@ impl OwnershipController {
         self.start_application_baseline(worker);
     }
 
-    /// Supply coordinator evidence for the next operation without changing authority.
-    pub fn set_lifecycle_context(&mut self, context: LifecycleContext) {
-        self.lifecycle_context = context;
+    /// Supply coordinator evidence for the next operations without changing
+    /// authority. Locally derived fields (authority, incarnation) are kept.
+    pub fn set_lifecycle_binding(&mut self, binding: LifecycleBinding) {
+        self.lifecycle_context.transfer_id = binding.transfer_id;
+        self.lifecycle_context.peer_nonce = binding.peer_nonce;
+        self.lifecycle_context.deactivate_deadline = binding.deactivate_deadline;
+        self.activation_mode = binding.activation;
+        self.deactivation_mode = binding.deactivation;
+    }
+
+    /// Route a role notification through the serial executor when lifecycle is
+    /// configured. Notifications stay log-only: a refused submission is logged
+    /// and never falls back to a detached child at the daemon identity.
+    pub fn submit_notification(&self, event: HookEvent, context: HookContext) {
+        let Some(executor) = &self.lifecycle_executor else {
+            tracing::warn!(
+                event = event.as_env_value(),
+                "lifecycle executor unavailable; notification dropped"
+            );
+            return;
+        };
+        let mut job_context = self.lifecycle_context.clone();
+        job_context.notification = Some(context);
+        match executor.submit(
+            LifecycleOperation::Notify(event),
+            self.generation,
+            job_context,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    event = event.as_env_value(),
+                    "obsolete notification discarded"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, event = event.as_env_value(), "notification not submitted");
+            }
+        }
+    }
+
+    /// Detach the executor for bounded shutdown; later submissions fail closed.
+    pub fn take_lifecycle_executor(&mut self) -> Option<LifecycleExecutor> {
+        self.lifecycle_executor.take()
     }
 
     #[must_use]
@@ -637,10 +705,13 @@ impl OwnershipController {
                 executor.submit(
                     match kind {
                         LifecycleKind::Activate => {
-                            LifecycleOperation::Activate(ActivationMode::Cold)
+                            LifecycleOperation::Activate(self.activation_mode)
+                        }
+                        LifecycleKind::Deactivate if self.application_baseline_pending => {
+                            LifecycleOperation::Deactivate(DeactivationMode::Baseline)
                         }
                         LifecycleKind::Deactivate => {
-                            LifecycleOperation::Deactivate(DeactivationMode::Baseline)
+                            LifecycleOperation::Deactivate(self.deactivation_mode)
                         }
                         LifecycleKind::Verify => LifecycleOperation::Verify,
                         LifecycleKind::Notify(event) => LifecycleOperation::Notify(event),
@@ -693,6 +764,12 @@ impl OwnershipController {
             worker.send_command(ResourceCommand::Withdraw(self.generation));
             RoleTransitionEffect::None
         } else {
+            // Pace re-activation: an immediately failing script would otherwise
+            // cycle activate/deactivate as fast as it exits once compensation
+            // confirms passivity again (a hot loop against the application).
+            self.activation_hold_until = self
+                .application_timeout
+                .map(|period| Instant::now() + period);
             self.revoke_authority_internal(
                 self.elected_role,
                 self.elected_role,
@@ -887,9 +964,17 @@ impl OwnershipController {
         self.application.operation = None;
         self.lifecycle_context.db_incarnation = event.db_incarnation;
         if event.kind == LifecycleKind::Activate {
-            return self.acquire_ready_resource(worker);
+            return self.acquire_after_activation(worker);
         }
         RoleTransitionEffect::None
+    }
+
+    /// The VIP add and first feed (`Q + B`) must still fit the armed watchdog.
+    fn acquire_after_activation(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        if !self.activation_budget_fits(Duration::ZERO) {
+            return self.fail_activation_budget(worker);
+        }
+        self.acquire_ready_resource(worker)
     }
 
     fn advance_generation(&mut self, worker: &ResourceWorkerHandle) -> bool {
@@ -1037,6 +1122,41 @@ impl OwnershipController {
                 runtime.watchdog.safety_margin_ms,
             )));
         self.watchdog = WatchdogManager::new(runtime.watchdog.clone(), device, budget);
+        self.acquisition_budget = Duration::from_millis(
+            u64::try_from(crate::gruezi::addresses::acquisition_budget_ms(
+                runtime.addresses.len(),
+            ))
+            .unwrap_or(u64::MAX),
+        );
+    }
+
+    /// `P + Q + B < W` must hold on the armed device, not only in the
+    /// configuration: a device may round its effective timeout down. The
+    /// remaining watchdog budget must still cover what is left of activation
+    /// (`P`, zero once it succeeded) plus the acquisition `Q`, or the owner
+    /// could be reset by its own watchdog before its first feed.
+    fn activation_budget_fits(&self, activation_remaining: Duration) -> bool {
+        self.watchdog.covers(
+            Instant::now(),
+            activation_remaining.saturating_add(self.acquisition_budget),
+        )
+    }
+
+    fn fail_activation_budget(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        self.fail_application(
+            &LifecycleEvent {
+                kind: LifecycleKind::Activate,
+                generation: self.generation,
+                outcome: LifecycleOutcome::Failed,
+                elapsed: Duration::ZERO,
+                started: None,
+                exit_code_or_signal: None,
+                stderr_tail: "remaining watchdog budget cannot cover activation and acquisition"
+                    .to_owned(),
+                db_incarnation: None,
+            },
+            worker,
+        )
     }
 
     pub(crate) fn watchdog_status(&self, now: Instant) -> WatchdogStatus {
@@ -1236,10 +1356,18 @@ impl OwnershipController {
         reason: HaDecisionReason,
         worker: &ResourceWorkerHandle,
     ) -> RoleTransitionEffect {
-        if self.application.configured() && !authority.is_valid() {
+        let held = self
+            .activation_hold_until
+            .is_some_and(|until| until > Instant::now());
+        if self.application.configured() && (!authority.is_valid() || held) {
             // Waiting for authority has performed no application mutation and
             // must not invalidate the current passive generation's evidence.
-            self.authority = authority;
+            // A held retry stays pending so the next refresh re-evaluates it.
+            self.authority = if held {
+                AuthorityState::Pending
+            } else {
+                authority
+            };
             self.pending_promotion = Some(PendingPromotion {
                 generation: self.generation,
                 previous_state: self.previous_role,
@@ -1300,6 +1428,9 @@ impl OwnershipController {
             reason,
         });
         if self.application.configured() {
+            if !self.activation_budget_fits(self.application_timeout.unwrap_or_default()) {
+                return self.fail_activation_budget(worker);
+            }
             self.application.phase = ApplicationPhase::Activating {
                 generation: self.generation,
             };

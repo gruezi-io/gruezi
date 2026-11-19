@@ -205,6 +205,23 @@ impl WatchdogManager {
         self.generation = None;
     }
 
+    /// Whether the armed device still leaves `reserve` before the feed budget
+    /// (the same `elapsed + B >= W` rule as `feed`) is exhausted. A watchdog
+    /// that is off, unprotected or not armed for ownership constrains nothing.
+    pub(crate) fn covers(&self, now: Instant, reserve: Duration) -> bool {
+        if self.generation.is_none() {
+            return true;
+        }
+        self.last_feed
+            .zip(self.effective_timeout)
+            .is_some_and(|(last, timeout)| {
+                now.saturating_duration_since(last)
+                    .saturating_add(self.budget)
+                    .saturating_add(reserve)
+                    < timeout
+            })
+    }
+
     /// Called only by the coordinator, after it checks authority and the owned
     /// resource predicate (present or unmanaged). Armed generation and deadline
     /// budget remain mandatory for either resource state.
@@ -815,6 +832,31 @@ mod tests {
             "WATCHDOG nowayout reboot explicitly accepted: {:?}",
             fake.calls()
         );
+        Ok(())
+    }
+
+    /// W = 15 s, B = 11 s: a reserve fits only while elapsed + B + reserve < W.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_covers_reserve_with_feed_budget_boundaries() -> Result<()> {
+        let (mut manager, _fake) = manager(WatchdogMode::Required, WatchdogFault::None);
+        assert!(manager.covers(Instant::now(), Duration::from_secs(60)));
+        manager.arm(3, true)?;
+        let reserve = Duration::from_secs(3);
+        assert!(manager.covers(Instant::now(), reserve));
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(manager.covers(Instant::now(), reserve));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            !manager.covers(Instant::now(), reserve),
+            "equality is unsafe"
+        );
+        manager.feed(3)?;
+        assert!(
+            manager.covers(Instant::now(), reserve),
+            "a feed restores it"
+        );
+        manager.stop_feeding();
+        assert!(manager.covers(Instant::now(), Duration::from_secs(60)));
         Ok(())
     }
 

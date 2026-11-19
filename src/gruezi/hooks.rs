@@ -5,6 +5,8 @@ use tokio::{process::Command, time::timeout};
 use tracing::{info, warn};
 
 mod executor;
+#[cfg(test)]
+pub(crate) use executor::scripted;
 pub use executor::{
     ActivationMode, AuthoritySource, CANCEL_GRACE_MS, DeactivationMode, LifecycleContext,
     LifecycleEvent, LifecycleExecutor, LifecycleKind, LifecycleOperation, LifecycleOutcome,

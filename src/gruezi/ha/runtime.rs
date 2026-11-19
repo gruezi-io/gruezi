@@ -14,21 +14,32 @@ use crate::{
     config::FailurePolicy,
     gruezi::{
         addresses::{
-            AddressManager, CommandRunner, ResourceReport, ResourceReportKind, ResourceWorkerHandle,
+            AddressManager, CommandRunner, ResourceReport, ResourceReportKind,
+            ResourceWorkerHandle, WITHDRAW_TIMEOUT_MS,
         },
-        hooks::{HookContext, HookEvent, spawn_hook},
-        ownership::{OwnershipController, ReportEffect, ResourceManagement, RoleTransitionEffect},
+        application::ApplicationPhase,
+        hooks::{
+            CANCEL_GRACE_MS, HookContext, HookEvent, LifecycleEvent, LifecycleExecutor,
+            LifecycleKind, LifecycleOutcome, spawn_hook,
+        },
+        ownership::{
+            LifecycleBinding, OwnershipController, ReportEffect, ResourceManagement,
+            RoleTransitionEffect,
+        },
         watchdog::WatchdogDevice,
     },
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::VecDeque,
     future::Future,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::watch};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, watch},
+};
 use tracing::{debug, info, warn};
 
 mod authority_commands;
@@ -240,71 +251,163 @@ async fn run_with_watchdog<F, T>(
 where
     F: Future<Output = T>,
 {
-    let (io, local_bind, peer_addr) = open_transport(&runtime, transport).await?;
-    let peer = PeerTracker::new(&runtime, peer_addr.ip(), boot_nonce()?)?;
-    let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
-    let (mut worker, mut loop_state) = spawn_worker(&runtime, runner, status_tx.as_ref(), peer);
-    loop_state.ownership.configure_watchdog(&runtime, watchdog);
-    tokio::pin!(shutdown);
-    let mut authority_commands = authority_commands::AuthorityCommands::new(authority_runner);
+    run_with_seams(
+        runtime,
+        transport,
+        Seams {
+            commands: runner,
+            authority: authority_runner,
+            watchdog,
+            lifecycle: LifecycleRunner::System,
+        },
+        status_tx,
+        shutdown,
+    )
+    .await
+}
 
-    log_runtime_start(&runtime, &local_bind, peer_addr);
+/// Lifecycle script execution seam (design spec 8a: an enum, never a trait
+/// object). Production always runs the packaged-identity executor.
+enum LifecycleRunner {
+    System,
+    /// Real subprocesses at the test process identity, with a running clock.
+    #[cfg(test)]
+    Process,
+    /// The real executor queue with scripted jobs in virtual time.
+    #[cfg(test)]
+    Scripted(std::sync::Arc<std::sync::Mutex<crate::gruezi::hooks::scripted::ScriptedLifecycle>>),
+}
+
+/// Every process-level side effect the coordinator drives.
+struct Seams {
+    commands: CommandRunner,
+    authority: authority_commands::AuthorityCommandRunner,
+    watchdog: WatchdogDevice,
+    lifecycle: LifecycleRunner,
+}
+
+type LifecycleEvents = Option<mpsc::UnboundedReceiver<LifecycleEvent>>;
+
+/// Everything the coordinator loop owns once transport and executor run.
+struct Started {
+    io: DatagramIo,
+    peer_addr: std::net::SocketAddr,
+    worker: ResourceWorkerHandle,
+    loop_state: HaLoopState,
+    lifecycle_events: LifecycleEvents,
+    authority_commands: authority_commands::AuthorityCommands,
+}
+
+async fn start_runtime(
+    runtime: &HaRuntimeConfig,
+    transport: Transport,
+    seams: Seams,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+) -> Result<Started> {
+    let (io, local_bind, peer_addr) = open_transport(runtime, transport).await?;
+    // One boot nonce is both the wire sender_nonce and the actuator's
+    // GRUEZI_INSTANCE_ID (errata F-04); never draw a second identity.
+    let nonce = boot_nonce()?;
+    let (executor, lifecycle_events) = spawn_lifecycle(runtime, nonce, &seams.lifecycle)?
+        .map_or((None, None), |(executor, events)| {
+            (Some(executor), Some(events))
+        });
+    let peer = PeerTracker::new(runtime, peer_addr.ip(), nonce)?;
+    let (worker, mut loop_state) = spawn_worker(runtime, seams.commands, status_tx, peer, executor);
+    loop_state
+        .ownership
+        .configure_watchdog(runtime, seams.watchdog);
+    log_runtime_start(runtime, &local_bind, peer_addr);
+    Ok(Started {
+        io,
+        peer_addr,
+        worker,
+        loop_state,
+        lifecycle_events,
+        authority_commands: authority_commands::AuthorityCommands::new(seams.authority),
+    })
+}
+
+async fn run_with_seams<F, T>(
+    runtime: HaRuntimeConfig,
+    transport: Transport,
+    seams: Seams,
+    status_tx: Option<watch::Sender<HaStatus>>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = T>,
+{
+    let Started {
+        io,
+        peer_addr,
+        mut worker,
+        mut loop_state,
+        mut lifecycle_events,
+        mut authority_commands,
+    } = start_runtime(&runtime, transport, seams, status_tx.as_ref()).await?;
+    let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
+    tokio::pin!(shutdown);
 
     loop {
-        drain_reports(&runtime, status_tx.as_ref(), &mut loop_state, &mut worker);
-        refresh_local_state(&runtime, &mut loop_state, &worker);
-        authority_commands.start_due(
-            &runtime,
-            &mut loop_state.ownership,
-            loop_state.peer.last_fresh_at(),
-        );
-        publish_loop_status(
+        evaluate_iteration(
             &runtime,
             status_tx.as_ref(),
-            &loop_state,
-            tokio::time::Instant::now().into_std(),
+            &mut loop_state,
+            &mut worker,
+            &mut authority_commands,
         );
         if loop_state.shutdown_deadline.is_some_and(|deadline| {
             tokio::time::Instant::now() >= deadline || loop_state.handoff.acknowledged
         }) {
-            authority_commands.stop().await;
-            cleanup_before_exit(
+            exit_cleanup(
                 &runtime,
                 status_tx.as_ref(),
                 &mut loop_state,
                 &mut worker,
+                &mut lifecycle_events,
+                &mut authority_commands,
                 false,
             )
             .await;
             break;
         }
 
+        let verify_wake = sleep_until_optional(verification_wake(&loop_state.ownership));
         let advert_sleep = tokio::time::sleep_until(loop_state.next_advert_at);
         let reconcile_sleep = tokio::time::sleep_until(loop_state.next_reconcile_at);
-        // Wake exactly at the authority deadline so a lapsed consent is
-        // handled on time instead of at the next advert tick (invariant I3).
-        let authority_sleep = sleep_until_optional(loop_state.ownership.authority().expiry());
-        tokio::pin!(advert_sleep, reconcile_sleep, authority_sleep);
-        let shutdown_sleep = sleep_until_optional(loop_state.shutdown_deadline);
-        tokio::pin!(shutdown_sleep);
-        let command_sleep =
-            sleep_until_optional(authority_commands.deadline(&runtime, &loop_state.ownership));
-        tokio::pin!(command_sleep);
+        let deadline_wake =
+            sleep_until_optional(next_deadline(&runtime, &loop_state, &authority_commands));
+        tokio::pin!(advert_sleep, reconcile_sleep, deadline_wake, verify_wake);
 
         let event = tokio::select! {
             () = authority_commands.complete(
                 &runtime, &mut loop_state.ownership, loop_state.peer.last_fresh_at(),
             ) => Ok(()),
-            () = &mut command_sleep => Ok(()),
+            // Re-evaluate on the next iteration (authority expiry, command
+            // deadline or shutdown deadline); handling never waits for a tick.
+            () = &mut deadline_wake => Ok(()),
             _ = &mut shutdown, if loop_state.shutdown_deadline.is_none() => {
                 info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
                 authority_commands.stop().await;
                 if !begin_graceful_handoff(&runtime, &mut loop_state) {
-                    cleanup_before_exit(
-                        &runtime, status_tx.as_ref(), &mut loop_state, &mut worker, false,
+                    exit_cleanup(
+                        &runtime, status_tx.as_ref(), &mut loop_state, &mut worker,
+                        &mut lifecycle_events, &mut authority_commands, false,
                     ).await;
                     break;
                 }
+                Ok(())
+            }
+            event = recv_lifecycle(&mut lifecycle_events) => {
+                handle_lifecycle_recv(
+                    &runtime, status_tx.as_ref(), &mut loop_state, &worker,
+                    &mut lifecycle_events, event,
+                );
+                Ok(())
+            }
+            () = &mut verify_wake => {
+                handle_verification(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
                 Ok(())
             }
             Some(report) = worker.recv_report() => {
@@ -318,27 +421,18 @@ where
                 &io, &runtime, peer_addr, status_tx.as_ref(), &mut loop_state,
             ).await,
             () = &mut reconcile_sleep => {
-                loop_state.next_reconcile_at =
-                    tokio::time::Instant::now() + runtime.dead_timeout();
-                if loop_state.ownership.is_startup_reconciled() {
-                    loop_state.ownership.request_reconcile(&worker);
-                }
+                handle_reconcile_tick(&runtime, &mut loop_state, &worker);
                 Ok(())
             }
-            () = &mut authority_sleep => {
-                // Authority deadline reached; the next loop iteration
-                // re-evaluates the failure policy against the consent state.
-                Ok(())
-            }
-            () = &mut shutdown_sleep => Ok(()),
         };
         if let Err(error) = event {
-            authority_commands.stop().await;
-            cleanup_before_exit(
+            exit_cleanup(
                 &runtime,
                 status_tx.as_ref(),
                 &mut loop_state,
                 &mut worker,
+                &mut lifecycle_events,
+                &mut authority_commands,
                 true,
             )
             .await;
@@ -349,11 +443,274 @@ where
     Ok(())
 }
 
+/// Apply queued resource reports, re-evaluate election and authority, start
+/// due authority commands and publish, all before the next wait.
+fn evaluate_iteration(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
+    authority_commands: &mut authority_commands::AuthorityCommands,
+) {
+    drain_reports(runtime, status_tx, loop_state, worker);
+    refresh_local_state(runtime, loop_state, worker);
+    authority_commands.start_due(
+        runtime,
+        &mut loop_state.ownership,
+        loop_state.peer.last_fresh_at(),
+    );
+    publish_loop_status(
+        runtime,
+        status_tx,
+        loop_state,
+        tokio::time::Instant::now().into_std(),
+    );
+}
+
+/// Stop authority commands, then run the bounded exit cleanup.
+async fn exit_cleanup(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
+    lifecycle_events: &mut LifecycleEvents,
+    authority_commands: &mut authority_commands::AuthorityCommands,
+    faulted: bool,
+) {
+    authority_commands.stop().await;
+    cleanup_before_exit(
+        runtime,
+        status_tx,
+        loop_state,
+        worker,
+        lifecycle_events,
+        faulted,
+    )
+    .await;
+}
+
+/// B1 cadence (errata N-01): the due-submit time `next_verify_at` (absent
+/// while a Verify is in flight: coalesced) and the staleness deadline
+/// `next_verify_at + D`, which fires even if no completion ever arrives.
+fn verification_wake(ownership: &OwnershipController) -> Option<tokio::time::Instant> {
+    ownership
+        .next_verify_at()
+        .into_iter()
+        .chain(ownership.verification_deadline())
+        .min()
+}
+
+fn handle_reconcile_tick(
+    runtime: &HaRuntimeConfig,
+    loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
+) {
+    loop_state.next_reconcile_at = tokio::time::Instant::now() + runtime.dead_timeout();
+    if loop_state.ownership.is_startup_reconciled() {
+        bind_lifecycle(runtime, loop_state);
+        loop_state.ownership.request_reconcile(worker);
+    }
+}
+
+/// The earliest pure wake: the authority deadline (so a lapsed consent is
+/// handled on time instead of at the next advert tick, invariant I3), the
+/// external command schedule and the graceful-shutdown deadline.
+fn next_deadline(
+    runtime: &HaRuntimeConfig,
+    loop_state: &HaLoopState,
+    authority_commands: &authority_commands::AuthorityCommands,
+) -> Option<tokio::time::Instant> {
+    [
+        loop_state.ownership.authority().expiry(),
+        loop_state.shutdown_deadline,
+        authority_commands.deadline(runtime, &loop_state.ownership),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn handle_lifecycle_recv(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
+    lifecycle_events: &mut LifecycleEvents,
+    event: Option<LifecycleEvent>,
+) {
+    match event {
+        Some(event) => handle_lifecycle_event(runtime, status_tx, loop_state, worker, event),
+        // Executor gone (generation exhaustion): later submissions fail closed.
+        None => *lifecycle_events = None,
+    }
+}
+
 async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending::<()>().await,
     }
+}
+
+async fn recv_lifecycle(events: &mut LifecycleEvents) -> Option<LifecycleEvent> {
+    match events {
+        Some(events) => events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The single lifecycle cleanup deadline (`withdraw_timeout_ms`) must contain
+/// the resource worker's fixed withdrawal join bound, which runs in parallel
+/// with deactivation and cannot be shortened per deployment.
+const fn lifecycle_cleanup_fits(withdraw_timeout_ms: u64) -> bool {
+    WITHDRAW_TIMEOUT_MS <= withdraw_timeout_ms
+}
+
+/// Start the lifecycle executor when configured. It fails closed when the
+/// packaged identities are unusable, and so does the runtime.
+fn spawn_lifecycle(
+    runtime: &HaRuntimeConfig,
+    boot_nonce: super::protocol::Nonce,
+    runner: &LifecycleRunner,
+) -> Result<Option<(LifecycleExecutor, mpsc::UnboundedReceiver<LifecycleEvent>)>> {
+    let Some(lifecycle) = runtime.lifecycle.clone() else {
+        return Ok(None);
+    };
+    if !lifecycle_cleanup_fits(runtime.withdraw_timeout_ms) {
+        bail!(
+            "ha.withdraw_timeout_ms ({}) must cover the resource worker's fixed {WITHDRAW_TIMEOUT_MS} ms withdrawal bound when ha.lifecycle is configured",
+            runtime.withdraw_timeout_ms
+        );
+    }
+    let (hooks, node_id, group_id) = (
+        runtime.hooks.clone(),
+        runtime.node_id.clone(),
+        runtime.group_id.clone(),
+    );
+    Ok(Some(match runner {
+        LifecycleRunner::System => {
+            LifecycleExecutor::spawn(lifecycle, hooks, node_id, group_id, boot_nonce)?
+        }
+        #[cfg(test)]
+        LifecycleRunner::Process => {
+            LifecycleExecutor::spawn_for_unit_tests(lifecycle, hooks, node_id, group_id, boot_nonce)
+        }
+        #[cfg(test)]
+        LifecycleRunner::Scripted(script) => LifecycleExecutor::spawn_scripted(
+            lifecycle,
+            hooks,
+            node_id,
+            group_id,
+            boot_nonce,
+            script.clone(),
+        ),
+    }))
+}
+
+/// N-03: a Deactivate submitted by a revocation at `revoked_at` must finish,
+/// including the executor's termination (SIGTERM grace, SIGKILL, bounded pipe
+/// drain: two grace periods), inside the one `withdraw_timeout_ms` deadline
+/// that also bounds VIP withdrawal. Notifications never extend it.
+fn deactivate_deadline(
+    runtime: &HaRuntimeConfig,
+    revoked_at: tokio::time::Instant,
+) -> tokio::time::Instant {
+    revoked_at
+        + Duration::from_millis(runtime.withdraw_timeout_ms)
+            .saturating_sub(Duration::from_millis(2 * CANCEL_GRACE_MS))
+}
+
+/// Bind the next actuator jobs to the current transfer and to a cleanup
+/// deadline anchored now. Called before every controller entry point that may
+/// revoke or activate, so a job submitted there carries this iteration's facts.
+fn bind_lifecycle(runtime: &HaRuntimeConfig, loop_state: &mut HaLoopState) {
+    if runtime.lifecycle.is_none() {
+        return;
+    }
+    let (transfer_id, peer_nonce, activation, deactivation) =
+        loop_state.handoff.lifecycle_binding();
+    loop_state
+        .ownership
+        .set_lifecycle_binding(LifecycleBinding {
+            transfer_id,
+            peer_nonce,
+            activation,
+            deactivation,
+            deactivate_deadline: Some(deactivate_deadline(runtime, tokio::time::Instant::now())),
+        });
+}
+
+fn log_lifecycle_event(runtime: &HaRuntimeConfig, event: &LifecycleEvent) {
+    if matches!(event.kind, LifecycleKind::Notify(_)) {
+        // The executor already logs failed notifications; they stay log-only.
+        return;
+    }
+    if event.outcome == LifecycleOutcome::Succeeded {
+        info!(
+            node_id = %runtime.node_id,
+            kind = ?event.kind,
+            generation = event.generation,
+            elapsed_ms = saturating_duration_ms(event.elapsed),
+            "HA lifecycle operation succeeded"
+        );
+    } else {
+        warn!(
+            node_id = %runtime.node_id,
+            kind = ?event.kind,
+            generation = event.generation,
+            outcome = ?event.outcome,
+            elapsed_ms = saturating_duration_ms(event.elapsed),
+            exit_code_or_signal = ?event.exit_code_or_signal,
+            stderr = %event.stderr_tail,
+            "HA lifecycle operation did not succeed"
+        );
+    }
+}
+
+fn saturating_duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Apply one executor completion without awaiting anything, then publish.
+fn handle_lifecycle_event(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
+    event: LifecycleEvent,
+) {
+    let now = tokio::time::Instant::now().into_std();
+    log_lifecycle_event(runtime, &event);
+    bind_lifecycle(runtime, loop_state);
+    let effect = loop_state.ownership.apply_lifecycle_event(event, worker);
+    apply_authority_effect(runtime, loop_state, effect, now);
+    loop_state.handoff.advance(
+        &loop_state.ownership,
+        loop_state.peer.last_sent_seq().saturating_add(1),
+    );
+    publish_loop_status(runtime, status_tx, loop_state, now);
+}
+
+/// B1 wake: a missed freshness deadline (`next_verify_at + D` without a fresh
+/// success) runs the compensation path in this same iteration, before
+/// anything else; otherwise a due `Verify(g)` is submitted (Ready and live
+/// authority only; coalesced while one is in flight).
+fn handle_verification(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
+) {
+    let now = tokio::time::Instant::now().into_std();
+    bind_lifecycle(runtime, loop_state);
+    // `request_verify` checks the staleness deadline before it may submit.
+    let effect = loop_state.ownership.request_verify(worker);
+    apply_authority_effect(runtime, loop_state, effect, now);
+    loop_state.handoff.advance(
+        &loop_state.ownership,
+        loop_state.peer.last_sent_seq().saturating_add(1),
+    );
+    publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
 fn begin_graceful_handoff(runtime: &HaRuntimeConfig, loop_state: &mut HaLoopState) -> bool {
@@ -380,9 +737,10 @@ fn spawn_worker(
     command_runner: CommandRunner,
     status_tx: Option<&watch::Sender<HaStatus>>,
     peer: PeerTracker,
+    lifecycle: Option<LifecycleExecutor>,
 ) -> (ResourceWorkerHandle, HaLoopState) {
     let worker = ResourceWorkerHandle::spawn_with_runner(address_manager(runtime), command_runner);
-    let loop_state = initialize_loop_state(runtime, status_tx, &worker, peer);
+    let loop_state = initialize_loop_state(runtime, status_tx, &worker, peer, lifecycle);
     (worker, loop_state)
 }
 
@@ -450,6 +808,7 @@ fn initialize_loop_state(
     status_tx: Option<&watch::Sender<HaStatus>>,
     worker: &ResourceWorkerHandle,
     peer: PeerTracker,
+    lifecycle: Option<LifecycleExecutor>,
 ) -> HaLoopState {
     let now_tokio = tokio::time::Instant::now();
     let startup_at = now_tokio.into_std();
@@ -461,6 +820,10 @@ fn initialize_loop_state(
     let mut ownership = OwnershipController::new(management);
     ownership.set_failure_policy(runtime.failure_policy.clone());
     ownership.configure_watchdog(runtime, WatchdogDevice::default());
+    if let (Some(executor), Some(config)) = (lifecycle, &runtime.lifecycle) {
+        // Baseline deactivation precedes reconciliation and any election.
+        ownership.configure_lifecycle(executor, config.timeout_ms, worker);
+    }
     ownership.start_reconciliation(worker);
 
     let loop_state = HaLoopState {
@@ -516,6 +879,7 @@ fn refresh_local_state(
         &loop_state.ownership,
         loop_state.peer.last_sent_seq().saturating_add(1),
     );
+    bind_lifecycle(runtime, loop_state);
     let decision = desired_state(
         runtime,
         loop_state.state,
@@ -559,7 +923,13 @@ fn refresh_local_state(
                 .ownership
                 .apply_role_decision(decision.state, decision.reason, worker);
         loop_state.next_reconcile_at = next_reconcile_deadline(runtime, decision.reason, now_tokio);
-        dispatch_role_hook(runtime, effect, loop_state.peer_observation.as_ref(), now);
+        dispatch_role_hook(
+            runtime,
+            &loop_state.ownership,
+            effect,
+            loop_state.peer_observation.as_ref(),
+            now,
+        );
         log_state_change(
             previous_state,
             decision.state,
@@ -579,37 +949,7 @@ fn refresh_local_state(
     // the current role. A grant starts the acquisition; a lapsed strict
     // consent revokes authority and withdraws (invariants I1, I3).
     let authority_effect = loop_state.ownership.refresh_authority(worker);
-    if !matches!(
-        authority_effect,
-        RoleTransitionEffect::None | RoleTransitionEffect::AwaitingConfirmation
-    ) {
-        dispatch_role_hook(
-            runtime,
-            authority_effect,
-            loop_state.peer_observation.as_ref(),
-            now,
-        );
-        if let RoleTransitionEffect::Demote { reason, .. } = authority_effect {
-            loop_state.handoff.fault();
-            // Authority transitions are policy-layer facts: the trigger says
-            // consent (not the election) drove this transition.
-            loop_state.last_transition_reason = Some(reason);
-            loop_state.last_transition_at = Some(now);
-            loop_state.last_transition_trigger =
-                Some(if reason == HaDecisionReason::RuntimeFault {
-                    TransitionTrigger::Fault
-                } else if runtime.failure_policy == FailurePolicy::External {
-                    TransitionTrigger::External
-                } else {
-                    TransitionTrigger::Consent
-                });
-            info!(
-                node_id = %runtime.node_id,
-                reason = %reason,
-                "HA authority revoked by the failure policy; withdrawing"
-            );
-        }
-    }
+    apply_authority_effect(runtime, loop_state, authority_effect, now);
 
     // Unmanaged transitions confirm synchronously. Publish their transfer
     // phase in this iteration, before an advert could expose an absent,
@@ -618,6 +958,48 @@ fn refresh_local_state(
         &loop_state.ownership,
         loop_state.peer.last_sent_seq().saturating_add(1),
     );
+}
+
+/// Notify and record an authority-layer transition: a policy grant, a lapse,
+/// or a lifecycle compensation (activation/verification failure).
+fn apply_authority_effect(
+    runtime: &HaRuntimeConfig,
+    loop_state: &mut HaLoopState,
+    effect: RoleTransitionEffect,
+    now: Instant,
+) {
+    if matches!(
+        effect,
+        RoleTransitionEffect::None | RoleTransitionEffect::AwaitingConfirmation
+    ) {
+        return;
+    }
+    dispatch_role_hook(
+        runtime,
+        &loop_state.ownership,
+        effect,
+        loop_state.peer_observation.as_ref(),
+        now,
+    );
+    if let RoleTransitionEffect::Demote { reason, .. } = effect {
+        loop_state.handoff.fault();
+        // Authority transitions are policy-layer facts: the trigger says
+        // consent (not the election) drove this transition.
+        loop_state.last_transition_reason = Some(reason);
+        loop_state.last_transition_at = Some(now);
+        loop_state.last_transition_trigger = Some(if reason == HaDecisionReason::RuntimeFault {
+            TransitionTrigger::Fault
+        } else if runtime.failure_policy == FailurePolicy::External {
+            TransitionTrigger::External
+        } else {
+            TransitionTrigger::Consent
+        });
+        info!(
+            node_id = %runtime.node_id,
+            reason = %reason,
+            "HA authority revoked by the failure policy; withdrawing"
+        );
+    }
 }
 
 /// Coordinator overrides of the elected role for this evaluation: the
@@ -676,8 +1058,25 @@ fn stalled_owner(
             >= runtime.dead_timeout() + runtime.hold_down()
 }
 
+/// Lifecycle deployments serialize notifications behind critical jobs in the
+/// executor, at the notify identity. Without lifecycle the detached hook path
+/// is unchanged.
+fn notify(
+    runtime: &HaRuntimeConfig,
+    ownership: &OwnershipController,
+    event: HookEvent,
+    context: HookContext,
+) {
+    if ownership.application().configured() {
+        ownership.submit_notification(event, context);
+    } else {
+        spawn_hook(runtime.hooks.clone(), event, context);
+    }
+}
+
 fn dispatch_role_hook(
     runtime: &HaRuntimeConfig,
+    ownership: &OwnershipController,
     effect: RoleTransitionEffect,
     peer_observation: Option<&PeerObservation>,
     now: Instant,
@@ -695,7 +1094,7 @@ fn dispatch_role_hook(
                 peer_observation,
                 now,
             );
-            spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
+            notify(runtime, ownership, HookEvent::Promote, context);
         }
         RoleTransitionEffect::Demote {
             previous_state,
@@ -710,7 +1109,7 @@ fn dispatch_role_hook(
                 peer_observation,
                 now,
             );
-            spawn_hook(runtime.hooks.clone(), HookEvent::Demote, context);
+            notify(runtime, ownership, HookEvent::Demote, context);
         }
         RoleTransitionEffect::Backup {
             previous_state,
@@ -724,7 +1123,7 @@ fn dispatch_role_hook(
                 peer_observation,
                 now,
             );
-            spawn_hook(runtime.hooks.clone(), HookEvent::Backup, context);
+            notify(runtime, ownership, HookEvent::Backup, context);
         }
         RoleTransitionEffect::None | RoleTransitionEffect::AwaitingConfirmation => {}
     }
@@ -741,6 +1140,7 @@ fn handle_resource_report(
     let now = now_tokio.into_std();
     loop_state.next_reconcile_at =
         next_reconcile_deadline(runtime, loop_state.decision_reason, now_tokio);
+    bind_lifecycle(runtime, loop_state);
     let effect = loop_state.ownership.apply_worker_report(report, worker);
 
     match effect {
@@ -756,7 +1156,7 @@ fn handle_resource_report(
                 loop_state.peer_observation.as_ref(),
                 now,
             );
-            spawn_hook(runtime.hooks.clone(), HookEvent::Promote, context);
+            notify(runtime, &loop_state.ownership, HookEvent::Promote, context);
         }
         ReportEffect::Fault {
             state,
@@ -771,7 +1171,7 @@ fn handle_resource_report(
                 loop_state.peer_observation.as_ref(),
                 now,
             );
-            spawn_hook(runtime.hooks.clone(), HookEvent::Fault, context);
+            notify(runtime, &loop_state.ownership, HookEvent::Fault, context);
         }
         ReportEffect::None => {}
     }
@@ -947,6 +1347,17 @@ fn bootstrap_rule_satisfied(
     {
         return false;
     }
+    // VIP absence alone is not passivity: with lifecycle configured the local
+    // application must be confirmed Inactive for the current generation. The
+    // peer's side is covered by its conservative advert (releasing/uncertain
+    // until its own cleanup is resolved).
+    if !loop_state
+        .ownership
+        .application()
+        .passive_confirmed(loop_state.ownership.generation())
+    {
+        return false;
+    }
     if !matches!(
         peer.resource_state,
         AdvertResourceState::Absent | AdvertResourceState::Unmanaged
@@ -1097,11 +1508,18 @@ async fn cleanup_before_exit(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
     worker: &mut ResourceWorkerHandle,
+    lifecycle_events: &mut LifecycleEvents,
     faulted: bool,
 ) {
-    cleanup_before_exit_with_hook(runtime, status_tx, loop_state, worker, faulted, |context| {
-        runtime.hooks.run(HookEvent::Fault, context)
-    })
+    cleanup_before_exit_with_hook(
+        runtime,
+        status_tx,
+        loop_state,
+        worker,
+        lifecycle_events,
+        faulted,
+        |context| runtime.hooks.run(HookEvent::Fault, context),
+    )
     .await;
 }
 
@@ -1110,14 +1528,21 @@ async fn cleanup_before_exit_with_hook<H, F>(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
     worker: &mut ResourceWorkerHandle,
+    lifecycle_events: &mut LifecycleEvents,
     faulted: bool,
     fault_hook: H,
 ) where
     H: FnOnce(HookContext) -> F,
     F: Future<Output = Result<()>>,
 {
-    let cleanup_deadline = tokio::time::Instant::now()
-        + Duration::from_millis(crate::gruezi::addresses::WITHDRAW_TIMEOUT_MS);
+    let started = tokio::time::Instant::now();
+    let cleanup_deadline = started + Duration::from_millis(WITHDRAW_TIMEOUT_MS);
+    // With lifecycle, `withdraw_timeout_ms` is ONE absolute deadline for
+    // script cancellation, VIP withdrawal and deactivation (task 5e); the
+    // startup check guarantees it contains the worker's fixed join bound.
+    let lifecycle = loop_state.ownership.application().configured();
+    let lifecycle_deadline = started + Duration::from_millis(runtime.withdraw_timeout_ms);
+    bind_lifecycle(runtime, loop_state);
     let previous_state = loop_state.state;
     let now = tokio::time::Instant::now().into_std();
     let reason = if faulted {
@@ -1126,8 +1551,10 @@ async fn cleanup_before_exit_with_hook<H, F>(
         HaDecisionReason::GracefulShutdown
     };
 
+    // Runs in parallel with the Deactivate that `shutdown` submits.
     let withdraw_report = loop_state.ownership.shutdown(worker).await;
     let withdrawal_failed = withdraw_report.kind == ResourceReportKind::Fault;
+    let mut awaiting_fault = false;
     if withdrawal_failed {
         warn!(
             error = ?withdraw_report.error,
@@ -1150,15 +1577,33 @@ async fn cleanup_before_exit_with_hook<H, F>(
             loop_state.peer_observation.as_ref(),
             now,
         );
-        // Withdrawal owns the budget first. A notification cannot extend it,
-        // even when the configured hook timeout exceeds the remaining budget.
-        if let Err(error) = tokio::time::timeout_at(cleanup_deadline, fault_hook(context))
-            .await
-            .context("fault hook exceeded the remaining withdrawal deadline")
-            .and_then(std::convert::identity)
+        if lifecycle {
+            // Queued behind the critical Deactivate; cancelled at the deadline.
+            loop_state
+                .ownership
+                .submit_notification(HookEvent::Fault, context);
+            awaiting_fault = runtime.hooks.on_fault.is_some();
+        } else if let Err(error) =
+            // Withdrawal owns the budget first. A notification cannot extend it,
+            // even when the configured hook timeout exceeds the remaining budget.
+            tokio::time::timeout_at(cleanup_deadline, fault_hook(context))
+                    .await
+                    .context("fault hook exceeded the remaining withdrawal deadline")
+                    .and_then(std::convert::identity)
         {
             warn!(%error, node_id = %runtime.node_id, "HA fault hook execution failed during shutdown");
         }
+    }
+    if lifecycle {
+        finish_lifecycle(
+            runtime,
+            loop_state,
+            worker,
+            lifecycle_events,
+            lifecycle_deadline,
+            awaiting_fault,
+        )
+        .await;
     }
 
     if previous_state != HaState::Init {
@@ -1185,6 +1630,53 @@ async fn cleanup_before_exit_with_hook<H, F>(
     publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
+/// Wait, inside the one lifecycle deadline, for the cleanup Deactivate (and a
+/// submitted fault notification) to settle, then cancel and reap whatever is
+/// left. Script termination after the deadline is never waited for.
+async fn finish_lifecycle(
+    runtime: &HaRuntimeConfig,
+    loop_state: &mut HaLoopState,
+    worker: &ResourceWorkerHandle,
+    lifecycle_events: &mut LifecycleEvents,
+    deadline: tokio::time::Instant,
+    mut awaiting_fault: bool,
+) {
+    if let Some(events) = lifecycle_events.as_mut() {
+        while loop_state.ownership.application().operation.is_some() || awaiting_fault {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(event)) => {
+                    if event.kind == LifecycleKind::Notify(HookEvent::Fault) {
+                        awaiting_fault = false;
+                    }
+                    log_lifecycle_event(runtime, &event);
+                    loop_state.ownership.apply_lifecycle_event(event, worker);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+    if let Some(executor) = loop_state.ownership.take_lifecycle_executor() {
+        match tokio::time::timeout_at(deadline, executor.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, node_id = %runtime.node_id, "HA lifecycle executor failed during shutdown");
+            }
+            Err(_) => warn!(
+                node_id = %runtime.node_id,
+                "HA lifecycle work still terminating at the withdrawal deadline; not waiting"
+            ),
+        }
+    }
+    // Record what the shutdown itself settled: a cancelled Deactivate never
+    // confirmed passivity and must leave a failure, not a clean exit.
+    if let Some(events) = lifecycle_events.as_mut() {
+        while let Ok(event) = events.try_recv() {
+            log_lifecycle_event(runtime, &event);
+            loop_state.ownership.apply_lifecycle_event(event, worker);
+        }
+    }
+}
+
 /// Advert fields owned by the coordinator: elected role plus the ownership
 /// controller's authority and resource view.
 fn advert_state(ownership: &OwnershipController) -> AdvertState {
@@ -1192,10 +1684,27 @@ fn advert_state(ownership: &OwnershipController) -> AdvertState {
     AdvertState {
         role: ownership.advertised_role(),
         authority_source: AdvertAuthoritySource::from_authority(&authority),
-        resource_state: AdvertResourceState::from(ownership.resource_state()),
+        resource_state: advertised_resource_state(ownership),
         term: authority.term(),
         transfer_id: 0,
         transfer_phase: super::protocol::TransferPhase::None,
+    }
+}
+
+/// Conservative release evidence (task 5c, existing wire values 4 and 5):
+/// while application cleanup is unresolved the node advertises `releasing`,
+/// and `uncertain` once it failed, even when the VIP is absent or there is no
+/// VIP at all. A peer's bootstrap rule and handoff acceptance therefore never
+/// see `absent`/`unmanaged` before this node is confirmed passive. The
+/// physical VIP observation stays a separate status fact.
+fn advertised_resource_state(ownership: &OwnershipController) -> AdvertResourceState {
+    let physical = AdvertResourceState::from(ownership.resource_state());
+    match ownership.application().phase {
+        ApplicationPhase::Uncertain { .. } => AdvertResourceState::Uncertain,
+        ApplicationPhase::Deactivating { .. } if physical != AdvertResourceState::Uncertain => {
+            AdvertResourceState::Releasing
+        }
+        _ => physical,
     }
 }
 
@@ -1424,7 +1933,7 @@ mod tests {
             CommandRunner::Simulated(kernel.clone()),
         );
         let peer = PeerTracker::new(&runtime, "127.0.0.1".parse()?, LOCAL_NONCE)?;
-        let mut loop_state = super::initialize_loop_state(&runtime, None, &worker, peer);
+        let mut loop_state = super::initialize_loop_state(&runtime, None, &worker, peer, None);
         entered_rx
             .await
             .context("withdrawal entered the command gate")?;
@@ -1432,11 +1941,13 @@ mod tests {
         let budget =
             std::time::Duration::from_millis(crate::gruezi::addresses::WITHDRAW_TIMEOUT_MS);
         let hook_started = std::cell::Cell::new(false);
+        let mut lifecycle_events = None;
         let cleanup = super::cleanup_before_exit_with_hook(
             &runtime,
             None,
             &mut loop_state,
             &mut worker,
+            &mut lifecycle_events,
             true,
             |_| {
                 hook_started.set(true);
@@ -1479,7 +1990,7 @@ mod tests {
             CommandRunner::Simulated(SimulatedKernel::new_shared()),
         );
         let peer = PeerTracker::new(&runtime, "127.0.0.1".parse()?, LOCAL_NONCE)?;
-        let loop_state = super::initialize_loop_state(&runtime, None, &worker, peer);
+        let loop_state = super::initialize_loop_state(&runtime, None, &worker, peer, None);
         Ok((runtime, worker, loop_state))
     }
 

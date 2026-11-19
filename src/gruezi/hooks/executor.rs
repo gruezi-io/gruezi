@@ -19,6 +19,8 @@ use tracing::warn;
 
 mod process;
 use process::{Identities, execute};
+#[cfg(test)]
+pub(crate) mod scripted;
 
 pub const CANCEL_GRACE_MS: u64 = 250;
 
@@ -210,6 +212,8 @@ struct Settings {
     instance_id: String,
     adapter_conf: Option<OsString>,
     identities: Identities,
+    #[cfg(test)]
+    scripted: Option<Arc<Mutex<scripted::ScriptedLifecycle>>>,
 }
 
 /// A lifecycle deployment owns exactly one of these handles. Submission never
@@ -248,8 +252,9 @@ impl LifecycleExecutor {
         ))
     }
 
+    /// Real subprocesses at the test process identity (no account switch).
     #[cfg(test)]
-    fn spawn_for_unit_tests(
+    pub(crate) fn spawn_for_unit_tests(
         lifecycle: LifecycleConfig,
         hooks: HaHooks,
         node_id: String,
@@ -266,6 +271,28 @@ impl LifecycleExecutor {
         )
     }
 
+    /// The real queue with scripted jobs in virtual time (paused-clock matrix).
+    #[cfg(test)]
+    pub(crate) fn spawn_scripted(
+        lifecycle: LifecycleConfig,
+        hooks: HaHooks,
+        node_id: String,
+        group_id: String,
+        boot_nonce: [u8; 16],
+        script: Arc<Mutex<scripted::ScriptedLifecycle>>,
+    ) -> (Self, mpsc::UnboundedReceiver<LifecycleEvent>) {
+        let mut settings = Self::settings(
+            lifecycle,
+            hooks,
+            node_id,
+            group_id,
+            boot_nonce,
+            Identities::for_unit_tests(),
+        );
+        settings.scripted = Some(script);
+        Self::launch(settings)
+    }
+
     fn start(
         lifecycle: LifecycleConfig,
         hooks: HaHooks,
@@ -274,7 +301,20 @@ impl LifecycleExecutor {
         boot_nonce: [u8; 16],
         identities: Identities,
     ) -> (Self, mpsc::UnboundedReceiver<LifecycleEvent>) {
-        let settings = Settings {
+        Self::launch(Self::settings(
+            lifecycle, hooks, node_id, group_id, boot_nonce, identities,
+        ))
+    }
+
+    fn settings(
+        lifecycle: LifecycleConfig,
+        hooks: HaHooks,
+        node_id: String,
+        group_id: String,
+        boot_nonce: [u8; 16],
+        identities: Identities,
+    ) -> Settings {
+        Settings {
             lifecycle,
             hooks,
             node_id,
@@ -282,7 +322,12 @@ impl LifecycleExecutor {
             instance_id: nonce_hex(boot_nonce),
             adapter_conf: std::env::var_os("GRUEZI_MARIADB_ADAPTER_CONF"),
             identities,
-        };
+            #[cfg(test)]
+            scripted: None,
+        }
+    }
+
+    fn launch(settings: Settings) -> (Self, mpsc::UnboundedReceiver<LifecycleEvent>) {
         let (events, receiver) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),
@@ -400,7 +445,7 @@ async fn work(shared: Arc<Shared>, settings: Settings) {
             continue;
         };
         let started = Instant::now();
-        let (mut event, quiescent) = execute(&settings, &job, &mut cancel, started).await;
+        let (mut event, quiescent) = run(&settings, &job, &mut cancel, started).await;
         event.elapsed = started.elapsed();
         // Linearize completion with submit: even a just-exited child cannot be
         // credited after a caller synchronously revoked its generation.
@@ -419,6 +464,19 @@ async fn work(shared: Arc<Shared>, settings: Settings) {
             }
         }
     }
+}
+
+async fn run(
+    settings: &Settings,
+    job: &Job,
+    cancel: &mut watch::Receiver<bool>,
+    started: Instant,
+) -> (LifecycleEvent, bool) {
+    #[cfg(test)]
+    if let Some(script) = &settings.scripted {
+        return scripted::execute(script, settings, job, cancel, started).await;
+    }
+    execute(settings, job, cancel, started).await
 }
 
 fn nonce_hex(nonce: [u8; 16]) -> String {

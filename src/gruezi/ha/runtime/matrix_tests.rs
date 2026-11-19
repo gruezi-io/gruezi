@@ -41,6 +41,7 @@ use tokio::{
 };
 
 mod external;
+mod lifecycle;
 mod watchdog;
 
 const ADVERT_INTERVAL_MS: u64 = 1_000;
@@ -372,6 +373,27 @@ fn spawn_with_authority(
     authority_runner: super::authority_commands::AuthorityCommandRunner,
     watchdog: WatchdogDevice,
 ) -> Node {
+    spawn_with_seams(
+        side,
+        endpoint,
+        runtime,
+        super::Seams {
+            commands: CommandRunner::Simulated(kernel.clone()),
+            authority: authority_runner,
+            watchdog,
+            lifecycle: super::LifecycleRunner::System,
+        },
+        kernel,
+    )
+}
+
+fn spawn_with_seams(
+    side: Side,
+    endpoint: InMemoryEndpoint,
+    runtime: HaRuntimeConfig,
+    seams: super::Seams,
+    kernel: Arc<Mutex<SimulatedKernel>>,
+) -> Node {
     let name = match side {
         Side::A => "node-a",
         Side::B => "node-b",
@@ -384,12 +406,10 @@ fn spawn_with_authority(
     ));
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let freeze = FreezeGate::default();
-    let task = tokio::spawn(freeze.clone().run(super::run_with_watchdog(
+    let task = tokio::spawn(freeze.clone().run(super::run_with_seams(
         runtime,
         Transport::InMemory(endpoint),
-        CommandRunner::Simulated(kernel.clone()),
-        authority_runner,
-        watchdog,
+        seams,
         Some(status_tx),
         async move {
             let _ = shutdown_rx.await;

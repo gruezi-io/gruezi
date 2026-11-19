@@ -400,6 +400,82 @@ async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
     Ok(())
 }
 
+/// The real runtime with `ha.lifecycle` never runs a lifecycle script, an
+/// address command or a notification at the daemon identity: without the
+/// packaged accounts it refuses to start at all.
+#[tokio::test]
+async fn lifecycle_runtime_without_packaged_identities_fails_closed() -> Result<()> {
+    use gruezi::config::LifecycleConfig;
+
+    let dir = temp_dir("ha-hooks-lifecycle-runtime")?;
+    let fixture = FakeIp::new()?;
+    let marker = dir.join("lifecycle.log");
+    let script = dir.join("lifecycle.sh");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\necho \"$GRUEZI_EVENT $GRUEZI_INSTANCE_ID\" >> '{}'\necho db_incarnation=real-1\n",
+            marker.display()
+        ),
+    )?;
+    let promote_output = dir.join("promote.log");
+    let promote_hook = write_hook_script(&dir, "promote", &promote_output)?;
+    let port_a = free_udp_port()?;
+    let port_b = free_udp_port()?;
+    let mut runtime = runtime_config(
+        "node-a",
+        port_a,
+        port_b,
+        110,
+        true,
+        HaHooks {
+            on_promote: Some(promote_hook),
+            ..HaHooks::default()
+        },
+        &fixture,
+    );
+    runtime.lifecycle = Some(LifecycleConfig {
+        activate_command: script.display().to_string(),
+        deactivate_command: script.display().to_string(),
+        timeout_ms: 1_000,
+    });
+    let (_status, shutdown, task) = spawn_node(runtime);
+    // SAFETY: getpwnam reads a NUL-terminated literal and returns a pointer
+    // that is only compared with null here.
+    let packaged = unsafe {
+        !libc::getpwnam(c"gruezi-actuator".as_ptr()).is_null()
+            && !libc::getpwnam(c"gruezi-notify".as_ptr()).is_null()
+    };
+    if packaged {
+        // A packaged host may start; startup still runs no script as the
+        // daemon, which the executor's identity tests prove separately.
+        stop_node(shutdown, task).await?;
+        println!("lifecycle runtime started with packaged identities");
+    } else {
+        let result = timeout(Duration::from_secs(3), task)
+            .await
+            .map_err(|_| anyhow!("lifecycle runtime must refuse to start"))?
+            .map_err(|error| anyhow!(error))?;
+        let error = result
+            .err()
+            .ok_or_else(|| anyhow!("lifecycle runtime started without packaged identities"))?;
+        println!("lifecycle runtime refused: {error:#}");
+        assert!(format!("{error:#}").contains("lifecycle"));
+        assert!(!marker.exists(), "no lifecycle script ran");
+        assert!(!promote_output.exists(), "no notification ran");
+        assert_eq!(fs::read_to_string(fixture.dir.join("state"))?, "");
+        assert!(
+            !fs::read_to_string(fixture.dir.join("commands"))
+                .unwrap_or_default()
+                .contains(" add "),
+            "no address was added"
+        );
+        drop(shutdown);
+    }
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn lifecycle_executor_production_identity_is_fail_closed() -> Result<()> {
     use gruezi::{

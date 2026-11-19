@@ -289,7 +289,7 @@ fn command(settings: &Settings, job: &Job) -> Option<Command> {
     Some(command)
 }
 
-fn job_timeout(settings: &Settings, job: &Job) -> u64 {
+pub(super) fn job_timeout(settings: &Settings, job: &Job) -> u64 {
     if job.kind.critical() {
         settings.lifecycle.timeout_ms
     } else {

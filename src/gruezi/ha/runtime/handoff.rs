@@ -6,7 +6,10 @@ use super::super::{
     election::{HaDecision, HaDecisionReason, HaState, PeerObservation, outranks},
     protocol::{AdvertAuthoritySource, AdvertResourceState, HaPacket, Nonce, TransferPhase},
 };
-use crate::gruezi::ownership::OwnershipController;
+use crate::gruezi::{
+    hooks::{ActivationMode, DeactivationMode},
+    ownership::OwnershipController,
+};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -257,6 +260,54 @@ impl Handoff {
     /// No transfer is in progress or pending in either direction.
     pub(super) const fn idle(&self) -> bool {
         matches!(self.phase, Phase::Idle)
+    }
+
+    /// Actuator binding for the transfer this node is part of (errata F-04,
+    /// F-06, F-15): `(transfer_id, peer_nonce, activation, deactivation)`.
+    ///
+    /// Only an accepted release token makes an activation a planned handoff,
+    /// bound to the releasing incarnation's nonce, so the adapter can match
+    /// the receipt's `gruezi_instance_id` and `transfer_id`. Only an origin
+    /// that is releasing writes release evidence; a released, returning or
+    /// idle node revokes, which never publishes a receipt. Everything else is
+    /// cold, which the adapter gates with its strictest rules.
+    pub(super) fn lifecycle_binding(
+        &self,
+    ) -> (Option<u64>, Option<Nonce>, ActivationMode, DeactivationMode) {
+        match self.phase {
+            Phase::Acquiring(id) => match self.incoming {
+                Some((nonce, token)) if token == id => (
+                    Some(id),
+                    Some(nonce),
+                    ActivationMode::Handoff,
+                    DeactivationMode::Revoke,
+                ),
+                _ => (
+                    None,
+                    self.peer_nonce,
+                    ActivationMode::Cold,
+                    DeactivationMode::Revoke,
+                ),
+            },
+            Phase::Releasing(id) => (
+                Some(id),
+                self.peer_nonce,
+                ActivationMode::Cold,
+                DeactivationMode::HandoffRelease,
+            ),
+            Phase::Idle
+            | Phase::Requesting
+            | Phase::Released(_)
+            | Phase::Owned(_)
+            | Phase::Returning(_)
+            | Phase::Returned(_)
+            | Phase::Reclaiming => (
+                None,
+                self.peer_nonce,
+                ActivationMode::Cold,
+                DeactivationMode::Revoke,
+            ),
+        }
     }
 
     pub(super) const fn bootstrap_permitted(&self) -> bool {
