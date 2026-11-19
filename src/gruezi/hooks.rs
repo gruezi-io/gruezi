@@ -4,6 +4,12 @@ use std::time::Duration;
 use tokio::{process::Command, time::timeout};
 use tracing::{info, warn};
 
+mod executor;
+pub use executor::{
+    AuthoritySource, CANCEL_GRACE_MS, LifecycleContext, LifecycleEvent, LifecycleExecutor,
+    LifecycleKind, LifecycleOutcome,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaHooks {
     pub on_promote: Option<String>,

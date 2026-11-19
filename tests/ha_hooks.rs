@@ -399,3 +399,69 @@ async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
     fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn lifecycle_executor_production_identity_is_fail_closed() -> Result<()> {
+    use gruezi::{
+        config::LifecycleConfig,
+        gruezi::hooks::{LifecycleContext, LifecycleExecutor, LifecycleKind, LifecycleOutcome},
+    };
+
+    let dir = temp_dir("ha-hooks-production-identity")?;
+    let script = dir.join("identity.sh");
+    write_executable(&script, "#!/bin/sh\nid -u >&2\n")?;
+    let started = LifecycleExecutor::spawn(
+        LifecycleConfig {
+            activate_command: script.display().to_string(),
+            deactivate_command: script.display().to_string(),
+            timeout_ms: 1_000,
+        },
+        HaHooks::default(),
+        "node-a".to_owned(),
+        "group-a".to_owned(),
+        [1; 16],
+    );
+    match started {
+        Err(error) => {
+            // Developer hosts without the packaged accounts refuse startup.
+            assert!(error.to_string().contains("lifecycle"));
+            println!("production lifecycle startup refused: {error}");
+        }
+        Ok((executor, mut events)) => {
+            executor.submit(
+                LifecycleKind::Activate,
+                1,
+                LifecycleContext {
+                    authority_source: None,
+                    authority_term: 0,
+                    transfer_id: None,
+                    peer_nonce: None,
+                    deactivate_deadline: None,
+                    db_incarnation: None,
+                    notification: None,
+                },
+            )?;
+            let result = timeout(Duration::from_secs(3), events.recv())
+                .await?
+                .ok_or_else(|| anyhow!("executor channel closed"))?;
+            // A non-root developer cannot switch identities. A privileged
+            // package/lab runner may execute using the real packaged account.
+            assert!(matches!(
+                result.outcome,
+                LifecycleOutcome::Succeeded | LifecycleOutcome::SpawnError
+            ));
+            if result.outcome == LifecycleOutcome::Succeeded {
+                // SAFETY: getuid/geteuid are argument-free identity getters.
+                let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+                let child_uid = result.stderr_tail.parse::<u32>()?;
+                assert_ne!(child_uid, uid);
+                assert_ne!(child_uid, euid);
+                assert_ne!(child_uid, 0);
+            }
+            println!("production identity path: {:?}", result.outcome);
+            executor.shutdown().await?;
+        }
+    }
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
