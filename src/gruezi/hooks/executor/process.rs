@@ -1,4 +1,7 @@
-use super::{Job, LifecycleEvent, LifecycleKind, LifecycleOutcome, Settings};
+use super::{
+    ActivationMode, DeactivationMode, Job, LifecycleEvent, LifecycleKind, LifecycleOperation,
+    LifecycleOutcome, Settings,
+};
 use crate::gruezi::hooks::hook_command;
 use anyhow::{Result, bail};
 use std::{
@@ -234,6 +237,28 @@ fn command(settings: &Settings, job: &Job) -> Option<Command> {
         && let Some(incarnation) = &job.context.db_incarnation
     {
         command.env("GRUEZI_DB_INCARNATION", incarnation);
+    }
+    match job.operation {
+        LifecycleOperation::Activate(mode) => {
+            command.env(
+                "GRUEZI_ACTIVATION_MODE",
+                match mode {
+                    ActivationMode::Handoff => "handoff",
+                    ActivationMode::Cold => "cold",
+                },
+            );
+        }
+        LifecycleOperation::Deactivate(mode) => {
+            command.env(
+                "GRUEZI_DEACTIVATE_MODE",
+                match mode {
+                    DeactivationMode::Baseline => "baseline",
+                    DeactivationMode::HandoffRelease => "handoff_release",
+                    DeactivationMode::Revoke => "revoke",
+                },
+            );
+        }
+        LifecycleOperation::Verify | LifecycleOperation::Notify(_) => {}
     }
     let actuator = job.kind.critical();
     if actuator {

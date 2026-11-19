@@ -6,8 +6,8 @@ use tracing::{info, warn};
 
 mod executor;
 pub use executor::{
-    AuthoritySource, CANCEL_GRACE_MS, LifecycleContext, LifecycleEvent, LifecycleExecutor,
-    LifecycleKind, LifecycleOutcome,
+    ActivationMode, AuthoritySource, CANCEL_GRACE_MS, DeactivationMode, LifecycleContext,
+    LifecycleEvent, LifecycleExecutor, LifecycleKind, LifecycleOperation, LifecycleOutcome,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

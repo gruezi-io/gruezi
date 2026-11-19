@@ -8,7 +8,8 @@ use crate::{
         application::{ApplicationOperation, ApplicationPhase, ApplicationState},
         ha::{HaDecisionReason, HaRuntimeConfig, HaState},
         hooks::{
-            LifecycleContext, LifecycleEvent, LifecycleExecutor, LifecycleKind, LifecycleOutcome,
+            ActivationMode, DeactivationMode, LifecycleContext, LifecycleEvent, LifecycleExecutor,
+            LifecycleKind, LifecycleOperation, LifecycleOutcome,
         },
         watchdog::{WatchdogDevice, WatchdogManager, WatchdogStatus},
     },
@@ -632,7 +633,22 @@ impl OwnershipController {
         }
         let result = self.lifecycle_executor.as_ref().map_or_else(
             || Err(anyhow::anyhow!("lifecycle executor unavailable")),
-            |executor| executor.submit(kind, self.generation, context),
+            |executor| {
+                executor.submit(
+                    match kind {
+                        LifecycleKind::Activate => {
+                            LifecycleOperation::Activate(ActivationMode::Cold)
+                        }
+                        LifecycleKind::Deactivate => {
+                            LifecycleOperation::Deactivate(DeactivationMode::Baseline)
+                        }
+                        LifecycleKind::Verify => LifecycleOperation::Verify,
+                        LifecycleKind::Notify(event) => LifecycleOperation::Notify(event),
+                    },
+                    self.generation,
+                    context,
+                )
+            },
         );
         let (outcome, stderr_tail) = match result {
             Ok(true) => return RoleTransitionEffect::None,

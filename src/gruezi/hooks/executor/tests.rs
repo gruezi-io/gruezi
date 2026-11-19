@@ -133,7 +133,7 @@ async fn executor_passes_full_environment() -> Result<()> {
     let mut job_context = context();
     job_context.transfer_id = Some(9);
     job_context.peer_nonce = Some([0x22; 16]);
-    executor.submit(LifecycleKind::Verify, 7, job_context)?;
+    executor.submit(LifecycleOperation::Verify, 7, job_context)?;
     let result = event(&mut events).await?;
     assert_eq!(result.outcome, LifecycleOutcome::Succeeded);
     assert_eq!(result.db_incarnation.as_deref(), Some("db-123"));
@@ -178,11 +178,106 @@ async fn executor_passes_full_environment() -> Result<()> {
 }
 
 #[tokio::test]
+async fn executor_passes_operation_mode_env() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let output = fixture.dir.join("mode-env");
+    let script = fixture.script(
+        "mode-environment",
+        &format!("/usr/bin/env > '{}'", output.display()),
+    )?;
+    let (executor, mut events) = fixture.executor(&script, &script, 1_000, HaHooks::default())?;
+    for (operation, expected, forbidden) in [
+        (
+            LifecycleOperation::Activate(ActivationMode::Handoff),
+            "GRUEZI_ACTIVATION_MODE=handoff",
+            "GRUEZI_DEACTIVATE_MODE=",
+        ),
+        (
+            LifecycleOperation::Activate(ActivationMode::Cold),
+            "GRUEZI_ACTIVATION_MODE=cold",
+            "GRUEZI_DEACTIVATE_MODE=",
+        ),
+        (
+            LifecycleOperation::Deactivate(DeactivationMode::Baseline),
+            "GRUEZI_DEACTIVATE_MODE=baseline",
+            "GRUEZI_ACTIVATION_MODE=",
+        ),
+        (
+            LifecycleOperation::Deactivate(DeactivationMode::HandoffRelease),
+            "GRUEZI_DEACTIVATE_MODE=handoff_release",
+            "GRUEZI_ACTIVATION_MODE=",
+        ),
+        (
+            LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+            "GRUEZI_DEACTIVATE_MODE=revoke",
+            "GRUEZI_ACTIVATION_MODE=",
+        ),
+    ] {
+        executor.submit(operation, 1, context())?;
+        assert_eq!(
+            event(&mut events).await?.outcome,
+            LifecycleOutcome::Succeeded
+        );
+        let env = fs::read_to_string(&output)?;
+        println!("observed {operation:?} child environment:\n{env}");
+        assert!(
+            env.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+        assert!(!env.lines().any(|line| line.starts_with(forbidden)));
+    }
+    executor.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn executor_omits_mode_env_for_verify() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let output = fixture.dir.join("verify-env");
+    let script = fixture.script(
+        "verify-environment",
+        &format!(
+            "/usr/bin/env > '{}'\nprintf 'db_incarnation=db-123\\n'",
+            output.display()
+        ),
+    )?;
+    let (executor, mut events) = fixture.executor(&script, &script, 1_000, HaHooks::default())?;
+    // A read-only check of the active generation must not inherit its activation mode.
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Handoff),
+        1,
+        context(),
+    )?;
+    assert_eq!(
+        event(&mut events).await?.outcome,
+        LifecycleOutcome::Succeeded
+    );
+    executor.submit(LifecycleOperation::Verify, 1, context())?;
+    assert_eq!(
+        event(&mut events).await?.outcome,
+        LifecycleOutcome::Succeeded
+    );
+    let env = fs::read_to_string(output)?;
+    println!("observed verify child environment:\n{env}");
+    assert!(env.lines().any(|line| line == "GRUEZI_EVENT=verify"));
+    for key in ["GRUEZI_ACTIVATION_MODE=", "GRUEZI_DEACTIVATE_MODE="] {
+        assert!(!env.lines().any(|line| line.starts_with(key)));
+        println!("verify child: {key}<absent>");
+    }
+    executor.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn executor_bounds_output_and_strips_control_characters() -> Result<()> {
     let fixture = Fixture::new()?;
     let script = fixture.script("output", "test \"$GRUEZI_TRANSFER_ID\" = 0\ntest -z \"$GRUEZI_PEER_NONCE\"\nhead -c 200000 /dev/zero\nhead -c 200000 /dev/zero >&2\nprintf '\\001\\033bad\\177tail\\n' >&2")?;
     let (executor, mut events) = fixture.executor(&script, &script, 1_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let result = event(&mut events).await?;
     assert_eq!(result.outcome, LifecycleOutcome::Succeeded);
     assert!(result.stderr_tail.len() <= 1_024);
@@ -202,7 +297,11 @@ async fn executor_timeout_kills_grandchild() -> Result<()> {
         pid_file.display()
     ))?;
     let (executor, mut events) = fixture.executor(&script, &script, 500, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let _stream = started(&listener).await?;
     assert_eq!(
         event(&mut events).await?.outcome,
@@ -221,9 +320,17 @@ async fn executor_deactivate_cancels_running_activate_before_starting() -> Resul
     let deactivate = fixture.script("deactivate", "exit 0")?;
     let (executor, mut events) =
         fixture.executor(&activate, &deactivate, 3_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let _stream = started(&listener).await?;
-    executor.submit(LifecycleKind::Deactivate, 2, context())?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+        2,
+        context(),
+    )?;
     let cancelled = event(&mut events).await?;
     assert_eq!(
         (cancelled.kind, cancelled.outcome),
@@ -243,7 +350,7 @@ async fn executor_deactivate_cancels_running_activate_before_starting() -> Resul
     Ok(())
 }
 
-async fn discards_queued(kind: LifecycleKind) -> Result<()> {
+async fn discards_queued(operation: LifecycleOperation) -> Result<()> {
     let fixture = Fixture::new()?;
     let marker = fixture.dir.join("forbidden");
     let activate = fixture.script("activate", &format!("touch '{}'", marker.display()))?;
@@ -251,8 +358,12 @@ async fn discards_queued(kind: LifecycleKind) -> Result<()> {
     let (executor, mut events) =
         fixture.executor(&activate, &deactivate, 1_000, HaHooks::default())?;
     // No yield: both submissions happen before the single worker can dequeue.
-    executor.submit(kind, 1, context())?;
-    executor.submit(LifecycleKind::Deactivate, 2, context())?;
+    executor.submit(operation, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+        2,
+        context(),
+    )?;
     assert_eq!(
         event(&mut events).await?.outcome,
         LifecycleOutcome::Cancelled
@@ -268,15 +379,15 @@ async fn discards_queued(kind: LifecycleKind) -> Result<()> {
 
 #[tokio::test]
 async fn executor_discards_queued_activate_on_deactivate() -> Result<()> {
-    discards_queued(LifecycleKind::Activate).await
+    discards_queued(LifecycleOperation::Activate(ActivationMode::Cold)).await
 }
 
 #[tokio::test]
 async fn executor_discards_queued_verify_on_deactivate() -> Result<()> {
-    discards_queued(LifecycleKind::Verify).await
+    discards_queued(LifecycleOperation::Verify).await
 }
 
-async fn stale_completion(kind: LifecycleKind) -> Result<()> {
+async fn stale_completion(operation: LifecycleOperation) -> Result<()> {
     let fixture = Fixture::new()?;
     let (listener, gate_script) = gate().await?;
     let script = fixture.script(
@@ -285,11 +396,15 @@ async fn stale_completion(kind: LifecycleKind) -> Result<()> {
     )?;
     let passive = fixture.script("passive", "exit 0")?;
     let (executor, mut events) = fixture.executor(&script, &passive, 3_000, HaHooks::default())?;
-    executor.submit(kind, 1, context())?;
+    executor.submit(operation, 1, context())?;
     let mut stream = started(&listener).await?;
     // Race a zero exit with revocation. Submission synchronously invalidates completion.
     stream.write_all(b"release\n").await?;
-    executor.submit(LifecycleKind::Deactivate, 2, context())?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+        2,
+        context(),
+    )?;
     let stale = event(&mut events).await?;
     assert_eq!(stale.outcome, LifecycleOutcome::Cancelled);
     assert!(!stale.is_current_success(2));
@@ -303,12 +418,12 @@ async fn stale_completion(kind: LifecycleKind) -> Result<()> {
 
 #[tokio::test]
 async fn executor_stale_completion_never_reports_success() -> Result<()> {
-    stale_completion(LifecycleKind::Activate).await
+    stale_completion(LifecycleOperation::Activate(ActivationMode::Cold)).await
 }
 
 #[tokio::test]
 async fn executor_stale_verify_event_never_refreshes_freshness() -> Result<()> {
-    stale_completion(LifecycleKind::Verify).await
+    stale_completion(LifecycleOperation::Verify).await
 }
 
 #[tokio::test]
@@ -316,7 +431,11 @@ async fn executor_spawn_error_is_visible() -> Result<()> {
     let fixture = Fixture::new()?;
     let missing = fixture.dir.join("missing").display().to_string();
     let (executor, mut events) = fixture.executor(&missing, &missing, 1_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     assert_eq!(
         event(&mut events).await?.outcome,
         LifecycleOutcome::SpawnError
@@ -337,7 +456,11 @@ async fn executor_notifications_do_not_overlap_critical_jobs() -> Result<()> {
         ..HaHooks::default()
     };
     let (executor, mut events) = fixture.executor(&activate, &activate, 3_000, hooks)?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let mut stream = started(&listener).await?;
     let mut notification = context();
     notification.notification = Some(HookContext {
@@ -353,7 +476,11 @@ async fn executor_notifications_do_not_overlap_critical_jobs() -> Result<()> {
         peer_priority: None,
         last_peer_seen_ms_ago: None,
     });
-    executor.submit(LifecycleKind::Notify(HookEvent::Promote), 1, notification)?;
+    executor.submit(
+        LifecycleOperation::Notify(HookEvent::Promote),
+        1,
+        notification,
+    )?;
     assert!(!marker.exists());
     stream.write_all(b"release\n").await?;
     assert_eq!(event(&mut events).await?.kind, LifecycleKind::Activate);
@@ -367,6 +494,8 @@ async fn executor_notifications_do_not_overlap_critical_jobs() -> Result<()> {
         "GRUEZI_TRANSFER_ID",
         "GRUEZI_PEER_NONCE",
         "GRUEZI_DB_INCARNATION",
+        "GRUEZI_ACTIVATION_MODE",
+        "GRUEZI_DEACTIVATE_MODE",
     ] {
         assert!(!notify_env.contains(forbidden));
     }
@@ -384,7 +513,7 @@ async fn executor_verify_runs_activate_command_only() -> Result<()> {
     let missing = fixture.dir.join("must-not-run").display().to_string();
     let (executor, mut events) =
         fixture.executor(&activate, &missing, 1_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Verify, 1, context())?;
+    executor.submit(LifecycleOperation::Verify, 1, context())?;
     assert_eq!(
         event(&mut events).await?.outcome,
         LifecycleOutcome::Succeeded
@@ -404,10 +533,18 @@ async fn executor_cancel_grace_kills_process_group() -> Result<()> {
     ))?;
     let passive = fixture.script("passive", "exit 0")?;
     let (executor, mut events) = fixture.executor(&script, &passive, 3_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let mut stream = started(&listener).await?;
     stream.write_all(b"release\n").await?;
-    executor.submit(LifecycleKind::Deactivate, 2, context())?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+        2,
+        context(),
+    )?;
     let cancelled = event(&mut events).await?;
     assert_eq!(cancelled.outcome, LifecycleOutcome::Cancelled);
     assert_eq!(cancelled.exit_code_or_signal, Some(-libc::SIGKILL));
@@ -429,9 +566,17 @@ async fn executor_cancellation_after_stdout_eof_reaps_cleanly() -> Result<()> {
     let passive = fixture.script("passive", "exit 0")?;
     let (executor, mut events) =
         fixture.executor(&activate, &passive, 3_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let _stream = started(&listener).await?;
-    executor.submit(LifecycleKind::Deactivate, 2, context())?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+        2,
+        context(),
+    )?;
     assert_eq!(
         event(&mut events).await?.outcome,
         LifecycleOutcome::Cancelled
@@ -470,9 +615,9 @@ async fn executor_verify_is_coalesced_and_old_notifications_are_discarded() -> R
         peer_priority: None,
         last_peer_seen_ms_ago: None,
     });
-    executor.submit(LifecycleKind::Notify(HookEvent::Promote), 1, notify)?;
-    executor.submit(LifecycleKind::Verify, 2, context())?;
-    executor.submit(LifecycleKind::Verify, 2, context())?;
+    executor.submit(LifecycleOperation::Notify(HookEvent::Promote), 1, notify)?;
+    executor.submit(LifecycleOperation::Verify, 2, context())?;
+    executor.submit(LifecycleOperation::Verify, 2, context())?;
     assert_eq!(
         event(&mut events).await?.outcome,
         LifecycleOutcome::Cancelled
@@ -486,7 +631,11 @@ async fn executor_verify_is_coalesced_and_old_notifications_are_discarded() -> R
     assert!(verified.is_current_success(2));
     assert!(!verified.is_current_success(3));
     assert_eq!(fs::read_to_string(count)?, "run\n");
-    assert!(!executor.submit(LifecycleKind::Activate, 1, context())?);
+    assert!(!executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context()
+    )?);
     executor.shutdown().await?;
     Ok(())
 }
@@ -496,7 +645,11 @@ async fn executor_no_new_privileges_survives_exec() -> Result<()> {
     let fixture = Fixture::new()?;
     let script = fixture.script("privileges", "awk '/^NoNewPrivs:/ { print $2 > \"/dev/stderr\"; found = 1; if ($2 != 1) exit 1 } END { if (!found) exit 1 }' /proc/self/status")?;
     let (executor, mut events) = fixture.executor(&script, &script, 1_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let result = event(&mut events).await?;
     assert_eq!(result.outcome, LifecycleOutcome::Succeeded);
     assert_eq!(result.stderr_tail, "1");
@@ -517,7 +670,11 @@ async fn executor_timeout_cleans_descendants_after_leader_exits() -> Result<()> 
         ),
     )?;
     let (executor, mut events) = fixture.executor(&script, &script, 500, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     let mut stream = started(&listener).await?;
     stream.write_all(b"release\n").await?;
     assert_eq!(
@@ -554,9 +711,17 @@ async fn executor_critical_job_cancels_notification() -> Result<()> {
         peer_priority: None,
         last_peer_seen_ms_ago: None,
     });
-    executor.submit(LifecycleKind::Notify(HookEvent::Promote), 1, notification)?;
+    executor.submit(
+        LifecycleOperation::Notify(HookEvent::Promote),
+        1,
+        notification,
+    )?;
     let _stream = started(&listener).await?;
-    executor.submit(LifecycleKind::Deactivate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Revoke),
+        1,
+        context(),
+    )?;
     let cancelled = event(&mut events).await?;
     assert_eq!(cancelled.kind, LifecycleKind::Notify(HookEvent::Promote));
     assert_eq!(cancelled.outcome, LifecycleOutcome::Cancelled);
@@ -587,7 +752,11 @@ async fn executor_closes_inherited_descriptors() -> Result<()> {
         &format!("test ! -e /proc/$$/fd/{descriptor}"),
     )?;
     let (executor, mut events) = fixture.executor(&script, &script, 1_000, HaHooks::default())?;
-    executor.submit(LifecycleKind::Activate, 1, context())?;
+    executor.submit(
+        LifecycleOperation::Activate(ActivationMode::Cold),
+        1,
+        context(),
+    )?;
     assert_eq!(
         event(&mut events).await?.outcome,
         LifecycleOutcome::Succeeded
@@ -606,7 +775,11 @@ async fn executor_deactivate_deadline_is_capped_by_withdraw_budget() -> Result<(
     let mut job_context = context();
     let submitted = Instant::now();
     job_context.deactivate_deadline = Some(submitted + Duration::from_millis(500));
-    executor.submit(LifecycleKind::Deactivate, 1, job_context)?;
+    executor.submit(
+        LifecycleOperation::Deactivate(DeactivationMode::Baseline),
+        1,
+        job_context,
+    )?;
     let _stream = started(&listener).await?;
     let result = event(&mut events).await?;
     assert_eq!(result.outcome, LifecycleOutcome::TimedOut);

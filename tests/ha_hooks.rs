@@ -404,7 +404,10 @@ async fn fault_hook_runs_when_address_action_fails() -> Result<()> {
 async fn lifecycle_executor_production_identity_is_fail_closed() -> Result<()> {
     use gruezi::{
         config::LifecycleConfig,
-        gruezi::hooks::{LifecycleContext, LifecycleExecutor, LifecycleKind, LifecycleOutcome},
+        gruezi::hooks::{
+            ActivationMode, LifecycleContext, LifecycleExecutor, LifecycleOperation,
+            LifecycleOutcome,
+        },
     };
 
     let dir = temp_dir("ha-hooks-production-identity")?;
@@ -429,7 +432,7 @@ async fn lifecycle_executor_production_identity_is_fail_closed() -> Result<()> {
         }
         Ok((executor, mut events)) => {
             executor.submit(
-                LifecycleKind::Activate,
+                LifecycleOperation::Activate(ActivationMode::Cold),
                 1,
                 LifecycleContext {
                     authority_source: None,

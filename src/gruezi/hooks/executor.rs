@@ -48,6 +48,41 @@ impl LifecycleKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationMode {
+    Handoff,
+    Cold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeactivationMode {
+    Baseline,
+    HandoffRelease,
+    Revoke,
+}
+
+/// Submission carries the operation's semantics separately from its event kind.
+/// Mutating operations cannot be constructed without an explicit mode, while
+/// verification and notification cannot accidentally inherit a mutation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleOperation {
+    Activate(ActivationMode),
+    Deactivate(DeactivationMode),
+    Verify,
+    Notify(HookEvent),
+}
+
+impl LifecycleOperation {
+    const fn kind(self) -> LifecycleKind {
+        match self {
+            Self::Activate(_) => LifecycleKind::Activate,
+            Self::Deactivate(_) => LifecycleKind::Deactivate,
+            Self::Verify => LifecycleKind::Verify,
+            Self::Notify(event) => LifecycleKind::Notify(event),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LifecycleContext {
     pub authority_source: Option<AuthoritySource>,
@@ -96,6 +131,7 @@ impl LifecycleEvent {
 
 struct Job {
     kind: LifecycleKind,
+    operation: LifecycleOperation,
     generation: u64,
     context: LifecycleContext,
 }
@@ -258,7 +294,8 @@ impl LifecycleExecutor {
         (Self { shared, task }, receiver)
     }
 
-    /// Submit a generation-tagged job. Returns false for an already obsolete
+    /// Submit a generation-tagged job with an explicit operation mode.
+    /// Returns false for an already obsolete
     /// submission. Verify is coalesced; critical jobs precede notifications.
     ///
     /// # Errors
@@ -266,10 +303,11 @@ impl LifecycleExecutor {
     /// Returns an error after shutdown, or for a notification without its context.
     pub fn submit(
         &self,
-        kind: LifecycleKind,
+        operation: LifecycleOperation,
         generation: u64,
         context: LifecycleContext,
     ) -> Result<bool> {
+        let kind = operation.kind();
         if matches!(kind, LifecycleKind::Notify(_)) && context.notification.is_none() {
             bail!("notification requires hook context");
         }
@@ -307,6 +345,7 @@ impl LifecycleExecutor {
         }
         queue.jobs.push_back(Job {
             kind,
+            operation,
             generation,
             context,
         });
