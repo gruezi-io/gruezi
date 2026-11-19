@@ -11,11 +11,17 @@ report ownership only after kernel read-back confirms the optional resource.
 **Acceptance criteria:**
 
 * A stateful fake kernel test proves add, remove, duplicate, missing, partial,
-  and tentative IPv6 cases.
+  and tentative IPv6 cases. Evidence: `tests/fake_ip.rs` and
+  `.omo/evidence/task-4-gruezi-ha-safety-roadmap.txt`.
 * A delayed acquisition followed by demotion leaves the resource absent.
+  Evidence: `ownership::tests::delayed_add_then_demote_ends_absent` in
+  `.omo/evidence/task-6-gruezi-ha-safety-roadmap.txt`.
 * Every shutdown path joins the resource worker and confirms absence, or reports
-  a fault.
+  a fault. Evidence: `hanging_fault_hook_does_not_exceed_join_deadline` in
+  `.omo/evidence/task-7-gruezi-ha-safety-roadmap.txt`.
 * `owned` is false unless authority and confirmed resource state are valid.
+  Evidence: `status_api_reflects_live_ha_state` in
+  `.omo/evidence/task-7-gruezi-ha-safety-roadmap.txt`.
 
 ## M2: HA safety policies and watchdog, Experimental
 
@@ -25,14 +31,19 @@ operation.
 
 **Acceptance criteria:**
 
-* Deterministic policy tests cover the documented rows. The real netem script
-  still needs the available process-freeze follow-up recorded in task 28.
+* Deterministic policy tests cover the documented rows, and the netem matrix
+  passes after the freeze and failed-withdrawal fixes. Evidence:
+  `matrix_available_thawed_owner_yields_to_incumbent`,
+  `.omo/evidence/task-24-gruezi-ha-safety-roadmap.txt`, and
+  `.omo/evidence/task-27-gruezi-ha-safety-roadmap.txt`.
 * Strict mode never promotes after arbitrary simulated peer silence.
 * Available mode records `assumed` and demonstrates the documented partition
   outcome.
 * Required watchdog arm failure produces zero resource additions.
 * Fault injection proves a frozen owner stops feeding and the resource is
-  withdrawn or the host resets. The shipped Rocky helper remains a lab follow-up.
+  withdrawn or the host resets. Evidence:
+  `.omo/evidence/task-13-gruezi-ha-safety-roadmap.txt` and
+  `.omo/evidence/task-22-gruezi-ha-safety-roadmap.txt`.
 
 ## M3: Three-node Raft, Planned
 

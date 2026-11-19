@@ -20,8 +20,8 @@ systems.
 | VIP mutation and confirmed ownership | Implemented | A serialized Linux resource worker reads the kernel back before `owned=true`. |
 | Authenticated HA packets | Implemented | HMAC-SHA-256, peer pinning, sessions, and replay protection are tested. |
 | Explicit failure policies | Implemented | Strict, available, and external policies are implemented and covered by tests. |
-| Watchdog fencing | Experimental | Linux and fake-device paths are tested, but the shipped Rocky helper still needs lab follow-up. |
-| External grant happy path | Experimental | Grant, fencing, and stale-grant behavior are tested; task 26 has no evidence record yet. |
+| Watchdog fencing | Experimental | Linux and fake-device paths are tested, including the Rocky softdog helper and a real VM reset. |
+| External grant happy path | Experimental | Two-node grant acquisition, renewal beyond 20 seconds, stale-grant withdrawal, and lone-node fencing behavior are tested. |
 | `gruezi peers` listing | Experimental | The command exists, but peer discovery currently returns an empty list. |
 | Direct `start` flags | Unsupported | `gruezi start --bind/--peers/--node-id` is a stub. Use YAML only. |
 | KV mode | Planned | No Raft or key-value runtime is shipped. |

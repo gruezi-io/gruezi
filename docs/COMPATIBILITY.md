@@ -4,6 +4,9 @@ The compatibility target is the narrow HTTP surface used by Patroni's
 etcd3 integration. It is not a claim of general etcd compatibility.
 
 **Status: Planned.** No endpoint is implemented by the current HA milestone.
+Raft, KV, DNS, and agent runtimes are out of scope for this milestone. HA wire
+v1 and YAML configuration are unstable prototype formats with no compatibility
+promise.
 
 The intended endpoints are:
 

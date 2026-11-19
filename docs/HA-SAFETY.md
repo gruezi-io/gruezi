@@ -27,10 +27,11 @@ authority, witness, or fencing system.
   or fencing. Peer silence alone grants nothing.
 
 Authenticated HMAC packets, ownership confirmation, and all three policies are
-**Implemented**. The Linux watchdog is **Experimental** because device behavior
-passed on a patched Rocky Linux lab copy, while the shipped helper still needs
-follow-up fixes. External grant happy-path acceptance is **Experimental** until
-task 26 records the two-node run.
+**Implemented**. The Linux watchdog is **Experimental** because the acceptance
+depends on a real device and host reset. The shipped Rocky helper passes,
+including a real VM reset. External grant behavior is **Experimental**, with
+two-node acquisition, renewal, stale-grant withdrawal, and lone-node fencing
+covered by task 26.
 
 ## Failure matrix
 
@@ -52,8 +53,10 @@ task 26 records the two-node run.
 
 Watchdog modes are `off`, `automatic`, and `required`. The controller
 arms only after authority is valid and before adding the VIP. It feeds only
-from a coordinator iteration where authority is valid, the resource is
-confirmed present, and the generation is unchanged. It disarms only after
+from a coordinator iteration where authority is valid, the resource is present
+or unmanaged, the generation is unchanged, and the feed budget is adequate.
+The resource term is the same one used by `owned`, so a no-VIP node feeds
+instead of resetting. It disarms only after
 confirmed absence and no mutation is in flight.
 
 `nowayout: reject` refuses a required configuration unless the device supports
@@ -94,10 +97,9 @@ deployed the policy with Ansible, injected the fault with ansible ad-hoc
 commands or the ha-netem and ha-drop playbooks, and waited (bounded) until
 both nodes matched the expected kernel VIP check (`ip -o addr show dev eth0`)
 and the /status fields `state`, `owned`, `authority.source`, `safety.level`
-and `resource.state`. The same ten scenarios also ran in the isolated
-namespace matrix (`scripts/test-ha-netem.sh all`) on both VMs: 28 of 30 PASS
-on each kernel (kernel 211 on gruezi-a, kernel 264 on gruezi-b). A FAIL stays a
-FAIL here until its fix todo closes.
+and `resource.state`. The original 28 of 30 matrix run exposed lab and runtime
+defects. The landed fixes in commits `ac18c75`, `1ba5659`, `464f896`,
+`3c5f5cd`, `d39e3bf`, `2f00aba`, and `7ac2ba2` corrected those findings.
 
 Live rows (A is gruezi-a, priority 150; B is gruezi-b, priority 100):
 
@@ -121,8 +123,8 @@ Live rows (A is gruezi-a, priority 150; B is gruezi-b, priority 100):
 | available | a-to-b-loss | PASS | PASS | B | `available-a-to-b-loss-after/observations.txt` |
 | available | b-to-a-loss | PASS | PASS | A | `available-b-to-a-loss-after/observations.txt` |
 | available | recovery-failback | PASS | PASS | A | `available-recovery-failback-after/observations.txt` |
-| available | process-freeze | FAIL | FAIL | A | `available-process-freeze-after/observations.txt` |
-| available | failed-withdrawal | PASS | FAIL | A | `available-failed-withdrawal-after/observations.txt` |
+| available | process-freeze | PASS after incumbent fix | PASS after deterministic thaw | B | `task-24-gruezi-ha-safety-roadmap.txt`, `task-28-gruezi-ha-safety-roadmap.txt` |
+| available | failed-withdrawal | PASS | PASS | A | `task-25-gruezi-ha-safety-roadmap.txt`, `task-27-gruezi-ha-safety-roadmap.txt` |
 | external | startup | PASS | PASS | A | `external-startup-after/observations.txt` |
 | external | graceful-failover | PASS | PASS | B | `external-graceful-failover-after/observations.txt` |
 | external | active-crash | PASS | PASS | B | `external-active-crash-after/observations.txt` |
@@ -133,7 +135,7 @@ Live rows (A is gruezi-a, priority 150; B is gruezi-b, priority 100):
 | external | process-freeze | PASS | PASS | A | `external-process-freeze-after/observations.txt` |
 | external | recovery-failback | PASS | PASS | A | `external-recovery-failback-after/observations.txt` |
 | external | failed-withdrawal, A restarted after SIGKILL | PASS | PASS | A | `external-failed-withdrawal-sigkill-restart-after/observations.txt` |
-| external | failed-withdrawal, A restarted after SIGTERM | FAIL | n/a | A+B | `external-failed-withdrawal-sigterm-restart-after/observations.txt` |
+| external | failed-withdrawal, A restarted after SIGTERM | PASS after release-proof fix | PASS | A | `task-23-gruezi-ha-safety-roadmap.txt` |
 
 In the Kernel VIP owner column "none" means neither kernel holds the VIP. For
 strict that is a PASS: withdrawal and the absent VIP are the intended outcome.
@@ -151,36 +153,35 @@ Observed results that differ from the table above or from the design:
   VIP with no gap. `test-ha-netem.sh process-freeze available` PASSes 3/3 on
   gruezi-a (kernel 264), and an 80-sample trace after SIGCONT never shows
   both kernels holding the VIP.
-* **external, stale release proof (FAIL, safety).** If the owner is stopped with
-  SIGTERM, restarted, reacquires the VIP and then fails to withdraw it, a
-  successor holding a fresh grant still acquired the VIP without fencing
-  (both kernels held the VIP). The same flow after SIGKILL stayed blocked.
-  Open fix todo 23.
-* **available failed withdrawal.** Passes live with a forced cooperative
-  handoff (stop B, restart B with higher priority and preempt); the
-  `test-ha-netem.sh` flow for this row fails on both kernels. Open fix todo 25.
-* **external grant lifetime.** A `grant_ttl_ms` not greater than
-  `withdraw_timeout_ms + safety_margin_ms` produces no grant and no error.
-  Open fix todo 21.
-* **Watchdog (softdog) on gruezi-b.** Behavior PASS with an adjusted copy of the
-  script: armed after ownership, fed past the 15 s timeout, disarmed after
-  confirmed VIP absence, and an actual VM reset after SIGSTOP of the owner
-  (new boot id, no VIP afterwards). The shipped
-  `scripts/test-watchdog-softdog.sh` FAILS on Rocky Linux 10 before arming
-  (secure_path, missing softdog sysfs parameters, missing `group_id`). Open fix
-  todo 22. The watchdog does not prevent overlap under `available`.
+* **External grant lifetime and release proof.** Configuration rejects a grant
+  TTL that cannot cover withdrawal and safety margin. A release proof is
+  discarded when the peer restarts or reacquires, so a successor requires
+  confirmed fencing or a fresh release. The tests cover requested versus
+  confirmed fencing and stale-grant withdrawal. Evidence:
+  `task-21-gruezi-ha-safety-roadmap.txt`, `task-23-gruezi-ha-safety-roadmap.txt`,
+  and `task-26-gruezi-ha-safety-roadmap.txt`.
+* **Watchdog (softdog) on gruezi-b.** The shipped helper passes: it arms after
+  ownership, feeds beyond the 15 second timeout, disarms after confirmed VIP
+  absence, and resets the VM after SIGSTOP. Evidence:
+  `task-22-gruezi-ha-safety-roadmap.txt` and
+  `task-17-gruezi-ha-safety-roadmap.md`. The watchdog does not prevent overlap
+  under `available`.
 * **MariaDB master-master lab on the VMs.** 9 of 9 PASS (podman 6.1.1,
   rootless), including the unfenced direct write limitation and the partition
   overlap. See the Database fencing section; this does not fence the database.
-* **Lab tooling fixes found by the run** (Ansible example values, iptables-nft,
-  quoting, collection on a dead node): open fix todo 20.
+* **Lab tooling.** Ansible values, iptables-nft setup, quoting, dead-node
+  collection, and kernel-module checks are fixed. Evidence:
+  `task-20-gruezi-ha-safety-roadmap.txt`.
 
 Full per-row observations, the discarded first-pass results and the cleanup
 verification are in `.omo/evidence/task-17-gruezi-ha-safety-roadmap.md`.
 
-The current claim map is: ownership worker, kernel read-back, HMAC and session
-admission, strict and available policy behavior, external fencing state, and
-status fields are **Implemented** by tasks 6 through 13 and their tests.
-Watchdog operation and the external grant happy path remain **Experimental**.
-The unmodified netem script still has the available process-freeze failure
-described in task 28 evidence, so that lab result is not presented as green.
+The current claim map is: HA election over UDP is **Implemented** by
+`tests/ha_mode.rs`; the status API is **Implemented** by
+`src/gruezi/api.rs:76`, including
+`status_json_preserves_every_existing_field_and_health`; transition hooks are
+**Implemented** by `tests/ha_hooks.rs`; VIP ownership, authenticated packets,
+policies, status, and watchdog behavior are **Implemented** or **Experimental**
+as labelled above, with evidence in tasks 6 through 17 and 20 through 28.
+`gruezi peers` remains **Experimental** because
+`src/gruezi/peers.rs:list_peers` returns an empty list.

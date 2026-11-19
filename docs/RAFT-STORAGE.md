@@ -2,6 +2,9 @@
 
 This is a **Planned** evaluation. No Raft or KV storage choice here is
 implemented or proven. Raft and KV are outside the current HA safety milestone.
+Raft, KV, DNS, and agent runtimes are out of scope for this milestone. HA wire
+v1 and YAML configuration are unstable prototype formats with no compatibility
+promise.
 
 ## Raft library
 
