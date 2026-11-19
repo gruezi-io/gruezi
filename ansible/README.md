@@ -10,6 +10,7 @@ install a built `.deb` or `.rpm` instead of copying the binary by hand.
 
 - `ansible.cfg`: sets the default inventory and local Ansible defaults for this directory
 - `deploy-ha-lab.yml`: deploys the local release binary, renders the HA config, clears stale VIP state, and starts `gruezi`
+- `prepare-rocky-lab.yml`: installs Rocky Linux lab prerequisites and prepares SELinux, firewalld, and optional softdog
 - `ha-netem.yml`: applies or clears `tc netem` impairment on the HA interface for failure-injection testing
 - `ha-drop.yml`: applies or clears an HA-only UDP drop rule to the configured peer on port `9375`
 - `ha-collect.yml`: collects `/status`, interface state, qdisc state, and recent `gruezi.log` lines into local artifacts
@@ -22,6 +23,7 @@ install a built `.deb` or `.rpm` instead of copying the binary by hand.
 - `ansible-playbook` available locally
 - SSH access to both hosts
 - passwordless `sudo` on both hosts
+- Rocky Linux hosts with `systemd`, `dnf`, and (when enabled) `firewalld`
 
 ## Inventory
 
@@ -41,6 +43,7 @@ Current host-specific variables:
 - `gruezi_node_id`
 - `gruezi_peer_ip`
 - `gruezi_priority`
+- `gruezi_peer_id` (the other node's `node.id`)
 
 Current group-level lab variable in inventory:
 
@@ -52,6 +55,19 @@ Shared defaults live in `group_vars/gruezi_ha_lab.yml`, including:
 - `gruezi_group_id`
 - `gruezi_shared_key`
 - `gruezi_advert_interval_ms`
+- `gruezi_failure_policy` (`strict`, `available`, or `external`)
+- `gruezi_withdraw_timeout_ms`
+- `gruezi_command_timeout_ms`
+- `gruezi_watchdog_mode`, `gruezi_watchdog_device`, `gruezi_watchdog_timeout_ms`,
+  `gruezi_watchdog_safety_margin_ms`, and `gruezi_watchdog_nowayout`
+- `gruezi_authority_check_command`, `gruezi_authority_fence_command`,
+  `gruezi_authority_interval_ms`, and `gruezi_authority_grant_ttl_ms` (only for
+  `external`)
+
+The shared key is required, must contain at least 16 bytes, and is rendered with
+`no_log`; do not put a real key in an example or commit it. The lab defaults to
+`strict`, with the watchdog off. The authority block is emitted only for the
+`external` policy.
 
 ## Run
 
@@ -66,6 +82,23 @@ From the repository root:
 ```bash
 ansible-playbook -i ansible/inventory/lab.yml ansible/deploy-ha-lab.yml
 ```
+
+Prepare both Rocky Linux lab nodes before the first deployment:
+
+```bash
+ansible-playbook -i ansible/inventory/lab.yml ansible/prepare-rocky-lab.yml
+```
+
+Podman and softdog are opt-in:
+
+```bash
+ansible-playbook -i ansible/inventory/lab.yml ansible/prepare-rocky-lab.yml \
+  -e gruezi_prepare_install_podman=true -e gruezi_prepare_load_softdog=true
+```
+
+The prepare playbook is idempotent. It opens UDP `9375` only from the
+configured peer when firewalld is active, sets SELinux permissive both at runtime
+and in `/etc/selinux/config`, and never opens a watchdog device.
 
 ## What It Does
 
@@ -147,6 +180,16 @@ Operational notes:
 - a full partition in a 2-node HA pair can produce dual-active ownership until connectivity is restored
 - collected artifacts are written locally under `ansible/artifacts/<label>/`
 - each collection stores one file per host for `/status`, `tc qdisc show`, `ip address show`, and the recent `gruezi.log` tail
+- each collection also stores `ip -o addr show dev {{ gruezi_interface }}` and
+  watchdog device/sysfs presence (presence checks do not open the device)
+
+## Upgrading a pair
+
+The HA configuration and wire format are prototype settings and are not
+backward-compatible. Stop **both** nodes, deploy the new binary and config, then
+start **both** nodes again. A `strict` pair has an outage during this procedure;
+do not upgrade one node while its peer is still serving the old process. Rotate
+the shared key with the same coordinated stop, update, and start procedure.
 
 Observed live-lab result:
 

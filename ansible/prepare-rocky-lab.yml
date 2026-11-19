@@ -1,0 +1,103 @@
+---
+- name: Prepare Rocky Linux HA lab nodes
+  hosts: '{{ gruezi_prepare_hosts | default("gruezi_ha_lab") }}'
+  gather_facts: false
+  become: true
+  vars:
+    gruezi_prepare_install_podman: false
+    gruezi_prepare_load_softdog: false
+    gruezi_ha_peer_port: 9375
+  tasks:
+    - name: Install HA lab packages
+      ansible.builtin.dnf:
+        name: >-
+          {{
+            ['iproute', 'iputils', 'procps-ng', 'iproute-tc']
+            + (['podman'] if gruezi_prepare_install_podman | bool else [])
+          }}
+        state: present
+        update_cache: true
+
+    - name: Check whether firewalld is active
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - firewalld
+      register: gruezi_firewalld_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check HA UDP firewall rule
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - '--query-rich-rule=rule family="ipv4" source address="{{ gruezi_peer_ip }}/32" port port="{{ gruezi_ha_peer_port }}" protocol="udp" accept'
+      register: gruezi_firewall_rule
+      changed_when: false
+      failed_when: false
+      when: gruezi_firewalld_status.rc == 0
+
+    - name: Allow HA UDP only from the peer node
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - '--add-rich-rule=rule family="ipv4" source address="{{ gruezi_peer_ip }}/32" port port="{{ gruezi_ha_peer_port }}" protocol="udp" accept'
+      register: gruezi_firewall_rule_added
+      changed_when: gruezi_firewall_rule_added.rc == 0
+      when:
+        - gruezi_firewalld_status.rc == 0
+        - gruezi_firewall_rule.rc != 0
+      notify: Reload firewalld
+
+    - name: Read SELinux enforcement mode
+      ansible.builtin.command:
+        argv:
+          - getenforce
+      register: gruezi_selinux_mode
+      changed_when: false
+      failed_when: false
+
+    - name: Set SELinux permissive at runtime
+      ansible.builtin.command:
+        argv:
+          - setenforce
+          - '0'
+      when: gruezi_selinux_mode.stdout | trim == 'Enforcing'
+      changed_when: true
+
+    - name: Persist permissive SELinux mode
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: SELINUX=permissive
+        create: false
+        backup: false
+
+    - name: Check whether softdog is loaded
+      ansible.builtin.command:
+        argv:
+          - lsmod
+      register: gruezi_softdog_modules
+      changed_when: false
+      when: gruezi_prepare_load_softdog | bool
+
+    - name: Load the softdog kernel module
+      ansible.builtin.command:
+        argv:
+          - modprobe
+          - softdog
+      when:
+        - gruezi_prepare_load_softdog | bool
+        - "'softdog' not in (gruezi_softdog_modules.stdout | default(''))"
+      changed_when: true
+
+  handlers:
+    - name: Reload firewalld
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --reload
+      changed_when: true

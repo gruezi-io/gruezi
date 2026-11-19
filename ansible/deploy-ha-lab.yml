@@ -46,8 +46,18 @@
         that:
           - gruezi_node_id is defined
           - gruezi_peer_ip is defined
+          - gruezi_peer_id is defined
           - gruezi_priority is defined
-        fail_msg: Each host needs gruezi_node_id, gruezi_peer_ip, and gruezi_priority
+          - gruezi_failure_policy is defined
+          - gruezi_shared_key is defined
+        fail_msg: Each host needs node, peer, policy, priority, and shared-key variables
+    - name: Validate external authority variables
+      ansible.builtin.assert:
+        that:
+          - gruezi_authority_check_command is defined
+          - gruezi_authority_grant_ttl_ms is defined
+        fail_msg: External policy requires authority check command and grant TTL
+      when: gruezi_failure_policy == 'external'
   tasks:
     - name: Create remote directory
       ansible.builtin.file:
@@ -90,6 +100,7 @@
         src: templates/gruezi-ha.yaml.j2
         dest: '{{ gruezi_config_path }}'
         mode: 0644
+      no_log: true
       notify: restart gruezi
 
     - name: Check whether gruezi is already running
@@ -136,6 +147,7 @@
         ip address del {{ gruezi_vip }} dev {{ gruezi_interface }} || true
       args:
         executable: /bin/bash
+      when: gruezi_vip is defined
 
     - name: Start gruezi in the background
       listen: restart gruezi

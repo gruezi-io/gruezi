@@ -55,6 +55,19 @@
       failed_when: false
       changed_when: false
 
+    - name: Read machine-readable interface addresses
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -o
+          - addr
+          - show
+          - dev
+          - '{{ gruezi_interface }}'
+      register: gruezi_ip_addr_oneline
+      failed_when: false
+      changed_when: false
+
     - name: Read current VIP interface state
       ansible.builtin.command:
         argv:
@@ -65,6 +78,18 @@
           - '{{ gruezi_interface }}'
       register: gruezi_ip_addr
       failed_when: false
+      changed_when: false
+
+    - name: Read watchdog presence information
+      ansible.builtin.shell: |
+        set -o pipefail
+        printf 'devices:\n'
+        ls -la /dev/watchdog* 2>/dev/null || true
+        printf 'sysfs:\n'
+        ls -la /sys/class/watchdog 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: gruezi_watchdog_presence
       changed_when: false
 
     - name: Read recent gruezi log lines
@@ -96,6 +121,15 @@
       delegate_to: localhost
       become: false
 
+    - name: Store machine-readable interface addresses locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-ip-o-addr.txt'
+        content: |
+          {{ gruezi_ip_addr_oneline.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
     - name: Store interface snapshot locally
       ansible.builtin.copy:
         dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-ip-address.txt'
@@ -110,6 +144,15 @@
         dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-gruezi.log.tail'
         content: |
           {{ gruezi_log_tail.stdout | default('') }}
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+
+    - name: Store watchdog presence locally
+      ansible.builtin.copy:
+        dest: '{{ gruezi_artifact_dir }}/{{ inventory_hostname }}-watchdog.txt'
+        content: |
+          {{ gruezi_watchdog_presence.stdout | default('') }}
         mode: '0644'
       delegate_to: localhost
       become: false

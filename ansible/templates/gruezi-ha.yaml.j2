@@ -10,7 +10,7 @@ ha:
   interface: {{ gruezi_interface }}
   group_id: {{ gruezi_group_id }}
   addresses:
-    - {{ gruezi_vip }}
+    - {{ gruezi_vip | to_json }}
   peer: {{ gruezi_peer_ip }}:9375
   priority: {{ gruezi_priority }}
   preempt: {{ gruezi_preempt | lower }}
@@ -19,4 +19,21 @@ ha:
   hold_down_ms: {{ gruezi_hold_down_ms }}
   jitter_ms: {{ gruezi_jitter_ms }}
   auth:
-    key: {{ gruezi_shared_key }}
+    key: {{ gruezi_shared_key | to_json }}
+  withdraw_timeout_ms: {{ gruezi_withdraw_timeout_ms }}
+  command_timeout_ms: {{ gruezi_command_timeout_ms }}
+  watchdog:
+    mode: {{ gruezi_watchdog_mode }}
+    device: {{ gruezi_watchdog_device | to_json }}
+    timeout_ms: {{ gruezi_watchdog_timeout_ms }}
+    safety_margin_ms: {{ gruezi_watchdog_safety_margin_ms }}
+    nowayout: {{ gruezi_watchdog_nowayout }}
+{% if gruezi_failure_policy == 'external' %}
+  authority:
+    check_command: {{ gruezi_authority_check_command | to_json }}
+{% if gruezi_authority_fence_command is defined and gruezi_authority_fence_command | trim | length > 0 %}
+    fence_command: {{ gruezi_authority_fence_command | to_json }}
+{% endif %}
+    interval_ms: {{ gruezi_authority_interval_ms }}
+    grant_ttl_ms: {{ gruezi_authority_grant_ttl_ms }}
+{% endif %}
