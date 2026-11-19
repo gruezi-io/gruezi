@@ -424,8 +424,10 @@ run_scenario() {
                 # A live cooperative handoff exposes the failed resource
                 # status, unlike SIGTERM which also stops the status API.
                 # Restart B with a higher rank and preemption enabled.
+                # Stop B first. Available keeps A's VIP with no peer, so wait
+                # for that observed state before forcing the handoff.
                 signal_node b TERM; MODE_B=down
-                wait_owner "$NS_A" fault
+                SOURCE_A=assumed; wait_owner "$NS_A" normal 2
                 write_config "$SCENARIO_DIR/node-b.yaml" node-b node-a "$IP_B" "$IP_A" "$IF_B" 120 true
                 start_node b; MODE_B=live
             fi
