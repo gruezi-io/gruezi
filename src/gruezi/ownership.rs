@@ -5,7 +5,11 @@ use crate::{
             DesiredOwnership, ResourceCommand, ResourceReport, ResourceReportKind,
             ResourceWorkerHandle,
         },
+        application::{ApplicationOperation, ApplicationPhase, ApplicationState},
         ha::{HaDecisionReason, HaRuntimeConfig, HaState},
+        hooks::{
+            LifecycleContext, LifecycleEvent, LifecycleExecutor, LifecycleKind, LifecycleOutcome,
+        },
         watchdog::{WatchdogDevice, WatchdogManager, WatchdogStatus},
     },
 };
@@ -461,7 +465,6 @@ pub enum ReportEffect {
 }
 
 /// Coordinator state machine separating elected role, ownership authority, and verified resource state.
-#[derive(Debug)]
 pub struct OwnershipController {
     management: ResourceManagement,
     elected_role: HaState,
@@ -477,6 +480,29 @@ pub struct OwnershipController {
     last_observed_at: Option<Instant>,
     last_error: Option<String>,
     watchdog: WatchdogManager,
+    application: ApplicationState,
+    application_timeout: Option<Duration>,
+    lifecycle_executor: Option<LifecycleExecutor>,
+    lifecycle_context: LifecycleContext,
+    application_baseline_pending: bool,
+    #[cfg(test)]
+    lifecycle_submissions: Vec<(LifecycleKind, u64, LifecycleContext)>,
+}
+
+impl std::fmt::Debug for OwnershipController {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnershipController")
+            .field("management", &self.management)
+            .field("elected_role", &self.elected_role)
+            .field("authority", &self.authority)
+            .field("resource_state", &self.resource_state)
+            .field("generation", &self.generation)
+            .field("lifecycle", &self.lifecycle)
+            .field("application", &self.application)
+            .field("watchdog", &self.watchdog)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OwnershipController {
@@ -506,7 +532,389 @@ impl OwnershipController {
             last_observed_at: None,
             last_error: None,
             watchdog: WatchdogManager::default(),
+            application: ApplicationState::disabled(0),
+            application_timeout: None,
+            lifecycle_executor: None,
+            lifecycle_context: LifecycleContext {
+                authority_source: None,
+                authority_term: 0,
+                transfer_id: None,
+                peer_nonce: None,
+                deactivate_deadline: None,
+                db_incarnation: None,
+                notification: None,
+            },
+            application_baseline_pending: false,
+            #[cfg(test)]
+            lifecycle_submissions: Vec::new(),
         }
+    }
+
+    /// Attach the validated executor before startup reconciliation or election.
+    /// The baseline operation always precedes activation, including no-address mode.
+    pub fn configure_lifecycle(
+        &mut self,
+        executor: LifecycleExecutor,
+        timeout_ms: u64,
+        worker: &ResourceWorkerHandle,
+    ) {
+        self.lifecycle_executor = Some(executor);
+        self.application_timeout = Some(Duration::from_millis(timeout_ms));
+        self.start_application_baseline(worker);
+    }
+
+    /// Supply coordinator evidence for the next operation without changing authority.
+    pub fn set_lifecycle_context(&mut self, context: LifecycleContext) {
+        self.lifecycle_context = context;
+    }
+
+    #[must_use]
+    pub const fn application(&self) -> &ApplicationState {
+        &self.application
+    }
+
+    fn start_application_baseline(&mut self, worker: &ResourceWorkerHandle) {
+        self.application_baseline_pending = true;
+        self.application.phase = ApplicationPhase::Deactivating {
+            generation: self.generation,
+        };
+        worker.set_directive(self.generation, DesiredOwnership::Revoked);
+        self.submit_lifecycle(LifecycleKind::Deactivate, worker);
+    }
+
+    fn application_ready(&self) -> bool {
+        self.application
+            .ready(self.generation, Instant::now(), self.application_timeout)
+    }
+
+    const fn application_blocks_acquisition(&self) -> bool {
+        matches!(
+            self.application.phase,
+            ApplicationPhase::Deactivating { .. } | ApplicationPhase::Uncertain { .. }
+        )
+    }
+
+    fn submit_lifecycle(
+        &mut self,
+        kind: LifecycleKind,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        let Some(timeout) = self.application_timeout else {
+            return RoleTransitionEffect::None;
+        };
+        let now = Instant::now();
+        let mut context = self.lifecycle_context.clone();
+        if self.authority.is_valid() {
+            context.authority_source = self.authority.source();
+            context.authority_term = self.authority.term();
+        }
+        let deadline = if kind == LifecycleKind::Deactivate {
+            context
+                .deactivate_deadline
+                .map_or(now + timeout, |limit| limit.min(now + timeout))
+        } else {
+            now + timeout
+        };
+        self.application.operation = Some(ApplicationOperation {
+            kind,
+            generation: self.generation,
+            submitted_at: now,
+            deadline,
+        });
+        #[cfg(test)]
+        {
+            self.lifecycle_submissions
+                .push((kind, self.generation, context.clone()));
+            // Unit tests drive completion events and virtual time explicitly.
+            if self.lifecycle_executor.is_none() {
+                return RoleTransitionEffect::None;
+            }
+        }
+        let result = self.lifecycle_executor.as_ref().map_or_else(
+            || Err(anyhow::anyhow!("lifecycle executor unavailable")),
+            |executor| executor.submit(kind, self.generation, context),
+        );
+        let (outcome, stderr_tail) = match result {
+            Ok(true) => return RoleTransitionEffect::None,
+            Ok(false) => (
+                LifecycleOutcome::Cancelled,
+                "lifecycle submission obsolete".to_owned(),
+            ),
+            Err(error) => (LifecycleOutcome::SpawnError, error.to_string()),
+        };
+        self.fail_application(
+            &LifecycleEvent {
+                kind,
+                generation: self.generation,
+                outcome,
+                elapsed: Duration::ZERO,
+                started: None,
+                exit_code_or_signal: None,
+                stderr_tail,
+                db_incarnation: None,
+            },
+            worker,
+        )
+    }
+
+    fn fail_application(
+        &mut self,
+        event: &LifecycleEvent,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        self.application.record_failure(event);
+        if event.kind == LifecycleKind::Deactivate {
+            // No retry: absence alone cannot establish application passivity.
+            self.application.phase = ApplicationPhase::Uncertain {
+                generation: self.generation,
+            };
+            self.application.operation = None;
+            self.watchdog.stop_feeding();
+            self.authority_provider.revoke();
+            self.authority = AuthorityState::None;
+            self.pending_promotion = None;
+            worker.set_directive(self.generation, DesiredOwnership::Revoked);
+            worker.send_command(ResourceCommand::Withdraw(self.generation));
+            RoleTransitionEffect::None
+        } else {
+            self.revoke_authority_internal(
+                self.elected_role,
+                self.elected_role,
+                HaDecisionReason::RuntimeFault,
+                worker,
+            )
+        }
+    }
+
+    /// Earliest due verification submission; an in-flight verify is coalesced.
+    #[must_use]
+    pub fn next_verify_at(&self) -> Option<Instant> {
+        if self
+            .application
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.kind == LifecycleKind::Verify)
+        {
+            return None;
+        }
+        match self.application.phase {
+            ApplicationPhase::Ready {
+                generation,
+                next_verify_at,
+                ..
+            } if generation == self.generation => Some(next_verify_at),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn verification_deadline(&self) -> Option<Instant> {
+        match self.application.phase {
+            ApplicationPhase::Ready {
+                generation,
+                next_verify_at,
+                ..
+            } if generation == self.generation => self
+                .application_timeout
+                .map(|timeout| next_verify_at + timeout),
+            _ => None,
+        }
+    }
+
+    /// Handle the freshness wake even if no executor event has arrived.
+    pub fn check_verification_deadline(
+        &mut self,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        if self
+            .verification_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return self.fail_application(
+                &LifecycleEvent {
+                    kind: LifecycleKind::Verify,
+                    generation: self.generation,
+                    outcome: LifecycleOutcome::TimedOut,
+                    elapsed: self.application_timeout.unwrap_or_default(),
+                    started: None,
+                    exit_code_or_signal: None,
+                    stderr_tail: "verification freshness deadline missed".to_owned(),
+                    db_incarnation: None,
+                },
+                worker,
+            );
+        }
+        RoleTransitionEffect::None
+    }
+
+    /// Submit only while current readiness and live authority both hold.
+    pub fn request_verify(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        let effect = self.check_verification_deadline(worker);
+        if !matches!(effect, RoleTransitionEffect::None) {
+            return effect;
+        }
+        if self.elected_role == HaState::Active
+            && self.authority.is_valid()
+            && self
+                .authority
+                .expiry()
+                .is_none_or(|until| until > Instant::now())
+            && self.application_ready()
+            && self
+                .next_verify_at()
+                .is_some_and(|due| Instant::now() >= due)
+        {
+            return self.submit_lifecycle(LifecycleKind::Verify, worker);
+        }
+        RoleTransitionEffect::None
+    }
+
+    /// Apply critical completion evidence without ever awaiting a script.
+    /// Old results are inert; they cannot clear a retained failure or renew freshness.
+    pub fn apply_lifecycle_event(
+        &mut self,
+        mut event: LifecycleEvent,
+        worker: &ResourceWorkerHandle,
+    ) -> RoleTransitionEffect {
+        if !self.application.configured()
+            || event.generation < self.generation
+            || matches!(event.kind, LifecycleKind::Notify(_))
+            || matches!(self.application.phase, ApplicationPhase::Uncertain { .. })
+        {
+            return RoleTransitionEffect::None;
+        }
+        if event.generation != self.generation {
+            event.outcome = LifecycleOutcome::Failed;
+            "lifecycle completion generation mismatch".clone_into(&mut event.stderr_tail);
+            return self.fail_application(&event, worker);
+        }
+        let expected = self
+            .application
+            .operation
+            .as_ref()
+            .is_some_and(|operation| {
+                operation.kind == event.kind && operation.generation == event.generation
+            });
+        if event.kind == LifecycleKind::Verify
+            && self.application.activation_confirmed(self.generation)
+            && event.outcome != LifecycleOutcome::Succeeded
+        {
+            return self.fail_application(&event, worker);
+        }
+        if !expected {
+            return RoleTransitionEffect::None;
+        }
+        if event.outcome != LifecycleOutcome::Succeeded {
+            return self.fail_application(&event, worker);
+        }
+        if event.kind == LifecycleKind::Deactivate {
+            self.application.phase = ApplicationPhase::Inactive {
+                generation: self.generation,
+            };
+            self.application.operation = None;
+            self.application_baseline_pending = false;
+            if self.resource_state.is_confirmed_absent_or_unmanaged() {
+                self.disarm_watchdog_after_absence();
+            }
+            return self.refresh_authority(worker);
+        }
+        let effect = self.check_verification_deadline(worker);
+        if !matches!(effect, RoleTransitionEffect::None) {
+            return effect;
+        }
+        let authority = self.authority_provider.evaluate(
+            self.elected_role,
+            matches!(self.lifecycle, LifecyclePhase::Ready),
+            self.policy_inputs,
+        );
+        let live = self.elected_role == HaState::Active
+            && self.authority.is_valid()
+            && authority.is_valid()
+            && authority
+                .expiry()
+                .is_none_or(|until| until > Instant::now())
+            && self.watchdog.ownership_allowed()
+            && !self.application_blocks_acquisition();
+        let identity_valid = event.kind != LifecycleKind::Verify
+            || matches!(
+                &self.application.phase,
+                ApplicationPhase::Ready { db_incarnation: Some(expected), .. }
+                    if event.db_incarnation.as_ref() == Some(expected)
+            );
+        let Some(started) = event.started.filter(|started| *started <= Instant::now()) else {
+            event.outcome = LifecycleOutcome::Failed;
+            "lifecycle completion has no valid start time".clone_into(&mut event.stderr_tail);
+            return self.fail_application(&event, worker);
+        };
+        if !live || !identity_valid {
+            event.outcome = LifecycleOutcome::Failed;
+            "lifecycle completion no longer matches live ownership evidence"
+                .clone_into(&mut event.stderr_tail);
+            return self.fail_application(&event, worker);
+        }
+        self.authority = authority;
+        let Some(period) = self.application_timeout else {
+            return RoleTransitionEffect::None;
+        };
+        if started + 2 * period <= Instant::now() {
+            event.outcome = LifecycleOutcome::TimedOut;
+            "lifecycle completion arrived after freshness deadline"
+                .clone_into(&mut event.stderr_tail);
+            return self.fail_application(&event, worker);
+        }
+        self.application.phase = ApplicationPhase::Ready {
+            generation: self.generation,
+            db_incarnation: event.db_incarnation.clone(),
+            verified_at: started,
+            next_verify_at: started + period,
+        };
+        self.application.operation = None;
+        self.lifecycle_context.db_incarnation = event.db_incarnation;
+        if event.kind == LifecycleKind::Activate {
+            return self.acquire_ready_resource(worker);
+        }
+        RoleTransitionEffect::None
+    }
+
+    fn advance_generation(&mut self, worker: &ResourceWorkerHandle) -> bool {
+        if let Some(generation) = self.generation.checked_add(1) {
+            self.generation = generation;
+            if matches!(self.application.phase, ApplicationPhase::Disabled { .. }) {
+                self.application.phase = ApplicationPhase::Disabled { generation };
+            }
+            return true;
+        }
+        self.watchdog.stop_feeding();
+        self.authority_provider.revoke();
+        self.authority = AuthorityState::None;
+        self.pending_promotion = None;
+        self.lifecycle = LifecyclePhase::RevokedSticky;
+        self.application.phase = ApplicationPhase::Uncertain {
+            generation: self.generation,
+        };
+        self.application.operation = None;
+        if self.application.last_critical_failure.is_none() {
+            self.application.record_failure(&LifecycleEvent {
+                kind: LifecycleKind::Deactivate,
+                generation: self.generation,
+                outcome: LifecycleOutcome::Failed,
+                elapsed: Duration::ZERO,
+                started: None,
+                exit_code_or_signal: None,
+                stderr_tail: "ownership generation exhausted".to_owned(),
+                db_incarnation: None,
+            });
+        }
+        // Dropping cancels old work, without submitting an aliased generation.
+        self.lifecycle_executor = None;
+        worker.set_directive(self.generation, DesiredOwnership::Revoked);
+        worker.send_command(ResourceCommand::Withdraw(self.generation));
+        if self.management == ResourceManagement::Managed {
+            self.resource_state = ResourceState::Releasing {
+                generation: self.generation,
+            };
+        }
+        false
     }
 
     /// Enqueue the initial startup reconciliation before any owned state can be advertised.
@@ -518,7 +926,7 @@ impl OwnershipController {
     /// True once startup reconciliation has confirmed initial VIP absence (or unmanaged).
     #[must_use]
     pub const fn is_startup_reconciled(&self) -> bool {
-        !matches!(self.lifecycle, LifecyclePhase::Booting)
+        !matches!(self.lifecycle, LifecyclePhase::Booting) && !self.application_baseline_pending
     }
 
     /// Role that may be advertised to peers; never advertises `Active` before startup reconciliation finishes.
@@ -579,6 +987,12 @@ impl OwnershipController {
         matches!(self.elected_role, HaState::Active)
             && self.authority.is_valid()
             && self.watchdog.ownership_allowed()
+            && self.application_ready()
+            && (!self.application.configured()
+                || self
+                    .authority
+                    .expiry()
+                    .is_none_or(|until| until > Instant::now()))
             && match self.resource_state {
                 ResourceState::Present { generation } => generation == self.generation,
                 ResourceState::Unmanaged => true,
@@ -617,6 +1031,10 @@ impl OwnershipController {
     /// Share the owned predicate so both present and unmanaged resources feed.
     /// A failed keepalive revokes authority and starts bounded withdrawal.
     pub(crate) fn feed_watchdog(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        let effect = self.check_verification_deadline(worker);
+        if !matches!(effect, RoleTransitionEffect::None) {
+            return effect;
+        }
         if self.owned()
             && self
                 .authority
@@ -637,6 +1055,12 @@ impl OwnershipController {
     }
 
     fn disarm_watchdog_after_absence(&mut self) {
+        if !self.application.passive_confirmed(self.generation)
+            || !self.resource_state.is_confirmed_absent_or_unmanaged()
+            || self.authority.is_valid()
+        {
+            return;
+        }
         if let Err(error) = self.watchdog.disarm() {
             tracing::warn!(%error, "watchdog remains unfed after confirmed absence");
             self.last_error = Some(error.to_string());
@@ -649,6 +1073,7 @@ impl OwnershipController {
         !self.authority.is_valid()
             && matches!(self.lifecycle, LifecyclePhase::Ready)
             && self.resource_state.is_confirmed_absent_or_unmanaged()
+            && self.application.passive_confirmed(self.generation)
     }
 
     /// Select the authority provider for the configured failure policy.
@@ -737,6 +1162,10 @@ impl OwnershipController {
     /// time: `strict` revokes and withdraws, `available` falls back to
     /// `assumed` without interrupting ownership.
     pub fn refresh_authority(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        let effect = self.check_verification_deadline(worker);
+        if !matches!(effect, RoleTransitionEffect::None) {
+            return effect;
+        }
         if matches!(self.lifecycle, LifecyclePhase::Booting) {
             // Startup reconciliation still owes an absence proof; the
             // authority re-check in `handle_absent_report` runs once it lands.
@@ -745,7 +1174,8 @@ impl OwnershipController {
         if self.elected_role != HaState::Active {
             return RoleTransitionEffect::None;
         }
-        if !matches!(self.lifecycle, LifecyclePhase::Ready) {
+        if !matches!(self.lifecycle, LifecyclePhase::Ready) || self.application_blocks_acquisition()
+        {
             // Sticky revocation: authority stays pending until withdrawal
             // confirms absence; a policy grant must never push past it (I7).
             self.authority =
@@ -790,7 +1220,21 @@ impl OwnershipController {
         reason: HaDecisionReason,
         worker: &ResourceWorkerHandle,
     ) -> RoleTransitionEffect {
-        self.generation = self.generation.saturating_add(1);
+        if self.application.configured() && !authority.is_valid() {
+            // Waiting for authority has performed no application mutation and
+            // must not invalidate the current passive generation's evidence.
+            self.authority = authority;
+            self.pending_promotion = Some(PendingPromotion {
+                generation: self.generation,
+                previous_state: self.previous_role,
+                reason,
+            });
+            return RoleTransitionEffect::AwaitingConfirmation;
+        }
+        let passive = self.application.passive_confirmed(self.generation);
+        if !self.advance_generation(worker) {
+            return RoleTransitionEffect::AwaitingConfirmation;
+        }
         self.authority = authority;
         if !self.authority.is_valid() {
             self.pending_promotion = Some(PendingPromotion {
@@ -800,7 +1244,15 @@ impl OwnershipController {
             });
             return RoleTransitionEffect::AwaitingConfirmation;
         }
-        if !self.resource_state.is_confirmed_absent_or_unmanaged() {
+        if !self.resource_state.is_confirmed_absent_or_unmanaged() || !passive {
+            if self.application.configured() {
+                return self.revoke_authority_internal(
+                    self.elected_role,
+                    self.elected_role,
+                    HaDecisionReason::RuntimeFault,
+                    worker,
+                );
+            }
             self.authority_provider.revoke();
             self.authority = AuthorityState::Pending;
             return RoleTransitionEffect::AwaitingConfirmation;
@@ -811,25 +1263,55 @@ impl OwnershipController {
         ) {
             // Keep the worker revoked: neither a direct Acquire nor periodic
             // Reconcile may add a VIP after an unsuccessful arm (I10).
+            if self.application.configured() {
+                let effect = self.revoke_authority_internal(
+                    self.elected_role,
+                    self.elected_role,
+                    HaDecisionReason::RuntimeFault,
+                    worker,
+                );
+                self.last_error = Some(error.to_string());
+                return effect;
+            }
             self.authority_provider.revoke();
             self.authority = AuthorityState::Pending;
             self.last_error = Some(error.to_string());
             return RoleTransitionEffect::AwaitingConfirmation;
-        }
-        if self.management == ResourceManagement::Unmanaged {
-            self.resource_state = ResourceState::Unmanaged;
-            self.promoted_generation = Some(self.generation);
-            self.pending_promotion = None;
-            return RoleTransitionEffect::PromoteNow {
-                previous_state: self.previous_role,
-                reason,
-            };
         }
         self.pending_promotion = Some(PendingPromotion {
             generation: self.generation,
             previous_state: self.previous_role,
             reason,
         });
+        if self.application.configured() {
+            self.application.phase = ApplicationPhase::Activating {
+                generation: self.generation,
+            };
+            return match self.submit_lifecycle(LifecycleKind::Activate, worker) {
+                RoleTransitionEffect::None => RoleTransitionEffect::AwaitingConfirmation,
+                effect => effect,
+            };
+        }
+        self.acquire_ready_resource(worker)
+    }
+
+    fn acquire_ready_resource(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        if !self.application_ready() {
+            return RoleTransitionEffect::AwaitingConfirmation;
+        }
+        let pending = self.pending_promotion;
+        if self.management == ResourceManagement::Unmanaged {
+            self.resource_state = ResourceState::Unmanaged;
+            self.promoted_generation = Some(self.generation);
+            self.pending_promotion = None;
+            return RoleTransitionEffect::PromoteNow {
+                previous_state: pending
+                    .map_or(self.previous_role, |promotion| promotion.previous_state),
+                reason: pending.map_or(HaDecisionReason::AlreadyActive, |promotion| {
+                    promotion.reason
+                }),
+            };
+        }
         self.resource_state = ResourceState::Acquiring {
             generation: self.generation,
         };
@@ -885,7 +1367,9 @@ impl OwnershipController {
                 }
             }
             HaState::Active => {
-                if !matches!(self.lifecycle, LifecyclePhase::Ready) {
+                if !matches!(self.lifecycle, LifecyclePhase::Ready)
+                    || self.application_blocks_acquisition()
+                {
                     self.authority = self.authority_provider.evaluate(
                         HaState::Active,
                         false,
@@ -896,11 +1380,15 @@ impl OwnershipController {
                         previous_state: previous_role,
                         reason,
                     });
-                    if matches!(self.lifecycle, LifecyclePhase::RevokedSticky) {
+                    if matches!(self.lifecycle, LifecyclePhase::RevokedSticky)
+                        && !self.application.configured()
+                    {
                         worker.set_directive(self.generation, DesiredOwnership::Revoked);
-                        worker.send_command(ResourceCommand::Acquire(
-                            self.generation.saturating_add(1),
-                        ));
+                        if let Some(generation) = self.generation.checked_add(1) {
+                            worker.send_command(ResourceCommand::Acquire(generation));
+                        } else {
+                            self.advance_generation(worker);
+                        }
                     }
                     return RoleTransitionEffect::AwaitingConfirmation;
                 }
@@ -935,11 +1423,28 @@ impl OwnershipController {
         reason: HaDecisionReason,
         worker: &ResourceWorkerHandle,
     ) -> RoleTransitionEffect {
+        let uncertain = matches!(self.application.phase, ApplicationPhase::Uncertain { .. });
+        if self.authority.is_valid() {
+            self.lifecycle_context.authority_source = self.authority.source();
+            self.lifecycle_context.authority_term = self.authority.term();
+        }
         self.watchdog.stop_feeding();
         self.authority_provider.revoke();
         self.authority = AuthorityState::None;
         self.pending_promotion = None;
-        self.generation = self.generation.saturating_add(1);
+        let advanced = self.advance_generation(worker);
+        if self.application.configured() {
+            self.application.operation = None;
+            self.application.phase = if uncertain || !advanced {
+                ApplicationPhase::Uncertain {
+                    generation: self.generation,
+                }
+            } else {
+                ApplicationPhase::Deactivating {
+                    generation: self.generation,
+                }
+            };
+        }
 
         if self.management == ResourceManagement::Managed {
             self.lifecycle = LifecyclePhase::RevokedSticky;
@@ -951,6 +1456,10 @@ impl OwnershipController {
         } else {
             self.resource_state = ResourceState::Unmanaged;
             self.disarm_watchdog_after_absence();
+        }
+        if advanced && self.application.configured() && !uncertain {
+            // VIP withdrawal is requested before script cancellation/submission.
+            self.submit_lifecycle(LifecycleKind::Deactivate, worker);
         }
 
         if previous_role == HaState::Active {
@@ -965,6 +1474,9 @@ impl OwnershipController {
     }
 
     fn consume_pending_promotion(&mut self, generation: u64) -> ReportEffect {
+        if !self.application_ready() {
+            return ReportEffect::None;
+        }
         if self.promoted_generation != Some(generation) {
             self.promoted_generation = Some(generation);
             let (previous_state, reason) = self
@@ -989,7 +1501,10 @@ impl OwnershipController {
             self.disarm_watchdog_after_absence();
         }
 
-        if was_booting && self.elected_role == HaState::Active {
+        if was_booting
+            && self.elected_role == HaState::Active
+            && !self.application_blocks_acquisition()
+        {
             // Startup reconciliation confirmed absence: acquisition begins
             // only when the failure policy granted authority (bootstrap rule).
             let reason = self
@@ -1029,8 +1544,18 @@ impl OwnershipController {
                 .expiry()
                 .is_none_or(|until| until > Instant::now())
             && matches!(self.lifecycle, LifecyclePhase::Ready);
+        let valid_for_current = valid_for_current && self.application_ready();
 
         if !valid_for_current {
+            if self.application.configured() {
+                self.revoke_authority_internal(
+                    self.elected_role,
+                    self.elected_role,
+                    HaDecisionReason::RuntimeFault,
+                    worker,
+                );
+                return ReportEffect::None;
+            }
             // Invariant I7: a stale completion never restores ownership and triggers compensating withdrawal.
             self.lifecycle = LifecyclePhase::RevokedSticky;
             self.watchdog.stop_feeding();
@@ -1072,7 +1597,10 @@ impl OwnershipController {
                 if !self.authority.is_valid() {
                     self.disarm_watchdog_after_absence();
                 }
-                if self.elected_role == HaState::Active && self.authority.is_valid() {
+                if self.elected_role == HaState::Active
+                    && self.authority.is_valid()
+                    && self.application_ready()
+                {
                     return self.consume_pending_promotion(self.generation);
                 }
                 ReportEffect::None
@@ -1102,6 +1630,14 @@ impl OwnershipController {
                     last_error,
                 };
                 if report.kind == ResourceReportKind::Fault {
+                    if self.application.configured() && !self.application_blocks_acquisition() {
+                        self.revoke_authority_internal(
+                            self.elected_role,
+                            self.elected_role,
+                            HaDecisionReason::RuntimeFault,
+                            worker,
+                        );
+                    }
                     ReportEffect::Fault {
                         state: self.elected_role,
                         previous_state: self.previous_role,
@@ -1114,10 +1650,12 @@ impl OwnershipController {
     }
 
     /// Trigger a reconciliation check on the single resource worker.
-    pub fn request_reconcile(&self, worker: &ResourceWorkerHandle) {
+    pub fn request_reconcile(&mut self, worker: &ResourceWorkerHandle) {
+        self.check_verification_deadline(worker);
         let desired = if self.elected_role == HaState::Active
             && self.authority.is_valid()
             && matches!(self.lifecycle, LifecyclePhase::Ready)
+            && self.application_ready()
         {
             DesiredOwnership::Authorized
         } else {
@@ -1129,17 +1667,28 @@ impl OwnershipController {
 
     /// Revoke authority, drain in-flight work, withdraw VIPs, and join the resource worker.
     pub async fn shutdown(&mut self, worker: &mut ResourceWorkerHandle) -> ResourceReport {
-        self.watchdog.stop_feeding();
-        self.authority_provider.revoke();
-        self.authority = AuthorityState::None;
-        self.pending_promotion = None;
+        let previous_role = self.elected_role;
         self.elected_role = HaState::Init;
-        self.generation = self.generation.saturating_add(1);
-        if self.management == ResourceManagement::Managed {
-            self.lifecycle = LifecyclePhase::RevokedSticky;
-            self.resource_state = ResourceState::Releasing {
-                generation: self.generation,
-            };
+        if self.application.configured() {
+            self.revoke_authority_internal(
+                previous_role,
+                HaState::Init,
+                HaDecisionReason::GracefulShutdown,
+                worker,
+            );
+        } else {
+            // Preserve the legacy shutdown's single worker command and ordering.
+            self.watchdog.stop_feeding();
+            self.authority_provider.revoke();
+            self.authority = AuthorityState::None;
+            self.pending_promotion = None;
+            self.advance_generation(worker);
+            if self.management == ResourceManagement::Managed {
+                self.lifecycle = LifecyclePhase::RevokedSticky;
+                self.resource_state = ResourceState::Releasing {
+                    generation: self.generation,
+                };
+            }
         }
         let report = worker.shutdown(self.generation).await;
         self.last_observed_at = Some(report.observed_at);
@@ -2133,6 +2682,849 @@ mod tests {
 
         let _ = controller.shutdown(&mut worker).await;
         Ok(())
+    }
+
+    mod application_lifecycle_tests {
+        use super::*;
+        use crate::gruezi::{
+            application::ApplicationPhase,
+            hooks::{LifecycleEvent, LifecycleKind, LifecycleOutcome},
+        };
+
+        const PERIOD: Duration = Duration::from_millis(100);
+
+        fn event(
+            kind: LifecycleKind,
+            generation: u64,
+            outcome: LifecycleOutcome,
+        ) -> LifecycleEvent {
+            LifecycleEvent {
+                kind,
+                generation,
+                outcome,
+                elapsed: Duration::ZERO,
+                started: Some(Instant::now()),
+                exit_code_or_signal: Some(i32::from(outcome != LifecycleOutcome::Succeeded)),
+                stderr_tail: String::new(),
+                db_incarnation: Some("instance-a".to_owned()),
+            }
+        }
+
+        async fn passive(
+            management: ResourceManagement,
+        ) -> Result<(
+            Arc<Mutex<SimulatedKernel>>,
+            ResourceWorkerHandle,
+            OwnershipController,
+        )> {
+            let addresses = if management == ResourceManagement::Managed {
+                vec!["10.0.0.10/24"]
+            } else {
+                Vec::new()
+            };
+            let (kernel, worker, mut controller, _) = boot_managed_pair(addresses).await?;
+            controller.management = management;
+            controller.application_timeout = Some(PERIOD);
+            controller.start_application_baseline(&worker);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Deactivating { .. }
+            ));
+            assert!(!controller.can_release_handoff());
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Deactivate,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                ),
+                &worker,
+            );
+            assert!(controller.can_release_handoff());
+            Ok((kernel, worker, controller))
+        }
+
+        fn activate(controller: &mut OwnershipController, worker: &ResourceWorkerHandle) {
+            let effect = controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                worker,
+            );
+            assert_eq!(effect, RoleTransitionEffect::AwaitingConfirmation);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Activating { generation } if generation == controller.generation()
+            ));
+            assert!(controller.authority().is_valid());
+            assert!(!controller.owned());
+        }
+
+        fn confirm_activation(
+            controller: &mut OwnershipController,
+            worker: &ResourceWorkerHandle,
+        ) -> RoleTransitionEffect {
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Activate,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                ),
+                worker,
+            )
+        }
+
+        fn assert_compensation(controller: &OwnershipController, kind: LifecycleKind) {
+            assert!(!controller.authority().is_valid());
+            assert!(!controller.owned());
+            assert!(!controller.can_release_handoff());
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Deactivating { generation } if generation == controller.generation()
+            ));
+            assert_eq!(
+                controller
+                    .lifecycle_submissions
+                    .last()
+                    .map(|(kind, generation, _)| (*kind, *generation)),
+                Some((LifecycleKind::Deactivate, controller.generation()))
+            );
+            assert_eq!(
+                controller
+                    .application()
+                    .last_critical_failure
+                    .as_ref()
+                    .map(|failure| failure.kind),
+                Some(kind)
+            );
+            println!(
+                "LIFECYCLE FAILURE QA generation={} kind={kind:?} authority={:?} deactivate=submitted release=withheld owned=false",
+                controller.generation(),
+                controller.authority()
+            );
+        }
+
+        fn assert_no_add(kernel: &Arc<Mutex<SimulatedKernel>>) {
+            assert_eq!(
+                SimulatedKernel::table_snapshot(kernel),
+                Vec::<String>::new()
+            );
+            assert!(
+                !SimulatedKernel::calls_snapshot(kernel)
+                    .iter()
+                    .any(|call| call.iter().any(|arg| arg == "add"))
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn no_acquire_before_activation_ready() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            let generation = controller.generation();
+            println!("LIFECYCLE QA generation={generation} Activating");
+            assert_no_add(&kernel);
+            confirm_activation(&mut controller, &worker);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Ready { .. }
+            ));
+            println!("LIFECYCLE QA generation={generation} Ready");
+            assert_eq!(
+                controller.resource_state(),
+                &ResourceState::Acquiring { generation }
+            );
+            println!("LIFECYCLE QA generation={generation} Acquire");
+            let report = worker.recv_report().await.context("acquire after ready")?;
+            controller.apply_worker_report(report, &worker);
+            assert!(controller.owned());
+            println!("LIFECYCLE QA generation={generation} owned");
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stale_ready_for_old_generation_is_ignored() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            let old = controller.generation();
+            controller.revoke_authority(HaDecisionReason::PeerTimeout, &worker);
+            let submissions = controller.lifecycle_submissions.len();
+            controller.apply_lifecycle_event(
+                event(LifecycleKind::Activate, old, LifecycleOutcome::Succeeded),
+                &worker,
+            );
+            assert!(!controller.owned());
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Deactivating { .. }
+            ));
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            let report = worker
+                .recv_report()
+                .await
+                .context("withdraw mid activation")?;
+            controller.apply_worker_report(report, &worker);
+            assert_no_add(&kernel);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        async fn activation_failure(outcome: LifecycleOutcome) -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            let generation = controller.generation();
+            controller.apply_lifecycle_event(
+                event(LifecycleKind::Activate, generation, outcome),
+                &worker,
+            );
+            assert_eq!(controller.generation(), generation + 1);
+            assert_compensation(&controller, LifecycleKind::Activate);
+            let report = worker.recv_report().await.context("immediate withdrawal")?;
+            controller.apply_worker_report(report, &worker);
+            assert!(!controller.can_release_handoff());
+            assert_no_add(&kernel);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn activation_failure_revokes_and_compensates() -> Result<()> {
+            activation_failure(LifecycleOutcome::Failed).await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn activation_timeout_revokes_and_compensates() -> Result<()> {
+            activation_failure(LifecycleOutcome::TimedOut).await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn vip_add_failure_after_activation_runs_deactivate() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fail_add_addresses
+                .push("10.0.0.10/24".to_owned());
+            activate(&mut controller, &worker);
+            confirm_activation(&mut controller, &worker);
+            let report = worker.recv_report().await.context("failed VIP add")?;
+            assert_eq!(report.kind, ResourceReportKind::Fault);
+            controller.apply_worker_report(report, &worker);
+            assert!(!controller.authority().is_valid());
+            assert!(!controller.can_release_handoff());
+            assert_eq!(
+                controller
+                    .lifecycle_submissions
+                    .last()
+                    .map(|(kind, _, _)| *kind),
+                Some(LifecycleKind::Deactivate)
+            );
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconcile_cannot_add_vip_when_not_ready() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            controller.request_reconcile(&worker);
+            let report = worker
+                .recv_report()
+                .await
+                .context("reconciliation while activating")?;
+            controller.apply_worker_report(report, &worker);
+            assert_no_add(&kernel);
+            assert!(!controller.owned());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn no_vip_mode_cannot_bypass_readiness() -> Result<()> {
+            let (kernel, mut worker, mut controller) =
+                passive(ResourceManagement::Unmanaged).await?;
+            activate(&mut controller, &worker);
+            controller.request_reconcile(&worker);
+            let report = worker.recv_report().await.context("unmanaged reconcile")?;
+            assert_eq!(
+                controller.apply_worker_report(report, &worker),
+                ReportEffect::None
+            );
+            assert!(!controller.owned());
+            assert!(matches!(
+                confirm_activation(&mut controller, &worker),
+                RoleTransitionEffect::PromoteNow { .. }
+            ));
+            assert!(controller.owned());
+            assert_no_add(&kernel);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn release_blocked_until_inactive() -> Result<()> {
+            let (_, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            controller.revoke_authority(HaDecisionReason::GracefulShutdown, &worker);
+            let report = worker
+                .recv_report()
+                .await
+                .context("absence before inactive")?;
+            controller.apply_worker_report(report, &worker);
+            assert!(!controller.can_release_handoff());
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Deactivate,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                ),
+                &worker,
+            );
+            assert!(controller.can_release_handoff());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn watchdog_not_disarmed_until_inactive() -> Result<()> {
+            use crate::gruezi::watchdog::WatchdogCall;
+            let (_, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            let fake = attach_watchdog(&mut controller);
+            activate(&mut controller, &worker);
+            controller.revoke_authority(HaDecisionReason::GracefulShutdown, &worker);
+            let report = worker
+                .recv_report()
+                .await
+                .context("absence while deactivating")?;
+            controller.apply_worker_report(report, &worker);
+            assert!(controller.watchdog_status(Instant::now()).armed);
+            assert!(
+                !fake.calls().iter().any(|(_, call)| matches!(
+                    call,
+                    WatchdogCall::Disarm | WatchdogCall::MagicClose
+                ))
+            );
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Deactivate,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                ),
+                &worker,
+            );
+            assert!(!controller.watchdog_status(Instant::now()).armed);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_deactivate_latches_uncertain_and_blocks_reacquire() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            let fake = attach_watchdog(&mut controller);
+            activate(&mut controller, &worker);
+            controller.revoke_authority(HaDecisionReason::PeerTimeout, &worker);
+            let generation = controller.generation();
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Deactivate,
+                    generation,
+                    LifecycleOutcome::TimedOut,
+                ),
+                &worker,
+            );
+            let failure = controller.application().last_critical_failure.clone();
+            let report = worker
+                .recv_report()
+                .await
+                .context("withdraw with failed deactivate")?;
+            controller.apply_worker_report(report, &worker);
+            let submissions = controller.lifecycle_submissions.len();
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            );
+            controller.refresh_authority(&worker);
+            controller.request_reconcile(&worker);
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Deactivate,
+                    generation,
+                    LifecycleOutcome::Succeeded,
+                ),
+                &worker,
+            );
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Uncertain { .. }
+            ));
+            assert_eq!(controller.application().last_critical_failure, failure);
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            assert!(!controller.can_release_handoff());
+            assert!(controller.watchdog_status(Instant::now()).armed);
+            let calls = fake.calls();
+            controller.feed_watchdog(&worker);
+            assert_eq!(fake.calls(), calls);
+            assert_no_add(&kernel);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn owned_false_while_activating() -> Result<()> {
+            let (_, mut worker, mut controller) = passive(ResourceManagement::Unmanaged).await?;
+            activate(&mut controller, &worker);
+            assert!(controller.authority().is_valid());
+            assert_eq!(controller.resource_state(), &ResourceState::Unmanaged);
+            assert!(!controller.owned());
+            controller.refresh_authority(&worker);
+            assert!(
+                controller.authority().is_valid(),
+                "activation must not stop authority renewal"
+            );
+            assert!(!controller.owned());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn lifecycle_absent_is_behavior_identical() -> Result<()> {
+            let (_, mut worker, mut controller, mut hooks) =
+                boot_managed_pair(vec!["10.0.0.10/24"]).await?;
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            );
+            recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+            assert!(controller.owned());
+            assert!(controller.lifecycle_submissions.is_empty());
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Disabled { .. }
+            ));
+            controller.revoke_authority(HaDecisionReason::GracefulShutdown, &worker);
+            recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+            assert!(controller.can_release_handoff());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        async fn ready_unmanaged() -> Result<(ResourceWorkerHandle, OwnershipController)> {
+            let (_, worker, mut controller) = passive(ResourceManagement::Unmanaged).await?;
+            activate(&mut controller, &worker);
+            confirm_activation(&mut controller, &worker);
+            assert!(controller.owned());
+            Ok((worker, controller))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn verify_failure_revokes_and_compensates() -> Result<()> {
+            for outcome in [
+                LifecycleOutcome::Failed,
+                LifecycleOutcome::TimedOut,
+                LifecycleOutcome::SpawnError,
+                LifecycleOutcome::Cancelled,
+            ] {
+                let (mut worker, mut controller) = ready_unmanaged().await?;
+                tokio::time::advance(PERIOD).await;
+                controller.request_verify(&worker);
+                let generation = controller.generation();
+                controller.apply_lifecycle_event(
+                    event(LifecycleKind::Verify, generation, outcome),
+                    &worker,
+                );
+                assert_eq!(controller.generation(), generation + 1);
+                assert_compensation(&controller, LifecycleKind::Verify);
+                controller.shutdown(&mut worker).await;
+            }
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn missed_verify_deadline_revokes() -> Result<()> {
+            let (mut worker, mut controller) = ready_unmanaged().await?;
+            let generation = controller.generation();
+            tokio::time::advance(2 * PERIOD).await;
+            controller.check_verification_deadline(&worker);
+            assert_eq!(controller.generation(), generation + 1);
+            assert_compensation(&controller, LifecycleKind::Verify);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stale_verify_result_ignored() -> Result<()> {
+            let (mut worker, mut controller) = ready_unmanaged().await?;
+            let old = controller.generation();
+            tokio::time::advance(2 * PERIOD).await;
+            controller.check_verification_deadline(&worker);
+            let failure = controller.application().last_critical_failure.clone();
+            let submissions = controller.lifecycle_submissions.len();
+            controller.apply_lifecycle_event(
+                event(LifecycleKind::Verify, old, LifecycleOutcome::Succeeded),
+                &worker,
+            );
+            controller.apply_lifecycle_event(
+                event(LifecycleKind::Verify, old, LifecycleOutcome::Failed),
+                &worker,
+            );
+            assert_eq!(controller.application().last_critical_failure, failure);
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            assert!(!controller.owned());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn verify_success_refreshes_freshness() -> Result<()> {
+            let (mut worker, mut controller) = ready_unmanaged().await?;
+            tokio::time::advance(PERIOD).await;
+            controller.request_verify(&worker);
+            let started = Instant::now();
+            let generation = controller.generation();
+            let mut success = event(
+                LifecycleKind::Verify,
+                generation,
+                LifecycleOutcome::Succeeded,
+            );
+            success.started = Some(started);
+            tokio::time::advance(PERIOD / 2).await;
+            controller.apply_lifecycle_event(success, &worker);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Ready { verified_at, next_verify_at, .. }
+                    if verified_at == started && next_verify_at == started + PERIOD
+            ));
+            assert_eq!(controller.next_verify_at(), Some(started + PERIOD));
+            assert_eq!(
+                controller.verification_deadline(),
+                Some(started + 2 * PERIOD)
+            );
+            assert!(controller.owned());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn owned_false_when_verification_stale() -> Result<()> {
+            let (mut worker, mut controller) = ready_unmanaged().await?;
+            tokio::time::advance(2 * PERIOD).await;
+            assert!(controller.authority().is_valid());
+            assert_eq!(controller.resource_state(), &ResourceState::Unmanaged);
+            assert!(!controller.owned());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn generation_exhaustion_fails_closed() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            controller.generation = u64::MAX;
+            let submissions = controller.lifecycle_submissions.len();
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            );
+            assert_eq!(controller.generation(), u64::MAX);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Uncertain {
+                    generation: u64::MAX
+                }
+            ));
+            assert!(controller.application().last_critical_failure.is_some());
+            assert!(!controller.authority().is_valid());
+            assert!(!controller.can_release_handoff());
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            controller.shutdown(&mut worker).await;
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            assert_no_add(&kernel);
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn verify_absent_when_lifecycle_absent() -> Result<()> {
+            let kernel = SimulatedKernel::new_shared();
+            let mut worker = ResourceWorkerHandle::spawn_with_runner(
+                managed_address_manager(Vec::new()),
+                CommandRunner::Simulated(kernel),
+            );
+            let mut controller = OwnershipController::new(ResourceManagement::Unmanaged);
+            assert!(matches!(
+                controller.apply_role_decision(
+                    HaState::Active,
+                    HaDecisionReason::LocalHigherPriority,
+                    &worker
+                ),
+                RoleTransitionEffect::PromoteNow { .. }
+            ));
+            tokio::time::advance(Duration::from_secs(100)).await;
+            controller.request_verify(&worker);
+            assert_eq!(controller.next_verify_at(), None);
+            assert_eq!(controller.verification_deadline(), None);
+            assert!(controller.lifecycle_submissions.is_empty());
+            assert!(controller.owned());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn startup_baseline_precedes_activation_in_either_completion_order() -> Result<()> {
+            for baseline_first in [true, false] {
+                let kernel = SimulatedKernel::new_shared();
+                let mut worker = ResourceWorkerHandle::spawn_with_runner(
+                    managed_address_manager(vec!["10.0.0.10/24"]),
+                    CommandRunner::Simulated(kernel.clone()),
+                );
+                let mut controller = OwnershipController::new(ResourceManagement::Managed);
+                controller.application_timeout = Some(PERIOD);
+                controller.start_application_baseline(&worker);
+                controller.start_reconciliation(&worker);
+                controller.apply_role_decision(
+                    HaState::Active,
+                    HaDecisionReason::LocalHigherPriority,
+                    &worker,
+                );
+                let baseline = event(
+                    LifecycleKind::Deactivate,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                );
+                if baseline_first {
+                    controller.apply_lifecycle_event(baseline.clone(), &worker);
+                }
+                let absence = worker.recv_report().await.context("startup absence")?;
+                controller.apply_worker_report(absence, &worker);
+                if !baseline_first {
+                    assert!(!controller.is_startup_reconciled());
+                    assert_eq!(
+                        controller.lifecycle_submissions.len(),
+                        1,
+                        "only baseline before passivity"
+                    );
+                    controller.apply_lifecycle_event(baseline, &worker);
+                }
+                assert!(controller.is_startup_reconciled());
+                assert!(matches!(
+                    controller.application().phase,
+                    ApplicationPhase::Activating { .. }
+                ));
+                assert_no_add(&kernel);
+                controller.shutdown(&mut worker).await;
+            }
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn verify_incarnation_mismatch_or_unknown_revokes() -> Result<()> {
+            for incarnation in [None, Some("instance-b".to_owned())] {
+                let (mut worker, mut controller) = ready_unmanaged().await?;
+                tokio::time::advance(PERIOD).await;
+                controller.request_verify(&worker);
+                let mut result = event(
+                    LifecycleKind::Verify,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                );
+                result.db_incarnation = incarnation;
+                controller.apply_lifecycle_event(result, &worker);
+                assert_compensation(&controller, LifecycleKind::Verify);
+                controller.shutdown(&mut worker).await;
+            }
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn verify_generation_mismatch_revokes() -> Result<()> {
+            let (mut worker, mut controller) = ready_unmanaged().await?;
+            tokio::time::advance(PERIOD).await;
+            controller.request_verify(&worker);
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Verify,
+                    controller.generation() + 1,
+                    LifecycleOutcome::Succeeded,
+                ),
+                &worker,
+            );
+            assert_compensation(&controller, LifecycleKind::Verify);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn delayed_verify_success_cannot_restore_expired_freshness() -> Result<()> {
+            let (mut worker, mut controller) = ready_unmanaged().await?;
+            tokio::time::advance(PERIOD).await;
+            controller.request_verify(&worker);
+            let success = event(
+                LifecycleKind::Verify,
+                controller.generation(),
+                LifecycleOutcome::Succeeded,
+            );
+            tokio::time::advance(PERIOD).await;
+            controller.apply_lifecycle_event(success, &worker);
+            assert_compensation(&controller, LifecycleKind::Verify);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn activation_success_after_authority_expiry_compensates() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            controller.set_failure_policy(crate::config::FailurePolicy::Strict);
+            controller.observe_consent(Some(Instant::now()), PERIOD);
+            controller.set_bootstrap_allowed(true);
+            activate(&mut controller, &worker);
+            tokio::time::advance(PERIOD).await;
+            confirm_activation(&mut controller, &worker);
+            assert_compensation(&controller, LifecycleKind::Activate);
+            assert_no_add(&kernel);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn deactivation_success_retains_failure_until_restart() -> Result<()> {
+            let (kernel, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Activate,
+                    controller.generation(),
+                    LifecycleOutcome::Failed,
+                ),
+                &worker,
+            );
+            let failure = controller.application().last_critical_failure.clone();
+            controller.apply_role_decision(
+                HaState::Standby,
+                HaDecisionReason::PeerHigherPriority,
+                &worker,
+            );
+            let report = worker.recv_report().await.context("current absence")?;
+            controller.apply_worker_report(report, &worker);
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Deactivate,
+                    controller.generation(),
+                    LifecycleOutcome::Succeeded,
+                ),
+                &worker,
+            );
+            assert_eq!(controller.application().last_critical_failure, failure);
+            assert!(controller.can_release_handoff());
+            assert_no_add(&kernel);
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn generation_exhaustion_during_revoke_retains_prior_failure() -> Result<()> {
+            let (_, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            controller.apply_lifecycle_event(
+                event(
+                    LifecycleKind::Activate,
+                    controller.generation(),
+                    LifecycleOutcome::Failed,
+                ),
+                &worker,
+            );
+            let failure = controller.application().last_critical_failure.clone();
+            controller.generation = u64::MAX;
+            let submissions = controller.lifecycle_submissions.len();
+            controller.revoke_authority(HaDecisionReason::RuntimeFault, &worker);
+            assert_eq!(controller.application().last_critical_failure, failure);
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Uncertain { .. }
+            ));
+            assert!(!controller.can_release_handoff());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_withdrawal_does_not_cancel_pending_deactivation() -> Result<()> {
+            let (_, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            activate(&mut controller, &worker);
+            controller.revoke_authority(HaDecisionReason::PeerTimeout, &worker);
+            let generation = controller.generation();
+            let submissions = controller.lifecycle_submissions.len();
+            controller.apply_worker_report(
+                ResourceReport {
+                    generation,
+                    kind: ResourceReportKind::Fault,
+                    resource_state: ResourceState::Uncertain {
+                        last_observation: ObservedPresence::Unknown,
+                        last_error: Some("withdraw failed".to_owned()),
+                    },
+                    observed_at: Instant::now(),
+                    error: Some("withdraw failed".to_owned()),
+                },
+                &worker,
+            );
+            assert_eq!(controller.generation(), generation);
+            assert_eq!(controller.lifecycle_submissions.len(), submissions);
+            assert!(!controller.can_release_handoff());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn pending_authority_preserves_passivity_until_activation() -> Result<()> {
+            let (_, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+            controller.set_failure_policy(crate::config::FailurePolicy::Strict);
+            let generation = controller.generation();
+            controller.apply_role_decision(
+                HaState::Active,
+                HaDecisionReason::LocalHigherPriority,
+                &worker,
+            );
+            assert_eq!(controller.authority(), AuthorityState::Pending);
+            assert_eq!(controller.generation(), generation);
+            assert!(controller.application().passive_confirmed(generation));
+            controller.observe_consent(Some(Instant::now()), Duration::from_secs(10));
+            controller.set_bootstrap_allowed(true);
+            controller.refresh_authority(&worker);
+            assert!(matches!(
+                controller.application().phase,
+                ApplicationPhase::Activating { .. }
+            ));
+            assert!(controller.authority().is_valid());
+            controller.shutdown(&mut worker).await;
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn deactivate_failure_outcomes_all_latch_uncertain() -> Result<()> {
+            for outcome in [
+                LifecycleOutcome::Failed,
+                LifecycleOutcome::TimedOut,
+                LifecycleOutcome::SpawnError,
+                LifecycleOutcome::Cancelled,
+            ] {
+                let (_, mut worker, mut controller) = passive(ResourceManagement::Managed).await?;
+                activate(&mut controller, &worker);
+                controller.revoke_authority(HaDecisionReason::PeerTimeout, &worker);
+                controller.apply_lifecycle_event(
+                    event(LifecycleKind::Deactivate, controller.generation(), outcome),
+                    &worker,
+                );
+                assert!(matches!(
+                    controller.application().phase,
+                    ApplicationPhase::Uncertain { .. }
+                ));
+                assert!(!controller.can_release_handoff());
+                let submissions = controller.lifecycle_submissions.len();
+                controller.refresh_authority(&worker);
+                assert_eq!(controller.lifecycle_submissions.len(), submissions);
+                controller.shutdown(&mut worker).await;
+            }
+            Ok(())
+        }
     }
 
     fn attach_watchdog(

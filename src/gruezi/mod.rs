@@ -1,5 +1,6 @@
 pub mod addresses;
 pub mod api;
+pub mod application;
 pub mod ha;
 pub mod hooks;
 pub mod net;
