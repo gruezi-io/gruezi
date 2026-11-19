@@ -11,22 +11,23 @@
 
 use super::{
     Transport,
-    in_memory::{DropRule, InMemoryEndpoint, InMemoryNetwork, Side},
+    in_memory::{DropRule, InMemoryEndpoint, InMemoryNetwork, SentAdvert, Side, decode_advert},
     run_with_transport,
 };
 use crate::{
     config::{FailurePolicy, WatchdogConfig},
     gruezi::{
-        addresses::{CommandRunner, SimulatedKernel},
+        addresses::{CommandGate, CommandRunner, SimulatedKernel},
         ha::{
             HaAuth, HaDecisionReason, HaRuntimeConfig, HaStatus,
+            protocol::{HaPacket, TransferPhase},
             status::{SafetyLevel, TransitionTrigger},
         },
         hooks::HaHooks,
         ownership::AuthoritySource,
     },
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::{
     sync::{oneshot, watch},
@@ -117,10 +118,14 @@ impl Node {
         self.task.abort();
     }
 
-    async fn stop(mut self) -> Result<()> {
+    fn begin_shutdown(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
+    }
+
+    async fn stop(mut self) -> Result<()> {
+        self.begin_shutdown();
         match self.task.await {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
@@ -137,9 +142,17 @@ struct Harness {
 
 impl Harness {
     fn boot(policy: FailurePolicy) -> Self {
+        Self::boot_configs(
+            node_config(Side::A, policy.clone()),
+            node_config(Side::B, policy),
+        )
+    }
+
+    fn boot_configs(config_a: HaRuntimeConfig, config_b: HaRuntimeConfig) -> Self {
         let (net, endpoint_a, endpoint_b) = InMemoryNetwork::new_pair();
-        let node_a = spawn_node(Side::A, endpoint_a, policy.clone());
-        let node_b = spawn_node(Side::B, endpoint_b, policy);
+        let node_a = spawn_config(Side::A, endpoint_a, config_a, SimulatedKernel::new_shared());
+        let node_b = spawn_config(Side::B, endpoint_b, config_b, SimulatedKernel::new_shared());
+        net.capture_kernels(node_a.kernel.clone(), node_b.kernel.clone());
         Self {
             net,
             node_a,
@@ -151,15 +164,35 @@ impl Harness {
         self.node_a.stop().await?;
         self.node_b.stop().await
     }
+
+    async fn restart(&mut self, side: Side, policy: FailurePolicy, preempt: bool) {
+        let node = match side {
+            Side::A => &mut self.node_a,
+            Side::B => &mut self.node_b,
+        };
+        node.crash();
+        settle(Duration::ZERO).await;
+        let mut config = node_config(side, policy);
+        config.preempt = preempt;
+        *node = spawn_config(
+            side,
+            self.net.restart_endpoint(side),
+            config,
+            node.kernel.clone(),
+        );
+    }
 }
 
-fn spawn_node(side: Side, endpoint: InMemoryEndpoint, policy: FailurePolicy) -> Node {
-    let runtime = node_config(side, policy);
+fn spawn_config(
+    side: Side,
+    endpoint: InMemoryEndpoint,
+    runtime: HaRuntimeConfig,
+    kernel: Arc<Mutex<SimulatedKernel>>,
+) -> Node {
     let name = match side {
         Side::A => "node-a",
         Side::B => "node-b",
     };
-    let kernel = SimulatedKernel::new_shared();
     let (status_tx, status_rx) = watch::channel(HaStatus::new(
         runtime.node_id.clone(),
         runtime.group_id.clone(),
@@ -709,6 +742,592 @@ async fn matrix_available_one_way_loss_b_to_a() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn matrix_available_recovery_failback() -> Result<()> {
     run_recovery_failback(FailurePolicy::Available).await
+}
+
+fn adverts(net: &InMemoryNetwork, side: Side, phase: TransferPhase) -> Vec<(SentAdvert, HaPacket)> {
+    net.history()
+        .into_iter()
+        .filter_map(|sent| {
+            let packet = decode_advert(&sent.bytes)?;
+            (sent.side == side && packet.transfer_phase == phase).then_some((sent, packet))
+        })
+        .collect()
+}
+
+/// I6 and the successor's symmetric presence gate are checked against the
+/// kernel at SEND time, including datagrams deliberately lost by the fabric.
+fn assert_advert_order(net: &InMemoryNetwork) {
+    for sent in net.history() {
+        let Some(packet) = decode_advert(&sent.bytes) else {
+            continue;
+        };
+        let table = match sent.side {
+            Side::A => &sent.kernel_a,
+            Side::B => &sent.kernel_b,
+        };
+        match packet.transfer_phase {
+            TransferPhase::Released | TransferPhase::Returned => {
+                assert!(
+                    table.is_empty(),
+                    "I6: {:?} before absence: {sent:?}",
+                    packet.transfer_phase
+                );
+                assert!(matches!(
+                    packet.resource_state,
+                    super::super::protocol::AdvertResourceState::Absent
+                        | super::super::protocol::AdvertResourceState::Unmanaged
+                ));
+                assert_eq!(
+                    packet.authority_source,
+                    super::super::protocol::AdvertAuthoritySource::None
+                );
+            }
+            TransferPhase::Owned => {
+                assert_eq!(table, &vec!["eth0 10.0.0.10/24".to_owned()]);
+                assert_eq!(
+                    packet.resource_state,
+                    super::super::protocol::AdvertResourceState::Present
+                );
+                assert_ne!(
+                    packet.authority_source,
+                    super::super::protocol::AdvertAuthoritySource::None
+                );
+            }
+            TransferPhase::None | TransferPhase::Requesting => {}
+        }
+    }
+}
+
+fn print_transfer_sequence(row: &str, net: &InMemoryNetwork) {
+    let start = net.history().first().map(|sent| sent.at);
+    for sent in net.history() {
+        let Some(packet) = decode_advert(&sent.bytes) else {
+            continue;
+        };
+        if packet.transfer_phase != TransferPhase::None {
+            println!(
+                "HANDOFF[{row}] t={}ms side={:?} seq={} transfer_id={} phase={} resource={:?} kernel_a={:?} kernel_b={:?}",
+                start.map_or(0, |start| sent.at.duration_since(start).as_millis()),
+                sent.side,
+                packet.seq,
+                packet.transfer_id,
+                format!("{:?}", packet.transfer_phase).to_ascii_lowercase(),
+                packet.resource_state,
+                sent.kernel_a,
+                sent.kernel_b
+            );
+        }
+    }
+}
+
+async fn run_graceful_failover(policy: FailurePolicy) -> Result<()> {
+    let mut harness = Harness::boot(policy.clone());
+    settle(BOOT_WINDOW).await;
+    assert_single_owner("handoff setup", &harness.node_a, &harness.node_b);
+    // A gated delete proves that no Released can escape while withdrawal
+    // runs, rather than observing only the final successful snapshot.
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    harness
+        .node_a
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gate_next_del = Some(CommandGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    harness.node_a.begin_shutdown();
+    entered_rx.await.context("withdrawal must enter the gate")?;
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS)).await;
+    assert!(adverts(&harness.net, Side::A, TransferPhase::Released).is_empty());
+    assert_eq!(kernel_add_calls(&harness.node_b), Vec::<Vec<String>>::new());
+    println!(
+        "HANDOFF[{policy:?}] BEFORE release: withdrawal gated kernel_a={:?} kernel_b={:?}; released_adverts=0",
+        harness.node_a.kernel_table(),
+        harness.node_b.kernel_table()
+    );
+    let _ = release_tx.send(Ok(()));
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 2)).await;
+    assert_eq!(harness.node_a.kernel_table(), Vec::<String>::new());
+    assert!(harness.node_b.snapshot().owned);
+    assert_eq!(
+        harness.node_b.kernel_table(),
+        vec!["eth0 10.0.0.10/24".to_owned()]
+    );
+    let released = adverts(&harness.net, Side::A, TransferPhase::Released);
+    let owned = adverts(&harness.net, Side::B, TransferPhase::Owned);
+    let (_, release) = released.first().context("A must advertise Released")?;
+    let (_, acquired) = owned.first().context("B must advertise Owned")?;
+    assert_ne!(release.transfer_id, 0);
+    assert_eq!(release.transfer_id, acquired.transfer_id);
+    assert_advert_order(&harness.net);
+    print_transfer_sequence("graceful", &harness.net);
+    println!(
+        "HANDOFF[{policy:?}] RESULT A absent BEFORE phase=released; B present BEFORE phase=owned"
+    );
+    harness.stop().await
+}
+
+async fn run_failed_withdrawal(policy: FailurePolicy) -> Result<()> {
+    let mut harness = Harness::boot(policy.clone());
+    settle(BOOT_WINDOW).await;
+    {
+        let mut kernel = harness
+            .node_a
+            .kernel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Both a residual VIP and a failed read-back must forbid release.
+        kernel.fail_del_addresses.push("10.0.0.10/24".to_owned());
+        kernel.fail_show = true;
+    }
+    harness.node_a.begin_shutdown();
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 3)).await;
+    print_matrix_state("failed_withdrawal", "read-back failed", &harness.node_a);
+    print_matrix_state("failed_withdrawal", "successor blocked", &harness.node_b);
+    print_transfer_sequence("failed_withdrawal", &harness.net);
+    assert!(adverts(&harness.net, Side::A, TransferPhase::Released).is_empty());
+    assert_ne!(harness.node_a.kernel_table(), Vec::<String>::new());
+    assert_eq!(harness.node_b.kernel_table(), Vec::<String>::new());
+    assert_eq!(kernel_add_calls(&harness.node_b), Vec::<Vec<String>>::new());
+    assert!(!harness.node_a.snapshot().owned);
+    assert!(!harness.node_b.snapshot().owned);
+    println!(
+        "HANDOFF[{policy:?}] RESULT read-back failed; released_adverts=0; successor_adds=0; kernel_a={:?} kernel_b={:?}",
+        harness.node_a.kernel_table(),
+        harness.node_b.kernel_table()
+    );
+    {
+        let mut kernel = harness
+            .node_a
+            .kernel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        kernel.fail_show = false;
+        kernel.fail_del_addresses.clear();
+    }
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_strict_graceful_failover() -> Result<()> {
+    run_graceful_failover(FailurePolicy::Strict).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_available_graceful_failover() -> Result<()> {
+    run_graceful_failover(FailurePolicy::Available).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_strict_failed_withdrawal() -> Result<()> {
+    run_failed_withdrawal(FailurePolicy::Strict).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_available_failed_withdrawal() -> Result<()> {
+    run_failed_withdrawal(FailurePolicy::Available).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_lost_release_is_periodically_retransmitted() -> Result<()> {
+    let mut harness = Harness::boot(FailurePolicy::Strict);
+    settle(BOOT_WINDOW).await;
+    harness
+        .net
+        .set_drop_phase(Side::A, TransferPhase::Released, 1);
+    harness.node_a.begin_shutdown();
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 3)).await;
+    let released = adverts(&harness.net, Side::A, TransferPhase::Released);
+    let (first, first_packet) = released.first().context("first Released send")?;
+    let (second, second_packet) = released.get(1).context("next periodic Released send")?;
+    assert_eq!(first_packet.transfer_id, second_packet.transfer_id);
+    assert_eq!(
+        second.at - first.at,
+        Duration::from_millis(ADVERT_INTERVAL_MS)
+    );
+    assert!(harness.node_b.snapshot().owned);
+    assert_advert_order(&harness.net);
+    print_transfer_sequence("lost release", &harness.net);
+    harness.stop().await
+}
+
+async fn returning_rank_winner(policy: FailurePolicy, preempt: bool) -> Harness {
+    let mut config_a = node_config(Side::A, policy.clone());
+    config_a.priority = 90;
+    let mut harness = Harness::boot_configs(config_a, node_config(Side::B, policy.clone()));
+    settle(BOOT_WINDOW).await;
+    assert_single_owner("incumbent", &harness.node_b, &harness.node_a);
+    harness.restart(Side::A, policy, preempt).await;
+    harness
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_preempt_requests_only_after_stable_hold_down() -> Result<()> {
+    let harness = returning_rank_winner(FailurePolicy::Available, true).await;
+    // Gate the incumbent's withdrawal: rank and Requesting must never cause
+    // the returning node to touch the resource before Released.
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    harness
+        .node_b
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gate_next_del = Some(CommandGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    entered_rx
+        .await
+        .context("preemption must request the incumbent's withdrawal")?;
+    let requesting = adverts(&harness.net, Side::A, TransferPhase::Requesting);
+    let (request, _) = requesting
+        .first()
+        .context("returning rank winner must request")?;
+    let request_packet = decode_advert(&request.bytes).context("valid request")?;
+    let first_fresh_owner = harness
+        .net
+        .history()
+        .into_iter()
+        .find(|sent| {
+            sent.side == Side::B
+                && decode_advert(&sent.bytes).is_some_and(|packet| {
+                    packet.receiver_nonce == request_packet.sender_nonce
+                        && packet.authority_source
+                            != super::super::protocol::AdvertAuthoritySource::None
+                })
+        })
+        .context("fresh incumbent advert after restart")?;
+    assert!(request.at - first_fresh_owner.at >= Duration::from_millis(HOLD_DOWN_MS));
+    assert_eq!(kernel_add_calls(&harness.node_a), Vec::<Vec<String>>::new());
+    assert!(adverts(&harness.net, Side::B, TransferPhase::Released).is_empty());
+    let _ = release_tx.send(Ok(()));
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 3)).await;
+    assert_single_owner("preempt complete", &harness.node_a, &harness.node_b);
+    assert_advert_order(&harness.net);
+    print_transfer_sequence("preempt true", &harness.net);
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_preempt_false_never_requests() -> Result<()> {
+    let harness = returning_rank_winner(FailurePolicy::Available, false).await;
+    settle(BOOT_WINDOW).await;
+    assert_single_owner("preempt disabled", &harness.node_b, &harness.node_a);
+    assert!(adverts(&harness.net, Side::A, TransferPhase::Requesting).is_empty());
+    assert_eq!(kernel_add_calls(&harness.node_a), Vec::<Vec<String>>::new());
+    harness.stop().await
+}
+
+async fn run_lost_owned(policy: FailurePolicy) -> Result<()> {
+    let mut config_a = node_config(Side::A, policy.clone());
+    config_a.withdraw_timeout_ms = 60_000;
+    let mut harness = Harness::boot_configs(config_a, node_config(Side::B, policy));
+    settle(BOOT_WINDOW).await;
+    harness
+        .net
+        .set_drop_phase(Side::B, TransferPhase::Owned, usize::MAX);
+    // Also lose Returned: consent will eventually lapse at the successor,
+    // but the origin cannot infer a return from silence.
+    harness.node_a.begin_shutdown();
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 2)).await;
+    let release = adverts(&harness.net, Side::A, TransferPhase::Released);
+    assert!(!release.is_empty());
+    let adds = kernel_add_calls(&harness.node_a).len();
+    harness.net.set_drop(Side::B, DropRule::All);
+    settle(dead_window() * 10).await;
+    assert_eq!(
+        kernel_add_calls(&harness.node_a).len(),
+        adds,
+        "I8: released owner reacquired without Returned"
+    );
+    assert!(!harness.node_a.snapshot().owned);
+    assert_eq!(harness.node_a.kernel_table(), Vec::<String>::new());
+    assert!(
+        !harness.node_a.task.is_finished(),
+        "origin must remain alive throughout I8 check"
+    );
+    assert_advert_order(&harness.net);
+    print_transfer_sequence("lost owned, no return", &harness.net);
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_strict_released_owner_never_reacquires_on_lost_owned() -> Result<()> {
+    run_lost_owned(FailurePolicy::Strict).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_available_released_owner_blocks_assumed_fallback() -> Result<()> {
+    let harness = returning_rank_winner(FailurePolicy::Available, true).await;
+    harness
+        .net
+        .set_drop_phase(Side::A, TransferPhase::Owned, usize::MAX);
+    settle(BOOT_WINDOW).await;
+    assert!(!adverts(&harness.net, Side::B, TransferPhase::Released).is_empty());
+    let adds = kernel_add_calls(&harness.node_b).len();
+    harness.net.set_drop(Side::A, DropRule::All);
+    settle(dead_window() * 10).await;
+    assert_eq!(
+        kernel_add_calls(&harness.node_b).len(),
+        adds,
+        "I8: timeout cannot undo release"
+    );
+    assert!(!harness.node_b.snapshot().owned);
+    assert_eq!(harness.node_b.kernel_table(), Vec::<String>::new());
+    assert!(harness.node_a.snapshot().owned);
+    assert_advert_order(&harness.net);
+    print_transfer_sequence(
+        "available released owner, assumed fallback blocked",
+        &harness.net,
+    );
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_failed_successor_returns_only_after_absence() -> Result<()> {
+    let harness = returning_rank_winner(FailurePolicy::Available, true).await;
+    harness
+        .node_a
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .fail_add_addresses
+        .push("10.0.0.10/24".to_owned());
+    let old_term = harness.node_b.snapshot().authority.term;
+    settle(BOOT_WINDOW).await;
+    let returned = adverts(&harness.net, Side::A, TransferPhase::Returned);
+    let (_, returned_packet) = returned.first().context("failed successor must return")?;
+    let released = adverts(&harness.net, Side::B, TransferPhase::Released);
+    assert_eq!(
+        released.first().context("origin released")?.1.transfer_id,
+        returned_packet.transfer_id
+    );
+    assert_single_owner("returned transfer", &harness.node_b, &harness.node_a);
+    assert!(
+        harness.node_b.snapshot().authority.term > old_term,
+        "return must create a new term"
+    );
+    assert_advert_order(&harness.net);
+    print_transfer_sequence("successor returned", &harness.net);
+    harness.stop().await
+}
+
+/// An authority loss during a live add drains the worker before Returned.
+/// The command gate deliberately completes an old add after revocation (I7).
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_cancelled_acquire_drains_before_return() -> Result<()> {
+    let mut config_a = node_config(Side::A, FailurePolicy::Strict);
+    config_a.withdraw_timeout_ms = 60_000;
+    config_a.dead_factor = 2;
+    let mut config_b = node_config(Side::B, FailurePolicy::Strict);
+    config_b.dead_factor = 2;
+    let mut harness = Harness::boot_configs(config_a, config_b);
+    settle(BOOT_WINDOW).await;
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    harness
+        .node_b
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gate_after_add = Some(CommandGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    harness.node_a.begin_shutdown();
+    entered_rx
+        .await
+        .context("successor add must enter the gate")?;
+    harness.net.set_drop(Side::A, DropRule::All);
+    let remaining = harness
+        .node_b
+        .snapshot()
+        .authority
+        .expires_in_ms
+        .context("strict acquisition must have a consent deadline")?;
+    assert!(
+        remaining + 1 < crate::gruezi::addresses::COMMAND_TIMEOUT_MS,
+        "the consent deadline must precede the command gate timeout"
+    );
+    settle(Duration::from_millis(remaining + 1)).await;
+    assert!(adverts(&harness.net, Side::B, TransferPhase::Owned).is_empty());
+    assert!(adverts(&harness.net, Side::B, TransferPhase::Returned).is_empty());
+    let _ = release_tx.send(Ok(()));
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 2)).await;
+    assert_eq!(harness.node_b.kernel_table(), Vec::<String>::new());
+    assert!(!adverts(&harness.net, Side::B, TransferPhase::Returned).is_empty());
+    assert_advert_order(&harness.net);
+    harness.stop().await
+}
+
+fn assert_no_two_kernel_owners(harness: &Harness, schedule: &str) {
+    assert!(
+        harness.node_a.kernel_table().is_empty() || harness.node_b.kernel_table().is_empty(),
+        "I4: two kernel owners in {schedule}: A={:?}, B={:?}",
+        harness.node_a.kernel_table(),
+        harness.node_b.kernel_table()
+    );
+    for sent in harness.net.history() {
+        assert!(
+            sent.kernel_a.is_empty() || sent.kernel_b.is_empty(),
+            "I4: two kernel owners at send time in {schedule}: {sent:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_origin_restart_with_lost_owned_waits_for_return() -> Result<()> {
+    let mut config_a = node_config(Side::A, FailurePolicy::Strict);
+    config_a.withdraw_timeout_ms = 60_000;
+    let mut harness = Harness::boot_configs(config_a, node_config(Side::B, FailurePolicy::Strict));
+    settle(BOOT_WINDOW).await;
+    harness
+        .net
+        .set_drop_phase(Side::B, TransferPhase::Owned, usize::MAX);
+    harness.node_a.begin_shutdown();
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 2)).await;
+    assert!(harness.node_b.snapshot().owned);
+    assert_eq!(harness.node_a.kernel_table(), Vec::<String>::new());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    harness
+        .node_b
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gate_next_del = Some(CommandGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    harness.restart(Side::A, FailurePolicy::Strict, false).await;
+    entered_rx
+        .await
+        .context("new session must revoke the successor's previous grant")?;
+    assert_eq!(harness.node_a.kernel_table(), Vec::<String>::new());
+    assert_ne!(harness.node_b.kernel_table(), Vec::<String>::new());
+    assert_eq!(
+        kernel_add_calls(&harness.node_a).len(),
+        1,
+        "restarted origin cannot reacquire while successor is draining"
+    );
+    assert!(adverts(&harness.net, Side::B, TransferPhase::Returned).is_empty());
+    println!(
+        "I8 RESTART: every Owned advert dropped; restarted A adds=0; exactly one kernel owner B; A={:?} B={:?}",
+        harness.node_a.kernel_table(),
+        harness.node_b.kernel_table()
+    );
+    let _ = release_tx.send(Ok(()));
+    settle(BOOT_WINDOW).await;
+    assert_no_two_kernel_owners(&harness, "lost Owned/origin restart/return");
+    assert_advert_order(&harness.net);
+    assert!(!adverts(&harness.net, Side::B, TransferPhase::Returned).is_empty());
+    // Strict grants never survive a peer restart. Once B explicitly returns
+    // after absence, the new session may bootstrap A under the rank rule.
+    assert_single_owner(
+        "restart after explicit return",
+        &harness.node_a,
+        &harness.node_b,
+    );
+    harness.stop().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_new_session_cancels_inflight_transfer_grant() -> Result<()> {
+    let mut config_a = node_config(Side::A, FailurePolicy::Strict);
+    config_a.withdraw_timeout_ms = 60_000;
+    let mut harness = Harness::boot_configs(config_a, node_config(Side::B, FailurePolicy::Strict));
+    settle(BOOT_WINDOW).await;
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    harness
+        .node_b
+        .kernel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .gate_after_add = Some(CommandGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    harness.node_a.begin_shutdown();
+    entered_rx.await.context("transfer add entered")?;
+    harness.restart(Side::A, FailurePolicy::Strict, false).await;
+    // Re-establishment takes two intervals, within the three-second command
+    // bound. The new nonce must revoke the old transfer grant while gated.
+    settle(Duration::from_millis(ADVERT_INTERVAL_MS * 2)).await;
+    assert_eq!(harness.node_a.kernel_table(), Vec::<String>::new());
+    assert!(adverts(&harness.net, Side::B, TransferPhase::Owned).is_empty());
+    let _ = release_tx.send(Ok(()));
+    settle(BOOT_WINDOW).await;
+    assert!(!adverts(&harness.net, Side::B, TransferPhase::Returned).is_empty());
+    assert_no_two_kernel_owners(&harness, "origin restart/inflight transfer");
+    assert_advert_order(&harness.net);
+    harness.stop().await
+}
+
+/// Exhaustive fixed two-step alphabet: loss (including mid-flight), duplicate,
+/// reorder, crash and process restart, applied around a real strict handoff.
+#[tokio::test(start_paused = true)]
+async fn matrix_handoff_i4_bounded_schedule_enumeration() -> Result<()> {
+    let events = [
+        "loss-a",
+        "loss-b",
+        "duplicate",
+        "reorder",
+        "crash-a",
+        "restart-a",
+        "restart-b",
+    ];
+    let mut explored = 0_u64;
+    for first in events {
+        for second in events {
+            let mut config_a = node_config(Side::A, FailurePolicy::Strict);
+            config_a.withdraw_timeout_ms = 60_000;
+            let mut harness =
+                Harness::boot_configs(config_a, node_config(Side::B, FailurePolicy::Strict));
+            settle(BOOT_WINDOW).await;
+            harness.node_a.begin_shutdown();
+            let schedule = format!("{first}/{second}");
+            for event in [first, second] {
+                match event {
+                    "loss-a" => harness.net.set_drop(Side::A, DropRule::All),
+                    "loss-b" => harness.net.set_drop(Side::B, DropRule::All),
+                    "duplicate" => {
+                        harness.net.set_duplicate(Side::A, 2);
+                        harness.net.set_duplicate(Side::B, 2);
+                    }
+                    "reorder" => {
+                        harness.net.set_reorder(Side::A, 1);
+                        harness.net.set_reorder(Side::B, 1);
+                    }
+                    "crash-a" => harness.node_a.crash(),
+                    "restart-a" => harness.restart(Side::A, FailurePolicy::Strict, false).await,
+                    "restart-b" => harness.restart(Side::B, FailurePolicy::Strict, false).await,
+                    _ => return Err(anyhow!("unknown deterministic schedule event: {event}")),
+                }
+                // Sample on both sides of every advert and consent boundary.
+                for _ in 0..16 {
+                    settle(Duration::from_millis(250)).await;
+                    assert_no_two_kernel_owners(&harness, &schedule);
+                }
+            }
+            harness.net.set_drop(Side::A, DropRule::None);
+            harness.net.set_drop(Side::B, DropRule::None);
+            for _ in 0..20 {
+                settle(Duration::from_millis(250)).await;
+                assert_no_two_kernel_owners(&harness, &schedule);
+            }
+            assert_advert_order(&harness.net);
+            harness.stop().await?;
+            explored += 1;
+        }
+    }
+    println!(
+        "I4 ENUMERATION: explored_schedules={explored}; two-owner_states=0; alphabet=loss/duplication/reordering/crash/restart; kernel snapshots at every send and 250ms fake-time boundary"
+    );
+    Ok(())
 }
 
 /// Captures tracing output written by tasks on this test's thread.

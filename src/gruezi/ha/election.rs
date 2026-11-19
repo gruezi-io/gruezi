@@ -33,6 +33,8 @@ pub enum HaDecisionReason {
     PreemptHigherPriority,
     PreemptNodeIdTiebreak,
     GracefulShutdown,
+    PeerReleased,
+    PeerReturned,
     RuntimeFault,
     AddressActionFailed,
 }
@@ -56,6 +58,8 @@ impl HaDecisionReason {
             Self::PreemptHigherPriority => "preempt_higher_priority",
             Self::PreemptNodeIdTiebreak => "preempt_node_id_tiebreak",
             Self::GracefulShutdown => "graceful_shutdown",
+            Self::PeerReleased => "peer_released",
+            Self::PeerReturned => "peer_returned",
             Self::RuntimeFault => "runtime_fault",
             Self::AddressActionFailed => "address_action_failed",
         }

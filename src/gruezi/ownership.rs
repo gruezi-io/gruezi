@@ -158,6 +158,11 @@ pub struct PolicyInputs {
     /// report the resource absent/unmanaged, the peer holds no authority and
     /// this node wins the rank via `outranks`. Priority alone never grants.
     pub bootstrap_ok: bool,
+    /// A fresh release (or confirmed return) permits this acquisition.
+    pub handoff_allowed: bool,
+    /// A release remains irrevocable until a confirmed return, even under
+    /// the available policy's assumed fallback (I8).
+    pub handoff_blocked: bool,
 }
 
 /// Ownership authority provider boundary.
@@ -210,6 +215,10 @@ impl OwnershipAuthority {
                 term,
                 active,
             } => {
+                if inputs.handoff_blocked {
+                    *active = false;
+                    return AuthorityState::None;
+                }
                 if elected_role != HaState::Active {
                     *active = false;
                     return AuthorityState::None;
@@ -228,7 +237,9 @@ impl OwnershipAuthority {
                         // consent an existing grant lapses (the caller
                         // revokes and withdraws) and a pending one stays
                         // pending forever.
-                        if consent_fresh && (was_active || inputs.bootstrap_ok) {
+                        if consent_fresh
+                            && (was_active || inputs.bootstrap_ok || inputs.handoff_allowed)
+                        {
                             return Self::activate_peer(term, active, inputs.consent_until);
                         }
                         *active = false;
@@ -243,7 +254,7 @@ impl OwnershipAuthority {
                             // Fresh consent proves the session: acquisition
                             // still needs the bootstrap rule, a continuing
                             // grant only needs the consent.
-                            if was_active || inputs.bootstrap_ok {
+                            if was_active || inputs.bootstrap_ok || inputs.handoff_allowed {
                                 return Self::activate_peer(term, active, inputs.consent_until);
                             }
                             *active = false;
@@ -502,7 +513,9 @@ impl OwnershipController {
     /// True only when authority is not valid and the resource is confirmed `absent` or `unmanaged` (I6).
     #[must_use]
     pub const fn can_release_handoff(&self) -> bool {
-        !self.authority.is_valid() && self.resource_state.is_confirmed_absent_or_unmanaged()
+        !self.authority.is_valid()
+            && matches!(self.lifecycle, LifecyclePhase::Ready)
+            && self.resource_state.is_confirmed_absent_or_unmanaged()
     }
 
     /// Select the authority provider for the configured failure policy.
@@ -531,6 +544,13 @@ impl OwnershipController {
     /// Feed this iteration's bootstrap-rule verdict (design spec 3.1).
     pub fn set_bootstrap_allowed(&mut self, bootstrap_ok: bool) {
         self.policy_inputs.bootstrap_ok = bootstrap_ok;
+    }
+
+    /// Apply the coordinator's handoff gate before evaluating any role or
+    /// authority change. A blocked transfer cannot use timeout authority.
+    pub fn set_handoff_gate(&mut self, allowed: bool, blocked: bool) {
+        self.policy_inputs.handoff_allowed = allowed;
+        self.policy_inputs.handoff_blocked = blocked;
     }
 
     /// Re-evaluate authority for the current elected role under the failure
@@ -828,6 +848,16 @@ impl OwnershipController {
         report: ResourceReport,
         worker: &ResourceWorkerHandle,
     ) -> ReportEffect {
+        // An observation queued before revocation cannot prove that the
+        // current generation drained its mutations and withdrew (I6/I7).
+        if report.generation != self.generation
+            && matches!(
+                report.resource_state,
+                ResourceState::Absent | ResourceState::Unmanaged
+            )
+        {
+            return ReportEffect::None;
+        }
         self.last_observed_at = Some(report.observed_at);
         self.last_error.clone_from(&report.error);
 
@@ -1046,6 +1076,46 @@ mod tests {
             hooks,
         );
         Ok(report)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_absence_cannot_confirm_a_new_handoff_generation() -> Result<()> {
+        let (kernel, mut worker, mut controller, mut hooks) =
+            boot_managed_pair(vec!["10.0.0.10/24"]).await?;
+        controller.apply_role_decision(
+            HaState::Active,
+            HaDecisionReason::LocalHigherPriority,
+            &worker,
+        );
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        let old_generation = controller.generation();
+        controller.revoke_authority(HaDecisionReason::GracefulShutdown, &worker);
+        controller.apply_worker_report(
+            ResourceReport {
+                generation: old_generation,
+                kind: ResourceReportKind::Reconciled,
+                resource_state: ResourceState::Absent,
+                observed_at: Instant::now(),
+                error: None,
+            },
+            &worker,
+        );
+        assert!(
+            !controller.can_release_handoff(),
+            "I6: stale absence cannot prove withdrawal"
+        );
+        assert_ne!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        recv_and_apply_report(&mut worker, &mut controller, &mut hooks).await?;
+        assert!(controller.can_release_handoff());
+        assert_eq!(
+            SimulatedKernel::table_snapshot(&kernel),
+            Vec::<String>::new()
+        );
+        let _ = controller.shutdown(&mut worker).await;
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

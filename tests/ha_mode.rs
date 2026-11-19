@@ -31,7 +31,9 @@ fn runtime_config(
         bind: format!("127.0.0.1:{bind_port}"),
         peer: format!("127.0.0.1:{peer_port}"),
         interface: "lo".to_owned(),
-        addresses: vec!["10.0.0.10/24".to_owned()],
+        // Role/session tests use an unmanaged resource. A command named
+        // "true" cannot provide the kernel read-back required for handoff.
+        addresses: Vec::new(),
         peer_id: if node_id == "node-a" {
             "node-b"
         } else {
@@ -292,7 +294,7 @@ async fn backup_promotes_after_master_stops() -> Result<()> {
     assert_eq!(snapshot_b.decision_reason, HaDecisionReason::PeerTimeout);
     assert_eq!(
         snapshot_b.last_transition_reason,
-        Some(HaDecisionReason::PeerTimeout)
+        Some(HaDecisionReason::PeerReleased)
     );
 
     stop_node(shutdown_b, task_b).await?;
@@ -717,6 +719,7 @@ async fn status_api_reflects_live_ha_state() -> Result<()> {
     let port_a = free_udp_port()?;
     let port_b = free_udp_port()?;
     let runtime_a = HaRuntimeConfig {
+        addresses: vec!["10.0.0.10/24".to_owned()],
         ip_command: fixture.command("ip").display().to_string(),
         arping_command: fixture.command("arping").display().to_string(),
         ndsend_command: fixture.command("ndsend").display().to_string(),

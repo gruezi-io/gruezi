@@ -14,6 +14,10 @@
 //! No sockets, ports or subprocesses are involved, so the fabric runs safely
 //! under `tokio::time::pause`.
 
+use crate::gruezi::{
+    addresses::SimulatedKernel,
+    ha::protocol::{HaPacket, PacketKey, TransferPhase, tests::TEST_KEY},
+};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex, PoisonError},
@@ -95,11 +99,19 @@ struct Direction {
     hold_next: usize,
     held: Option<QueuedDatagram>,
     tx: Option<mpsc::UnboundedSender<QueuedDatagram>>,
+    drop_phase: Option<(TransferPhase, usize)>,
 }
 
 impl Direction {
     fn send(&mut self, bytes: Vec<u8>) {
         self.sent = self.sent.saturating_add(1);
+        if let Some((phase, remaining)) = &mut self.drop_phase
+            && *remaining > 0
+            && decode_advert(&bytes).is_some_and(|packet| packet.transfer_phase == *phase)
+        {
+            *remaining -= 1;
+            return;
+        }
         match self.rule {
             DropRule::All => return,
             DropRule::EveryNth(nth) if nth >= 2 && self.sent.is_multiple_of(nth) => return,
@@ -140,14 +152,34 @@ impl Direction {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct FabricState {
     a_to_b: Direction,
     b_to_a: Direction,
+    kernels: Option<KernelPair>,
+    history: Vec<SentAdvert>,
+}
+
+type SharedKernel = Arc<Mutex<SimulatedKernel>>;
+type KernelPair = (SharedKernel, SharedKernel);
+
+/// Send-time kernel snapshots prove ordering even when delivery is lost.
+#[derive(Debug, Clone)]
+pub(crate) struct SentAdvert {
+    pub(crate) side: Side,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) kernel_a: Vec<String>,
+    pub(crate) kernel_b: Vec<String>,
+}
+
+pub(crate) fn decode_advert(bytes: &[u8]) -> Option<HaPacket> {
+    let key = PacketKey::new(TEST_KEY).ok()?;
+    HaPacket::decode(bytes, &key).ok()
 }
 
 /// Handle for reconfiguring the fabric while nodes run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct InMemoryNetwork {
     state: Arc<Mutex<FabricState>>,
 }
@@ -168,6 +200,7 @@ impl InMemoryNetwork {
                 tx: Some(to_a),
                 ..Direction::default()
             },
+            ..FabricState::default()
         }));
         let endpoint_a = InMemoryEndpoint {
             state: state.clone(),
@@ -211,6 +244,38 @@ impl InMemoryNetwork {
         side.direction_mut(&mut state).hold_next = count;
     }
 
+    pub(crate) fn set_drop_phase(&self, side: Side, phase: TransferPhase, count: usize) {
+        side.direction_mut(&mut self.lock_state()).drop_phase = Some((phase, count));
+    }
+
+    pub(crate) fn capture_kernels(&self, a: SharedKernel, b: SharedKernel) {
+        self.lock_state().kernels = Some((a, b));
+    }
+
+    pub(crate) fn history(&self) -> Vec<SentAdvert> {
+        self.lock_state().history.clone()
+    }
+
+    /// Replace a crashed node's receive channel. Nonces and replay admission
+    /// still run in the real runtime when the process starts again.
+    pub(crate) fn restart_endpoint(&self, side: Side) -> InMemoryEndpoint {
+        let (tx, rx) = mpsc::unbounded_channel();
+        side.inbound().direction_mut(&mut self.lock_state()).tx = Some(tx);
+        InMemoryEndpoint {
+            state: self.state.clone(),
+            side,
+            rx: AsyncMutex::new(rx),
+            local_addr: match side {
+                Side::A => addr_a(),
+                Side::B => addr_b(),
+            },
+            peer_addr: match side {
+                Side::A => addr_b(),
+                Side::B => addr_a(),
+            },
+        }
+    }
+
     /// Datagrams delivered in the direction `side` sends through.
     pub(crate) fn delivered(&self, side: Side) -> u64 {
         let state = self.lock_state();
@@ -223,7 +288,6 @@ impl InMemoryNetwork {
 }
 
 /// One node's view of the fabric: what it sends and what it receives.
-#[derive(Debug)]
 pub(crate) struct InMemoryEndpoint {
     state: Arc<Mutex<FabricState>>,
     side: Side,
@@ -245,6 +309,22 @@ impl InMemoryEndpoint {
 
     pub(crate) fn send(&self, bytes: &[u8]) -> usize {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (kernel_a, kernel_b) = state.kernels.as_ref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |(a, b)| {
+                (
+                    SimulatedKernel::table_snapshot(a),
+                    SimulatedKernel::table_snapshot(b),
+                )
+            },
+        );
+        state.history.push(SentAdvert {
+            side: self.side,
+            bytes: bytes.to_vec(),
+            at: tokio::time::Instant::now(),
+            kernel_a,
+            kernel_b,
+        });
         self.side.direction_mut(&mut state).send(bytes.to_vec());
         bytes.len()
     }

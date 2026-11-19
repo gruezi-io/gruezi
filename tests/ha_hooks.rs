@@ -314,7 +314,7 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
     let (mut status_a, shutdown_a, task_a) = spawn_node(runtime_a);
 
     wait_for_status(&mut status_a, "node-a master after preemption", |status| {
-        status.state == HaState::Active && status.peer_alive
+        status.state == HaState::Active && status.owned && status.peer_alive
     })
     .await?;
     wait_for_status(&mut status_b, "node-b backup after demotion", |status| {
@@ -323,8 +323,16 @@ async fn demote_hook_runs_when_master_steps_down() -> Result<()> {
     .await?;
 
     let demote_line = wait_for_hook_line(&demote_output, "demote hook output").await?;
+    // The requester is still Standby when it asks the incumbent to release;
+    // it cannot become Active until withdrawal confirms absence.
     assert!(
-        demote_line.starts_with("demote|STANDBY|ACTIVE|PEER_HIGHER_PRIORITY|100|node-a|ACTIVE|110")
+        demote_line
+            .starts_with("demote|STANDBY|ACTIVE|PEER_HIGHER_PRIORITY|100|node-a|STANDBY|110")
+    );
+    assert_eq!(fs::read_to_string(fixture_b.dir.join("state"))?, "");
+    assert_eq!(
+        fs::read_to_string(fixture_a.dir.join("state"))?,
+        "lo 10.0.0.10/24\n"
     );
 
     stop_node(shutdown_a, task_a).await?;

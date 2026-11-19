@@ -29,6 +29,7 @@ use std::{
 use tokio::{net::UdpSocket, sync::watch};
 use tracing::{debug, info, warn};
 
+mod handoff;
 /// Deterministic in-process datagram fabric used by the failure matrix tests
 /// (design spec 8a: an enum seam, never a trait object).
 #[cfg(test)]
@@ -69,6 +70,8 @@ pub(super) struct HaLoopState {
     pub(super) next_reconcile_at: tokio::time::Instant,
     pub(super) ownership: OwnershipController,
     pub(super) last_transition_trigger: Option<TransitionTrigger>,
+    pub(super) handoff: handoff::Handoff,
+    shutdown_deadline: Option<tokio::time::Instant>,
 }
 
 /// Datagram transport seam (design spec 8a: an enum, never a trait object).
@@ -183,36 +186,42 @@ where
     log_runtime_start(&runtime, &local_bind, peer_addr);
 
     loop {
-        refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
         drain_reports(&runtime, status_tx.as_ref(), &mut loop_state, &mut worker);
+        refresh_local_state(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
+        if loop_state.shutdown_deadline.is_some_and(|deadline| {
+            tokio::time::Instant::now() >= deadline || loop_state.handoff.acknowledged
+        }) {
+            cleanup_before_exit(
+                &runtime,
+                status_tx.as_ref(),
+                &mut loop_state,
+                &mut worker,
+                false,
+            )
+            .await;
+            break;
+        }
 
         let advert_sleep = tokio::time::sleep_until(loop_state.next_advert_at);
         let reconcile_sleep = tokio::time::sleep_until(loop_state.next_reconcile_at);
         // Wake exactly at the authority deadline so a lapsed consent is
         // handled on time instead of at the next advert tick (invariant I3).
-        let authority_expiry = loop_state.ownership.authority().expiry();
-        let authority_sleep = async move {
-            match authority_expiry {
-                Some(expiry) => tokio::time::sleep_until(expiry).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
+        let authority_sleep = sleep_until_optional(loop_state.ownership.authority().expiry());
         tokio::pin!(advert_sleep);
         tokio::pin!(reconcile_sleep);
         tokio::pin!(authority_sleep);
+        let shutdown_sleep = sleep_until_optional(loop_state.shutdown_deadline);
+        tokio::pin!(shutdown_sleep);
 
         tokio::select! {
-            _ = &mut shutdown => {
+            _ = &mut shutdown, if loop_state.shutdown_deadline.is_none() => {
                 info!(node_id = %runtime.node_id, "HA runtime loop received shutdown signal");
-                cleanup_before_exit(
-                    &runtime,
-                    status_tx.as_ref(),
-                    &mut loop_state,
-                    &mut worker,
-                    false,
-                )
-                .await;
-                break;
+                if !begin_graceful_handoff(&runtime, &mut loop_state) {
+                    cleanup_before_exit(
+                        &runtime, status_tx.as_ref(), &mut loop_state, &mut worker, false,
+                    ).await;
+                    break;
+                }
             }
             Some(report) = worker.recv_report() => {
                 handle_resource_report(&runtime, status_tx.as_ref(), &mut loop_state, &worker, report);
@@ -268,10 +277,36 @@ where
                 // Authority deadline reached; the next loop iteration
                 // re-evaluates the failure policy against the consent state.
             }
+            () = &mut shutdown_sleep => {}
         }
     }
 
     Ok(())
+}
+
+async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn begin_graceful_handoff(runtime: &HaRuntimeConfig, loop_state: &mut HaLoopState) -> bool {
+    if !loop_state.ownership.authority().is_valid()
+        || loop_state.peer.last_fresh_at().is_none_or(|seen| {
+            seen + runtime.dead_timeout() <= tokio::time::Instant::now().into_std()
+        })
+    {
+        // No fresh peer can participate in a cooperative transfer. The
+        // ordinary bounded shutdown still revokes, drains and withdraws.
+        return false;
+    }
+    loop_state
+        .handoff
+        .release(loop_state.peer.last_sent_seq().saturating_add(1));
+    loop_state.shutdown_deadline =
+        Some(tokio::time::Instant::now() + Duration::from_millis(runtime.withdraw_timeout_ms));
+    true
 }
 
 /// Spawn the single resource worker and build the initial loop state.
@@ -377,6 +412,8 @@ fn initialize_loop_state(
         next_reconcile_at: next_reconcile_deadline(runtime, HaDecisionReason::Startup, now_tokio),
         ownership,
         last_transition_trigger: None,
+        handoff: handoff::Handoff::default(),
+        shutdown_deadline: None,
     };
 
     publish_loop_status(runtime, status_tx, &loop_state, startup_at);
@@ -408,6 +445,10 @@ fn refresh_local_state(
 ) {
     let now_tokio = tokio::time::Instant::now();
     let now = now_tokio.into_std();
+    loop_state.handoff.advance(
+        &loop_state.ownership,
+        loop_state.peer.last_sent_seq().saturating_add(1),
+    );
     let decision = desired_state(
         runtime,
         loop_state.state,
@@ -415,6 +456,23 @@ fn refresh_local_state(
         loop_state.startup_at,
         now,
         loop_state.active_peer_conflict,
+    );
+    let mut decision = loop_state.handoff.decision(
+        runtime,
+        loop_state.peer_observation.as_ref(),
+        now,
+        loop_state.ownership.authority().is_valid(),
+        decision,
+    );
+    if loop_state.shutdown_deadline.is_some() {
+        decision.state = HaState::Standby;
+        decision.reason = HaDecisionReason::GracefulShutdown;
+    }
+    let bootstrap_ok = bootstrap_rule_satisfied(runtime, loop_state, now);
+    loop_state.ownership.set_bootstrap_allowed(bootstrap_ok);
+    loop_state.ownership.set_handoff_gate(
+        loop_state.handoff.allowed(),
+        loop_state.handoff.blocked() || loop_state.shutdown_deadline.is_some(),
     );
     if decision.reason == HaDecisionReason::PeerBecameActiveConflict {
         loop_state.active_peer_conflict = true;
@@ -456,8 +514,6 @@ fn refresh_local_state(
     // Policy layer: feed the bootstrap verdict and re-evaluate authority for
     // the current role. A grant starts the acquisition; a lapsed strict
     // consent revokes authority and withdraws (invariants I1, I3).
-    let bootstrap_ok = bootstrap_rule_satisfied(runtime, loop_state, now);
-    loop_state.ownership.set_bootstrap_allowed(bootstrap_ok);
     let authority_effect = loop_state.ownership.refresh_authority(worker);
     if !matches!(
         authority_effect,
@@ -470,6 +526,7 @@ fn refresh_local_state(
             now,
         );
         if let RoleTransitionEffect::Demote { reason, .. } = authority_effect {
+            loop_state.handoff.fault();
             // Authority transitions are policy-layer facts: the trigger says
             // consent (not the election) drove this transition.
             loop_state.last_transition_reason = Some(reason);
@@ -483,6 +540,13 @@ fn refresh_local_state(
         }
     }
 
+    // Unmanaged transitions confirm synchronously. Publish their transfer
+    // phase in this iteration, before an advert could expose an absent,
+    // unauthorized bootstrap candidate without its release state.
+    loop_state.handoff.advance(
+        &loop_state.ownership,
+        loop_state.peer.last_sent_seq().saturating_add(1),
+    );
     publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
@@ -572,6 +636,7 @@ fn handle_resource_report(
             state,
             previous_state,
         } => {
+            loop_state.handoff.fault();
             let context = hook_context(
                 runtime,
                 state,
@@ -626,6 +691,16 @@ fn handle_receive_event(
                 loop_state.counters.packets_received.saturating_add(1);
             match admission {
                 Admission::Fresh(packet) => {
+                    loop_state.handoff.observe(
+                        runtime,
+                        &packet,
+                        loop_state
+                            .peer_observation
+                            .as_ref()
+                            .map(|peer| peer.observed_at),
+                        observed_at,
+                        &loop_state.ownership,
+                    );
                     observe_peer(&mut loop_state.peer_observation, &packet, observed_at);
                     update_consent(runtime, loop_state, &packet);
                     debug!(
@@ -712,6 +787,9 @@ fn bootstrap_rule_satisfied(
     loop_state: &HaLoopState,
     now: Instant,
 ) -> bool {
+    if !loop_state.handoff.bootstrap_permitted() {
+        return false;
+    }
     let Some(peer) = loop_state.peer_observation.as_ref() else {
         return false;
     };
@@ -784,7 +862,15 @@ async fn handle_send_event(
     status_tx: Option<&watch::Sender<HaStatus>>,
     loop_state: &mut HaLoopState,
 ) -> Result<()> {
-    let advert = advert_state(&loop_state.ownership);
+    let mut advert = advert_state(&loop_state.ownership);
+    (advert.transfer_id, advert.transfer_phase) = loop_state.handoff.advert();
+    debug!(
+        node_id = %runtime.node_id,
+        transfer_id = advert.transfer_id,
+        phase = ?advert.transfer_phase,
+        resource = ?advert.resource_state,
+        "periodic HA handoff state"
+    );
     // Sequence exhaustion is fatal on purpose: the runtime exits and restarts
     // with a new nonce instead of ever reusing a sequence number.
     let (seq, encoded) = loop_state.peer.next_advert(advert)?;
@@ -965,6 +1051,8 @@ fn advert_state(ownership: &OwnershipController) -> AdvertState {
         authority_source: AdvertAuthoritySource::from_authority(&authority),
         resource_state: AdvertResourceState::from(ownership.resource_state()),
         term: authority.term(),
+        transfer_id: 0,
+        transfer_phase: super::protocol::TransferPhase::None,
     }
 }
 

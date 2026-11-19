@@ -199,6 +199,8 @@ pub(super) struct AdvertState {
     pub(super) authority_source: AdvertAuthoritySource,
     pub(super) resource_state: AdvertResourceState,
     pub(super) term: u64,
+    pub(super) transfer_id: u64,
+    pub(super) transfer_phase: TransferPhase,
 }
 
 /// Owns the local nonce and send sequence, the peer session, the single-slot
@@ -436,10 +438,8 @@ impl PeerTracker {
             resource_state: state.resource_state,
             priority: self.priority,
             term: state.term,
-            // Handoff phases arrive with the handoff todo; until then no
-            // transfer is ever in progress.
-            transfer_id: 0,
-            transfer_phase: TransferPhase::None,
+            transfer_id: state.transfer_id,
+            transfer_phase: state.transfer_phase,
         };
         Ok((seq, packet.encode(&self.key)?))
     }
@@ -613,6 +613,8 @@ mod tests {
             authority_source: AdvertAuthoritySource::None,
             resource_state: AdvertResourceState::Unmanaged,
             term: 0,
+            transfer_id: 0,
+            transfer_phase: super::TransferPhase::None,
         }
     }
 
