@@ -285,7 +285,10 @@ fn real_format_numeric_booleans_accepted() -> Result<()> {
 
 #[test]
 fn numeric_boolean_garbage_rejected() -> Result<()> {
-    for bad in ["2", "-1", "01", "00", "on", "off", "true", "NULL", "1 ", ""] {
+    for bad in [
+        "2", "-1", "01", "00", "on", "off", "true", "false", "yes", "no", "y", "n", "t", "f",
+        "enabled", "disabled", "True", "YES", "NULL", "1 ", "",
+    ] {
         for field in ["strict", "log_bin", "log_slave_updates"] {
             let fx = AdapterFixture::new("bad-boolean")?;
             install_healthy(&fx)?;
@@ -2139,6 +2142,77 @@ fn baseline_and_revoke_preserve_dirty_epoch() -> Result<()> {
         assert_dirty(&fx)?;
         assert!(!fx.state_dir.join("last_release.record").exists());
     }
+    Ok(())
+}
+
+#[test]
+fn baseline_deactivate_accepts_generation_zero() -> Result<()> {
+    const BASELINE: &[(&str, &str)] = &[("GRUEZI_DEACTIVATE_MODE", "baseline")];
+    // Startup baseline runs before any ownership generation exists.
+    let fx = activated("baseline-gen-zero")?;
+    let ledger = fx.state_dir.join("generation.record");
+    let before = fs::read(&ledger)?;
+    expect_exit(&fx.event("deactivate", "0", BASELINE)?, 0)?;
+    // Full baseline cleanup still ran; dirty history stays and no receipt exists.
+    assert!(fx.call_log()?.contains("SET GLOBAL read_only=1"));
+    assert_dirty(&fx)?;
+    assert!(!fx.state_dir.join("last_release.record").exists());
+    // Generation 0 never touches the strictly-increasing ledger.
+    assert_eq!(before, fs::read(&ledger)?);
+    // Replaying the already-recorded generation 1 is still refused.
+    let replay = fx.event("activate", "1", &[])?;
+    assert_reason(&expect_exit(&replay, 64)?, "stale_generation");
+    // A fresh state stays ledger-less after the baseline call.
+    let fresh = lifecycle_fixture("baseline-gen-zero-fresh")?;
+    expect_exit(&fresh.event("deactivate", "0", BASELINE)?, 0)?;
+    assert!(!fresh.state_dir.join("generation.record").exists());
+    Ok(())
+}
+
+#[test]
+fn activate_refuses_generation_zero() -> Result<()> {
+    for mode in ["handoff", "cold"] {
+        let fx = lifecycle_fixture("activate-gen-zero")?;
+        let out = fx.event("activate", "0", &[("GRUEZI_ACTIVATION_MODE", mode)])?;
+        assert_reason(&expect_exit(&out, 64)?, "generation_invalid");
+        assert_no_enable(&fx)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn handoff_release_deactivate_refuses_generation_zero() -> Result<()> {
+    let fx = activated("release-gen-zero")?;
+    let out = fx.event("deactivate", "0", &[])?;
+    assert_reason(&expect_exit(&out, 64)?, "generation_invalid");
+    Ok(())
+}
+
+#[test]
+fn revoke_deactivate_refuses_generation_zero() -> Result<()> {
+    let fx = activated("revoke-gen-zero")?;
+    let out = fx.event("deactivate", "0", &[("GRUEZI_DEACTIVATE_MODE", "revoke")])?;
+    assert_reason(&expect_exit(&out, 64)?, "generation_invalid");
+    Ok(())
+}
+
+#[test]
+fn verify_refuses_generation_zero() -> Result<()> {
+    let fx = activated("verify-gen-zero")?;
+    let incarnation = active_incarnation(&fx)?;
+    let out = fx.event("verify", "0", &[("GRUEZI_DB_INCARNATION", &incarnation)])?;
+    assert_reason(&expect_exit(&out, 64)?, "generation_invalid");
+    Ok(())
+}
+
+#[test]
+fn generation_after_baseline_zero_still_accepted() -> Result<()> {
+    let fx = lifecycle_fixture("after-baseline-zero")?;
+    expect_exit(
+        &fx.event("deactivate", "0", &[("GRUEZI_DEACTIVATE_MODE", "baseline")])?,
+        0,
+    )?;
+    expect_exit(&fx.event("activate", "1", &[])?, 0)?;
     Ok(())
 }
 

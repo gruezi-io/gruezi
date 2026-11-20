@@ -201,8 +201,12 @@ source and nonzero term.
 
 All commands share exclusive `flock`. Lock acquisition and SQL use the
 remaining monotonic event budget, capped by `COMMAND_TIMEOUT_S`. Mutating
-generations must strictly increase within one instance. Verify accepts
-repeated calls at exactly the active generation.
+generations must strictly increase within one instance. The only exception is
+the startup baseline `deactivate` (`GRUEZI_DEACTIVATE_MODE=baseline`), which
+carries `GRUEZI_GENERATION=0` because no generation exists yet: it runs the full
+baseline cleanup, is not recorded in the generation ledger, and never writes a
+receipt. Generation 0 is refused with exit 64 for every other operation. Verify
+accepts repeated calls at exactly the active generation.
 
 `activate` additionally requires `GRUEZI_ACTIVATION_MODE=handoff|cold`, no
 quarantine or unresolved dirty epoch, exact local process identity,

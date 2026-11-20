@@ -1537,7 +1537,12 @@ valid_nonce() { [[ "$1" =~ ^[0-9a-f]{32}$ ]]; }
 validate_event() {
     [[ "${GRUEZI_EVENT:-}" == "$1" ]] || fail 64 event_mismatch
     valid_nonce "${GRUEZI_INSTANCE_ID:-}" || fail 64 instance_invalid
-    valid_u64 "${GRUEZI_GENERATION:-}" && [[ "$GRUEZI_GENERATION" != 0 ]] || fail 64 generation_invalid
+    # Generation 0 exists only on the startup baseline Deactivate, sent before
+    # any ownership generation exists. Every other operation needs generation >= 1.
+    valid_u64 "${GRUEZI_GENERATION:-}" || fail 64 generation_invalid
+    if [[ "$GRUEZI_GENERATION" == 0 ]]; then
+        [[ "$1" == deactivate && "${GRUEZI_DEACTIVATE_MODE:-}" == baseline ]] || fail 64 generation_invalid
+    fi
     valid_u64 "${GRUEZI_TRANSFER_ID:-}" || fail 64 transfer_invalid
     [[ -v GRUEZI_PEER_NONCE ]] || fail 64 peer_nonce_missing
     [[ -z "$GRUEZI_PEER_NONCE" ]] || valid_nonce "$GRUEZI_PEER_NONCE" || fail 64 peer_nonce_invalid
@@ -1567,6 +1572,9 @@ operation_lock() {
 
 generation_guard() {
     local mode="$1" prior="$STATE_DIR/generation.record" instance generation
+    # Baseline generation 0 (validated earlier) precedes every real generation:
+    # it is neither compared with nor recorded in the strictly-increasing ledger.
+    [[ "$GRUEZI_GENERATION" != 0 ]] || return 0
     if [[ -e "$prior" ]]; then
         instance="$(read_record instance "$prior")" || fail 13 generation_record_invalid
         generation="$(read_record generation "$prior")" || fail 13 generation_record_invalid
