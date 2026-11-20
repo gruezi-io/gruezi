@@ -12,6 +12,11 @@ use tracing::warn;
 pub const COMMAND_TIMEOUT_MS: u64 = 3000;
 pub const WITHDRAW_TIMEOUT_MS: u64 = 5000;
 
+/// Bounded replacement-worker budget after a resource-worker loss (plan task
+/// 6a hardening): a persistent worker failure must quiesce on the latched
+/// `uncertain` state instead of respawning in a loop.
+pub(crate) const MAX_WORKER_RESPAWNS: u8 = 2;
+
 /// Bound the worker's per-address add and announcement commands plus read-back.
 pub(crate) const fn acquisition_budget_ms(address_count: usize) -> u128 {
     (2 * address_count as u128 + 1) * COMMAND_TIMEOUT_MS as u128
@@ -32,6 +37,14 @@ pub(crate) struct KernelAddressEntry {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PanicEveryCommand {
+    #[default]
+    Off,
+    On,
+}
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SimulatedKernel {
     pub(crate) entries: Vec<KernelAddressEntry>,
@@ -44,6 +57,14 @@ pub(crate) struct SimulatedKernel {
     pub(crate) gate_next_add: Option<CommandGate>,
     pub(crate) gate_after_add: Option<CommandGate>,
     pub(crate) gate_next_del: Option<CommandGate>,
+    /// Unwind the resource worker task inside its next command (worker panic).
+    pub(crate) panic_next_command: bool,
+    /// Unwind the worker inside every later command (persistent failure);
+    /// a two-variant enum keeps this struct inside the lint's bool limit.
+    pub(crate) panic_every_command: PanicEveryCommand,
+    /// Set when a worker runs over this kernel; lets a test end the task
+    /// without a panic (worker channel closure outside shutdown).
+    pub(crate) worker_abort: Option<tokio::task::AbortHandle>,
 }
 
 #[cfg(test)]
@@ -123,6 +144,24 @@ pub(crate) enum CommandRunner {
 }
 
 impl CommandRunner {
+    /// A runner for a replacement worker after the first one died outside
+    /// shutdown (plan task 6a): the system runner is recreated and the
+    /// simulated kernel is shared. A scripted runner is replaced by an
+    /// exhausted one, so a post-loss command fails instead of replaying a
+    /// scripted result.
+    fn cleanup_runner(&self) -> Self {
+        match self {
+            Self::System => Self::System,
+            #[cfg(test)]
+            Self::Simulated(kernel) => Self::Simulated(kernel.clone()),
+            #[cfg(test)]
+            Self::Scripted { .. } => Self::Scripted {
+                results: std::collections::VecDeque::new(),
+                calls: Vec::new(),
+            },
+        }
+    }
+
     async fn run(&mut self, command: &str, args: &[&str]) -> Result<String> {
         if command.trim().is_empty() {
             bail!("command path cannot be empty");
@@ -297,6 +336,14 @@ async fn run_simulated_command(
         if guard.fail_all_commands {
             bail!("unexpected command execution: {command} {args:?}");
         }
+        let panic_now = std::mem::take(&mut guard.panic_next_command)
+            || guard.panic_every_command == PanicEveryCommand::On;
+        if panic_now {
+            drop(guard);
+            // `resume_unwind` unwinds the worker task like a panic without
+            // the `panic!` macro the repository lints forbid.
+            std::panic::resume_unwind(Box::new("injected resource worker panic"));
+        }
     }
 
     if args.first() == Some(&"-o")
@@ -359,6 +406,15 @@ impl AddressObservation {
             })
             .collect()
     }
+}
+
+/// The managed address still answers whenever any entry on the interface
+/// carries its IP, whatever its prefix: removal is only proven when no entry
+/// remains (plan task 6c - never claim absence while an alias answers).
+fn interface_carries_ip(observed: &[AddressObservation], interface: &str, ip: IpAddr) -> bool {
+    observed
+        .iter()
+        .any(|entry| entry.interface == interface && entry.ip == ip)
 }
 
 fn parse_address(address: &str) -> Result<(IpAddr, u8)> {
@@ -448,17 +504,20 @@ impl AddressManager {
             Ok(observed) => {
                 for address in &self.addresses {
                     let correct = match parse_address(address) {
-                        Ok((ip, prefix)) => {
-                            let mut entries = observed.iter().filter(|entry| {
+                        Ok((ip, prefix)) => match action {
+                            AddressAction::Add => observed.iter().any(|entry| {
                                 entry.interface == self.interface
                                     && entry.ip == ip
                                     && entry.prefix == prefix
-                            });
-                            match action {
-                                AddressAction::Add => entries.any(|entry| entry.ready),
-                                AddressAction::Remove => entries.next().is_none(),
+                                    && entry.ready
+                            }),
+                            // Same rule as `evaluate_read_back`: a same-IP
+                            // alias under another prefix keeps removal
+                            // unproven.
+                            AddressAction::Remove => {
+                                !interface_carries_ip(&observed, &self.interface, ip)
                             }
-                        }
+                        },
                         Err(error) => {
                             errors.push(format!("{address}: {error:#}"));
                             false
@@ -513,6 +572,7 @@ impl AddressManager {
     ) -> (ObservedPresence, Vec<String>) {
         let mut ready_count = 0usize;
         let mut any_match_count = 0usize;
+        let mut any_residual = false;
         let mut missing_errors = Vec::new();
 
         for address in &self.addresses {
@@ -535,8 +595,16 @@ impl AddressManager {
                     }
                     let satisfied = match action {
                         AddressAction::Add => is_ready,
-                        AddressAction::Remove => matching.is_empty(),
+                        // A same-IP entry under another prefix still answers
+                        // for the managed address: removal is only proven
+                        // when no entry carries the IP any more.
+                        AddressAction::Remove => {
+                            !interface_carries_ip(observed, &self.interface, ip)
+                        }
                     };
+                    if interface_carries_ip(observed, &self.interface, ip) {
+                        any_residual = true;
+                    }
                     if !satisfied {
                         missing_errors.push(format!(
                             "read-back did not confirm {} {address} on {}",
@@ -551,12 +619,25 @@ impl AddressManager {
             }
         }
 
-        let presence = if ready_count == self.addresses.len() {
-            ObservedPresence::Present
-        } else if any_match_count == 0 {
-            ObservedPresence::Absent
-        } else {
-            ObservedPresence::Partial
+        let presence = match action {
+            AddressAction::Add => {
+                if ready_count == self.addresses.len() {
+                    ObservedPresence::Present
+                } else if any_match_count == 0 {
+                    ObservedPresence::Absent
+                } else {
+                    ObservedPresence::Partial
+                }
+            }
+            AddressAction::Remove => {
+                if !any_residual {
+                    ObservedPresence::Absent
+                } else if ready_count == self.addresses.len() {
+                    ObservedPresence::Present
+                } else {
+                    ObservedPresence::Partial
+                }
+            }
         };
 
         (presence, missing_errors)
@@ -613,6 +694,19 @@ pub struct ResourceWorkerHandle {
     directive_tx: watch::Sender<WorkerDirective>,
     report_rx: mpsc::UnboundedReceiver<ResourceReport>,
     join_handle: Option<JoinHandle<ResourceState>>,
+    manager: AddressManager,
+    /// Runner source for a replacement worker after a loss (plan task 6a).
+    cleanup_source: CommandRunner,
+    loss_reported: bool,
+    /// Remaining replacement-worker budget (bounded respawn policy).
+    respawn_budget: u8,
+}
+
+/// What the coordinator observes from the worker channel: a report, or the
+/// loss of the worker task outside shutdown (panic or exit).
+pub(crate) enum WorkerEvent {
+    Report(ResourceReport),
+    Lost,
 }
 
 impl ResourceWorkerHandle {
@@ -630,8 +724,9 @@ impl ResourceWorkerHandle {
             desired: DesiredOwnership::Revoked,
         };
         let (directive_tx, directive_rx) = watch::channel(initial_directive);
+        let cleanup_source = runner.cleanup_runner();
         let worker = ResourceWorker {
-            manager,
+            manager: manager.clone(),
             runner,
             command_rx,
             directive_rx,
@@ -639,12 +734,28 @@ impl ResourceWorkerHandle {
             sticky_withdraw: false,
             has_attempted_acquire: false,
         };
+        #[cfg(test)]
+        let kernel = match &worker.runner {
+            CommandRunner::Simulated(kernel) => Some(kernel.clone()),
+            _ => None,
+        };
         let join_handle = tokio::spawn(worker.run());
+        #[cfg(test)]
+        if let Some(kernel) = kernel {
+            kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .worker_abort = Some(join_handle.abort_handle());
+        }
         Self {
             command_tx,
             directive_tx,
             report_rx,
             join_handle: Some(join_handle),
+            manager,
+            cleanup_source,
+            loss_reported: false,
+            respawn_budget: MAX_WORKER_RESPAWNS,
         }
     }
 
@@ -666,9 +777,71 @@ impl ResourceWorkerHandle {
         self.report_rx.recv().await
     }
 
+    /// Receive the next worker report, or - once per lost worker - the loss
+    /// of the worker task outside shutdown. A closed channel must be an
+    /// observable event, never a silent loss of the only executor that can
+    /// withdraw the VIP (plan task 6a).
+    pub(crate) async fn recv_event(&mut self) -> WorkerEvent {
+        match self.report_rx.recv().await {
+            Some(report) => {
+                // A report proves the worker alive again: re-arm loss
+                // detection for a later, separate failure.
+                self.loss_reported = false;
+                WorkerEvent::Report(report)
+            }
+            None => {
+                if self.loss_reported {
+                    // Sticky across respawns (hardening): a replacement that
+                    // dies before proving itself alive must engage this
+                    // guard instead of re-reporting in a loop. Never
+                    // busy-loop on the closed channel.
+                    std::future::pending::<WorkerEvent>().await
+                } else {
+                    self.loss_reported = true;
+                    WorkerEvent::Lost
+                }
+            }
+        }
+    }
+
     /// Poll for a pending worker report without waiting.
     pub fn try_recv_report(&mut self) -> Option<ResourceReport> {
-        self.report_rx.try_recv().ok()
+        let report = self.report_rx.try_recv().ok();
+        if report.is_some() {
+            // Same proof-of-life as `recv_event`.
+            self.loss_reported = false;
+        }
+        report
+    }
+
+    /// Replace the worker task after it died outside shutdown. The
+    /// replacement starts sticky-withdrawn over a fresh runner, so it may
+    /// only attempt the revocation's withdrawal (plan task 6a). Replacements
+    /// are bounded by `MAX_WORKER_RESPAWNS`: once the budget is spent this
+    /// returns `false` and the coordinator quiesces on the latched state.
+    /// `loss_reported` is deliberately not touched here (sticky across
+    /// respawns): a replacement that dies before reporting engages the
+    /// anti-busy-loop guard in `recv_event` instead of re-reporting.
+    pub(crate) fn respawn(&mut self) -> bool {
+        if self.respawn_budget == 0 {
+            return false;
+        }
+        self.respawn_budget -= 1;
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (report_tx, report_rx) = mpsc::unbounded_channel();
+        let worker = ResourceWorker {
+            manager: self.manager.clone(),
+            runner: self.cleanup_source.cleanup_runner(),
+            command_rx,
+            directive_rx: self.directive_tx.subscribe(),
+            report_tx,
+            sticky_withdraw: true,
+            has_attempted_acquire: true,
+        };
+        self.command_tx = command_tx;
+        self.report_rx = report_rx;
+        self.join_handle = Some(tokio::spawn(worker.run()));
+        true
     }
 
     /// Request sticky shutdown withdrawal and join the worker within the withdrawal deadline.
@@ -1198,6 +1371,7 @@ mod tests {
         AddressAction, AddressManager, AddressObservation, COMMAND_TIMEOUT_MS, CommandRunner,
         parse_address_ip,
     };
+    use crate::gruezi::ownership::ObservedPresence;
     use anyhow::{Context, Result, anyhow};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1363,6 +1537,135 @@ mod tests {
             tokio::time::Duration::from_millis(2 * COMMAND_TIMEOUT_MS)
         );
         Ok(())
+    }
+
+    /// Plan task 6(c): VIP identity near-matches never produce a false
+    /// presence or a false absence. Presence needs the exact managed tuple
+    /// (interface, IP, prefix) and a ready address; absence is only claimed
+    /// when no entry with the managed IP remains on the managed interface,
+    /// whatever its prefix - a same-IP alias still answers for the VIP.
+    /// Entries on other interfaces are outside the observation
+    /// (`ip ... show dev`), which is a documented scope limit.
+    mod fails_closed {
+        use super::*;
+
+        use ObservedPresence::{Absent, Partial, Present};
+
+        /// (managed, observed line, presence for Add, presence for Remove).
+        const NEAR_MATCHES: [(&str, &str, ObservedPresence, ObservedPresence); 12] = [
+            (
+                "192.0.2.5/24",
+                "2: eth0 inet 192.0.2.5/24 scope global eth0",
+                Present,
+                Present,
+            ),
+            (
+                "192.0.2.5/24",
+                "2: eth0 inet 192.0.2.50/24 scope global eth0",
+                Absent,
+                Absent,
+            ),
+            (
+                "192.0.2.50/24",
+                "2: eth0 inet 192.0.2.5/24 scope global eth0",
+                Absent,
+                Absent,
+            ),
+            // Same IP, other prefix: the IP still answers, so never absent.
+            (
+                "192.0.2.5/24",
+                "2: eth0 inet 192.0.2.5/32 scope global eth0",
+                Absent,
+                Partial,
+            ),
+            // Other interface: not observed by `show dev eth0`, never a match.
+            (
+                "192.0.2.5/24",
+                "2: other0 inet 192.0.2.5/24 scope global other0",
+                Absent,
+                Absent,
+            ),
+            (
+                "2001:db8::5/64",
+                "2: eth0 inet6 2001:0db8:0:0:0:0:0:5/64 scope global",
+                Present,
+                Present,
+            ),
+            (
+                "2001:db8::5/64",
+                "2: eth0 inet6 2001:DB8::5/64 scope global",
+                Present,
+                Present,
+            ),
+            (
+                "2001:db8::5/64",
+                "2: eth0 inet6 2001:db8::5/128 scope global",
+                Absent,
+                Partial,
+            ),
+            (
+                "2001:db8::5/64",
+                "2: eth0 inet6 2001:db8::50/64 scope global",
+                Absent,
+                Absent,
+            ),
+            (
+                "192.0.2.5/24",
+                "2: eth0 inet6 ::ffff:192.0.2.5/120 scope global",
+                Absent,
+                Absent,
+            ),
+            // Tentative and DAD-failed addresses are neither present nor absent.
+            (
+                "2001:db8::5/64",
+                "2: eth0 inet6 2001:db8::5/64 scope global tentative",
+                Partial,
+                Partial,
+            ),
+            (
+                "2001:db8::5/64",
+                "2: eth0 inet6 2001:db8::5/64 scope global dadfailed tentative",
+                Partial,
+                Partial,
+            ),
+        ];
+
+        #[tokio::test]
+        async fn vip_identity_near_matches_never_false_present_or_absent() -> Result<()> {
+            for (managed, line, add, remove) in NEAR_MATCHES {
+                let mut config = manager();
+                config.addresses = vec![managed.to_owned()];
+                let observed = AddressObservation::parse(line)?;
+                let (added, _) = config.evaluate_read_back(&observed, AddressAction::Add);
+                let (removed, _) = config.evaluate_read_back(&observed, AddressAction::Remove);
+                println!(
+                    "VIP_IDENTITY managed={managed} observed={line:?} add={added:?} remove={removed:?}"
+                );
+                assert_eq!(added, add, "add presence for {managed} vs {line}");
+                assert_eq!(removed, remove, "remove presence for {managed} vs {line}");
+            }
+
+            // The same absence rule at the `AddressManager::apply` call site: a
+            // same-IP alias keeps a removal unproven there too.
+            let mut config = manager();
+            config.addresses = vec!["192.0.2.5/24".to_owned()];
+            let alias = "2: eth0 inet 192.0.2.5/32 scope global eth0";
+            let mut runner = scripted(vec![Some(Ok(String::new())), Some(Ok(alias.to_owned()))]);
+            println!("VIP_IDENTITY managed=192.0.2.5/24 apply=Remove observed={alias:?}");
+            assert!(
+                config
+                    .apply_with_runner(AddressAction::Remove, &mut runner)
+                    .await
+                    .is_err(),
+                "removal must stay unproven while a same-IP alias answers"
+            );
+            let mut runner = scripted(vec![Some(Ok(String::new())), Some(Ok(String::new()))]);
+            config
+                .apply_with_runner(AddressAction::Remove, &mut runner)
+                .await
+                .context("removal with no residual entry must confirm")?;
+            Ok(())
+        }
     }
 
     #[test]

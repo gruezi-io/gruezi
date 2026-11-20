@@ -41,6 +41,7 @@ use tokio::{
 };
 
 mod external;
+mod fails_closed;
 mod lifecycle;
 mod watchdog;
 

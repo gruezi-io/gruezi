@@ -506,6 +506,10 @@ pub struct OwnershipController {
     /// before this instant (one lifecycle timeout later).
     activation_hold_until: Option<Instant>,
     application_baseline_pending: bool,
+    /// Latched when the resource worker died outside shutdown (plan task 6a):
+    /// no worker report or lifecycle completion may resolve the resource
+    /// state or restore ownership before a process restart.
+    resource_worker_lost: bool,
     #[cfg(test)]
     lifecycle_submissions: Vec<(LifecycleKind, u64, LifecycleContext)>,
 }
@@ -573,6 +577,7 @@ impl OwnershipController {
             acquisition_budget: Duration::ZERO,
             activation_hold_until: None,
             application_baseline_pending: false,
+            resource_worker_lost: false,
             #[cfg(test)]
             lifecycle_submissions: Vec::new(),
         }
@@ -1085,7 +1090,8 @@ impl OwnershipController {
     /// Section 1 ownership predicate, including required watchdog protection.
     #[must_use]
     pub fn owned(&self) -> bool {
-        matches!(self.elected_role, HaState::Active)
+        !self.resource_worker_lost
+            && matches!(self.elected_role, HaState::Active)
             && self.authority.is_valid()
             && self.watchdog.ownership_allowed()
             && self.application_ready()
@@ -1298,6 +1304,11 @@ impl OwnershipController {
     /// time: `strict` revokes and withdraws, `available` falls back to
     /// `assumed` without interrupting ownership.
     pub fn refresh_authority(&mut self, worker: &ResourceWorkerHandle) -> RoleTransitionEffect {
+        // A latched worker loss ends authority for this process (plan task
+        // 6a): nothing may re-evaluate a grant or feed the watchdog.
+        if self.resource_worker_lost {
+            return RoleTransitionEffect::None;
+        }
         let effect = self.check_verification_deadline(worker);
         if !matches!(effect, RoleTransitionEffect::None) {
             return effect;
@@ -1356,6 +1367,11 @@ impl OwnershipController {
         reason: HaDecisionReason,
         worker: &ResourceWorkerHandle,
     ) -> RoleTransitionEffect {
+        // A latched worker loss blocks every acquisition path (plan task 6a):
+        // no promotion may start until a process restart.
+        if self.resource_worker_lost {
+            return RoleTransitionEffect::None;
+        }
         let held = self
             .activation_hold_until
             .is_some_and(|until| until > Instant::now());
@@ -1718,12 +1734,47 @@ impl OwnershipController {
         self.consume_pending_promotion(generation)
     }
 
+    /// A resource worker that died outside shutdown (panic or closed channel)
+    /// proves nothing about the VIP (plan task 6a): revoke authority like a
+    /// failed address action, latch the resource `uncertain` until restart and
+    /// keep the watchdog unfed. A replacement worker may attempt the
+    /// withdrawal, but no completion may resolve the latch or re-promote.
+    pub fn handle_worker_lost(&mut self, worker: &ResourceWorkerHandle) -> ReportEffect {
+        let previous_role = self.elected_role;
+        self.previous_role = previous_role;
+        self.elected_role = HaState::Standby;
+        self.resource_worker_lost = true;
+        self.revoke_authority_internal(
+            previous_role,
+            HaState::Standby,
+            HaDecisionReason::RuntimeFault,
+            worker,
+        );
+        if self.management == ResourceManagement::Managed {
+            let message = "resource worker exited outside shutdown".to_owned();
+            self.resource_state = ResourceState::Uncertain {
+                last_observation: ObservedPresence::Unknown,
+                last_error: Some(message.clone()),
+            };
+            self.last_error = Some(message);
+        }
+        ReportEffect::Fault {
+            state: self.elected_role,
+            previous_state: previous_role,
+        }
+    }
+
     /// Apply a completed report from the resource worker and determine whether any hook should fire.
     pub fn apply_worker_report(
         &mut self,
         report: ResourceReport,
         worker: &ResourceWorkerHandle,
     ) -> ReportEffect {
+        // A latched worker loss ends the evidence stream: no report from the
+        // replacement worker may resolve the latched state (plan task 6a).
+        if self.resource_worker_lost {
+            return ReportEffect::None;
+        }
         // An observation queued before revocation cannot prove that the
         // current generation drained its mutations and withdrew (I6/I7).
         if report.generation != self.generation

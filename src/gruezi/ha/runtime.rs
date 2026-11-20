@@ -15,7 +15,7 @@ use crate::{
     gruezi::{
         addresses::{
             AddressManager, CommandRunner, ResourceReport, ResourceReportKind,
-            ResourceWorkerHandle, WITHDRAW_TIMEOUT_MS,
+            ResourceWorkerHandle, WITHDRAW_TIMEOUT_MS, WorkerEvent,
         },
         application::ApplicationPhase,
         hooks::{
@@ -410,8 +410,8 @@ where
                 handle_verification(&runtime, status_tx.as_ref(), &mut loop_state, &worker);
                 Ok(())
             }
-            Some(report) = worker.recv_report() => {
-                handle_resource_report(&runtime, status_tx.as_ref(), &mut loop_state, &worker, report);
+            event = worker.recv_event() => {
+                handle_worker_event(&runtime, status_tx.as_ref(), &mut loop_state, &mut worker, event);
                 Ok(())
             }
             recv = io.recv(&mut buffer) => handle_receive_event(
@@ -1176,6 +1176,76 @@ fn handle_resource_report(
         ReportEffect::None => {}
     }
 
+    publish_loop_status(runtime, status_tx, loop_state, now);
+}
+
+/// Route one worker-channel event: reports flow through the normal report
+/// path; a lost worker is the plan-task-6a fail-closed path.
+fn handle_worker_event(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
+    event: WorkerEvent,
+) {
+    match event {
+        WorkerEvent::Report(report) => {
+            handle_resource_report(runtime, status_tx, loop_state, worker, report);
+        }
+        WorkerEvent::Lost => handle_worker_loss(runtime, status_tx, loop_state, worker),
+    }
+}
+
+/// The resource worker died outside shutdown (panic or closed channel): the
+/// node has no trustworthy VIP evidence any more. Fail closed (plan task 6a):
+/// revoke authority, latch the resource `uncertain`, attempt the VIP
+/// withdrawal through a replacement worker over a fresh runner, never promote
+/// and never feed the watchdog again.
+fn handle_worker_loss(
+    runtime: &HaRuntimeConfig,
+    status_tx: Option<&watch::Sender<HaStatus>>,
+    loop_state: &mut HaLoopState,
+    worker: &mut ResourceWorkerHandle,
+) {
+    warn!(
+        node_id = %runtime.node_id,
+        "HA resource worker died outside shutdown; failing closed"
+    );
+    let now_tokio = tokio::time::Instant::now();
+    let now = now_tokio.into_std();
+    loop_state.next_reconcile_at =
+        next_reconcile_deadline(runtime, loop_state.decision_reason, now_tokio);
+    bind_lifecycle(runtime, loop_state);
+    // Respawn first (bounded by MAX_WORKER_RESPAWNS): the revocation below
+    // enqueues the VIP withdrawal on the replacement worker, which can still
+    // execute it. The latch it sets makes this an attempt only - no completion
+    // may resolve `uncertain`.
+    let respawned = worker.respawn();
+    let effect = loop_state.ownership.handle_worker_lost(worker);
+    if !respawned {
+        warn!(
+            node_id = %runtime.node_id,
+            "resource worker respawn budget exhausted; quiescing on latched uncertainty"
+        );
+    }
+    match effect {
+        ReportEffect::PromoteConfirmed { .. } | ReportEffect::None => {}
+        ReportEffect::Fault {
+            state,
+            previous_state,
+        } => {
+            loop_state.handoff.fault();
+            let context = hook_context(
+                runtime,
+                state,
+                previous_state,
+                Some(HaDecisionReason::AddressActionFailed),
+                loop_state.peer_observation.as_ref(),
+                now,
+            );
+            notify(runtime, &loop_state.ownership, HookEvent::Fault, context);
+        }
+    }
     publish_loop_status(runtime, status_tx, loop_state, now);
 }
 
