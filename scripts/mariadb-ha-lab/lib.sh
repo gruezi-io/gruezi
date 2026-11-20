@@ -267,10 +267,17 @@ db_with() {
 # ---------------------------------------------------------------------------
 
 owners() {
-    local node addresses result=""
+    local node addresses code result=""
     for node in a b; do
-        # A missing pod is a crashed host, not an empty successful ip response.
-        if ! p pod exists "$NAME-$node"; then continue; fi
+        # Only Podman's status 1 confirms absence; errors (including the
+        # deadline's KILL status) leave this namespace's ownership unknown.
+        code=0
+        p pod exists "$NAME-$node" >/dev/null || code=$?
+        case "$code" in
+            0) ;;
+            1) continue ;;
+            *) return "$code" ;;
+        esac
         addresses="$(p exec "$NAME-db-$node" ip -o addr show dev eth0)" || return 1
         if printf '%s\n' "$addresses" | awk -v vip="$VIP/24" \
             '$3 == "inet" && $4 == vip {found=1} END {exit !found}'; then
@@ -279,7 +286,11 @@ owners() {
     done
     printf '%s' "${result:-none}"
 }
-owner_is() { [[ "$(owners)" == "$1" ]]; }
+owner_is() {
+    local observed
+    observed="$(owners)" || return 1
+    [[ "$observed" == "$1" ]]
+}
 single_owner() {
     OWNER="$(owners)" || return 1
     [[ "$OWNER" == a || "$OWNER" == b ]]
@@ -618,12 +629,17 @@ report_reset() {
 # outcome, and an unavailable value is recorded as such instead of guessed.
 report_capture_observed() {
     local node owners_now ro json
-    owners_now="$(owners 2>/dev/null || printf unreadable)"
+    owners_now="$(owners 2>/dev/null)" || owners_now=unreadable
+    case "$owners_now" in
+        a|b|ab|none) ;;
+        *) owners_now=unreadable ;;
+    esac
     report_field kernel_vip_owners "$owners_now"
     for node in a b; do
-        case "$owners_now" in
-            *"$node"*) report_field "owner_$node" yes ;;
-            *) report_field "owner_$node" no ;;
+        case "$owners_now:$node" in
+            a:a|b:b|ab:*) report_field "owner_$node" yes ;;
+            a:b|b:a|none:*) report_field "owner_$node" no ;;
+            *) report_field "owner_$node" unreadable ;;
         esac
         ro="$(read_only_of "$node" 2>/dev/null || printf unreadable)"
         report_field "read_only_$node" "$ro"
