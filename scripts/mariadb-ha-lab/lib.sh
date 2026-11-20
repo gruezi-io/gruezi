@@ -245,10 +245,12 @@ long_p() { timeout --signal=KILL 600 "${PODMAN[@]}" "$@"; }
 gx() { local node="$1"; shift; p exec "$NAME-gz-$node" "$@"; }
 db() {
     local node="$1"; shift
-    p exec "$NAME-db-$node" mariadb --defaults-extra-file=/lab/db-client.cnf \
+    p exec -i "$NAME-db-$node" mariadb --defaults-extra-file=/lab/db-client.cnf \
         --connect-timeout=1 --batch --skip-column-names "$@"
 }
-sql() { db "$1" --execute="$2"; }
+# Provisioning bodies contain account/replication passwords. Keep every SQL
+# body on stdin through the existing deadline and option-file client path.
+sql() { db "$1" <<<"$2"; }
 other() { if [[ "$1" == a ]]; then printf b; else printf a; fi; }
 ip_for() { if [[ "$1" == a ]]; then printf 10.249.15.11; else printf 10.249.15.12; fi; }
 
