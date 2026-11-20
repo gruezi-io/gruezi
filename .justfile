@@ -55,8 +55,15 @@ status-ha:
   cargo run -- status --node 127.0.0.1:{{api_b}}
 
 # Test suite
-test: clippy fmt
+test: clippy fmt test-prerequisites
   cargo test
+
+# Real-package tests require these exact tools and a native release binary.
+# Install the pinned tools through mise or the commands in CONTRIBUTING.md.
+test-prerequisites:
+  test "$(cargo-deb --version)" = "cargo-deb 3.8.0"
+  test "$(cargo-generate-rpm --version)" = "cargo-generate-rpm 0.21.0"
+  cargo build --release --locked
 
 # Linting
 clippy:
@@ -67,7 +74,7 @@ fmt:
   cargo fmt --all -- --check
 
 # Coverage report
-coverage:
+coverage: test-prerequisites
   CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' LLVM_PROFILE_FILE='coverage-%p-%m.profraw' cargo test
   grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing --ignore '../*' --ignore "/*" -o target/coverage/html
   firefox target/coverage/html/index.html

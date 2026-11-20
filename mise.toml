@@ -20,8 +20,8 @@ minimum_release_age = "0"
 "cargo:cargo-watch" = "latest"
 # Packaging + coverage helpers used by the justfile (package-deb / package-rpm /
 # coverage). Best-effort: binstall pulls prebuilt binaries when available.
-"cargo:cargo-deb" = "latest"
-"cargo:cargo-generate-rpm" = "latest"
+"cargo:cargo-deb" = "3.8.0"
+"cargo:cargo-generate-rpm" = "0.21.0"
 "cargo:grcov" = "latest"
 bat = "latest"
 eza = "latest"

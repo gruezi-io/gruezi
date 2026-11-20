@@ -65,11 +65,17 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
 
-      # The release recipe tests run the real just recipes under zsh and bash with jq.
+      # Release recipe and real-package tests need shell and distribution tools.
       - name: Install release test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends just zsh jq
+          sudo apt-get install --yes --no-install-recommends just zsh jq rpm rpm2cpio cpio
+
+      - name: Prepare real-package tests
+        run: |
+          cargo install cargo-generate-rpm --version 0.21.0 --locked
+          cargo install cargo-deb --version 3.8.0 --locked
+          just test-prerequisites
 
       - name: test
         run: cargo test --locked

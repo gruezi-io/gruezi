@@ -262,6 +262,7 @@ async fn bump_success() -> Result<()> {
                 "update",
                 "clippy --all-targets --all-features",
                 "fmt --all -- --check",
+                "build --release --locked",
                 "test",
             ]
         );
@@ -426,7 +427,17 @@ async fn bump_failure_rejected_push() -> Result<()> {
         "Cargo.lock\nCargo.toml"
     );
     assert_eq!(fixture.git(work, &["status", "--porcelain"])?, "");
-    assert_eq!(fixture.calls("cargo")?.len(), 5);
+    assert_eq!(
+        fixture.calls("cargo")?,
+        [
+            "set-version --bump patch",
+            "update",
+            "clippy --all-targets --all-features",
+            "fmt --all -- --check",
+            "build --release --locked",
+            "test",
+        ]
+    );
     assert!(log.contains(RETRY_PUSH), "retry command not printed");
     Ok(())
 }

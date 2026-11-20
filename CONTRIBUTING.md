@@ -14,6 +14,25 @@ Start with these files:
 
 You need a working Rust toolchain and standard Cargo workflow.
 
+The test suite also builds and inspects real DEB and RPM packages. On Linux,
+provide `just`, `zsh`, `bash`, `jq`, `dpkg-deb`, `rpm`, `rpm2cpio`, and `cpio`,
+plus these exact packagers (also pinned in `mise.toml`):
+
+```bash
+cargo install cargo-generate-rpm --version 0.21.0 --locked
+cargo install cargo-deb --version 3.8.0 --locked
+```
+
+`just test` runs Clippy, formatting, checks the packager versions, builds
+`target/release/gruezi` with `cargo build --release --locked`, and runs the
+complete test suite. `just coverage` prepares the same package prerequisites
+before its instrumented tests. Neither gate installs missing tools.
+For direct `cargo test` runs, prepare the package prerequisites first:
+
+```bash
+just test-prerequisites
+```
+
 Common commands:
 
 ```bash
