@@ -1979,6 +1979,8 @@ enable_writes() {
     ((rc == 0)) || fail 13 enable_client_failed
     local_identity
     [[ "$READ_ONLY" == 0 && "$PROC_INCARNATION" == "$ENABLE_INCARNATION" ]] || fail 13 enable_readback_mismatch
+    # Diagnostic only: emitted at the verified boundary, before activation returns.
+    printf 'event=enable_readback_verified realtime_ns=%s read_only=0 incarnation_matched=yes\n' "$(date +%s%N)" >&2 || true
     printf 'instance=%s\ngeneration=%s\nproc_incarnation=%s\n' \
         "$GRUEZI_INSTANCE_ID" "$GRUEZI_GENERATION" "$PROC_INCARNATION" \
         | atomic_write "$STATE_DIR/active.record"

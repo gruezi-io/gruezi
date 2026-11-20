@@ -64,6 +64,11 @@ ORDER BY 1,2,3;")"
 
 run_strict() {
     local i
+    # Row 1 owns the first client write and observes the initial VIP-add event.
+    if [[ "$SCENARIO_FILTER" == strict-startup ]]; then
+        "$SELECTED_HANDLER"
+        return
+    fi
     strict_smoke
     if [[ -n "$SCENARIO_FILTER" ]]; then
         if [[ "$SCENARIO_FILTER" != strict-smoke ]]; then "$SELECTED_HANDLER"; fi

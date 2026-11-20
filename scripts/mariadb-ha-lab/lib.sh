@@ -471,6 +471,11 @@ reap_resource() {
 cleanup() {
     local code=$? node failed=0 resource
     trap - EXIT
+    # A scenario may prearm namespace-local observers before daemon startup.
+    # Reap and preserve them before removing the namespaces, including on ERR.
+    if declare -F lab_observers_cleanup >/dev/null; then
+        lab_observers_cleanup || failed=1
+    fi
     if [[ -n "${LAB_TRANSCRIPT:-}" && -n "$WORK" ]]; then
         audit_fixture_output || { printf 'FAIL fixture_authentication_material_in_output\n' >&2; failed=1; }
     fi
@@ -879,6 +884,10 @@ start_gruezi() {
     local node="$1"
     if [[ "$PROFILE" == strict ]]; then
         write_strict_config "$node"
+        # Optional lab instrumentation only; ordinary startup retains a, b order.
+        if declare -F lab_before_gruezi_start >/dev/null; then
+            lab_before_gruezi_start "$node"
+        fi
         p run -d --name "$NAME-gz-$node" --pod "$NAME-$node" \
             --cap-add NET_ADMIN --cap-add NET_RAW -v "$WORK:/lab:ro,z" \
             -v "$NAME-run-$node:/run/mysqld:ro" \

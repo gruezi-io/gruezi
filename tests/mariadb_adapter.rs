@@ -1717,10 +1717,11 @@ fn delayed_enable_cannot_survive_deactivate() -> Result<()> {
 fn cold_bootstrap_refuses_with_dirty_history() -> Result<()> {
     let fx = lifecycle_fixture("cold-dirty")?;
     fs::write(fx.state_dir.join("dirty.prior.record"), "status=open\n")?;
-    expect_exit(
+    let text = expect_exit(
         &fx.event("activate", "1", &[("GRUEZI_ACTIVATION_MODE", "cold")])?,
         11,
     )?;
+    assert!(!text.contains("event=enable_readback_verified"));
     assert_no_enable(&fx)
 }
 
@@ -2104,6 +2105,17 @@ fn cold_bootstrap_requires_no_prior_write_episode_and_converged_pair() -> Result
         0,
     )?;
     assert!(text.contains("target=unknown") && text.contains("rpo=unknown"));
+    let diagnostic = text
+        .lines()
+        .find(|line| line.starts_with("event=enable_readback_verified "))
+        .ok_or_else(|| anyhow!("missing verified enable readback diagnostic"))?;
+    assert!(diagnostic.contains("read_only=0 incarnation_matched=yes"));
+    let timestamp = diagnostic
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("realtime_ns="))
+        .ok_or_else(|| anyhow!("missing readback timestamp"))?;
+    assert_eq!(timestamp.len(), 19);
+    assert!(timestamp.bytes().all(|byte| byte.is_ascii_digit()));
     let fx = lifecycle_fixture("cold-prior-episode")?;
     fx.control("receipt.peer.cnf", "")?;
     fs::write(

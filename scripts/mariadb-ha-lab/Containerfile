@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iproute2 iputils-arping ndisc6 iptables curl mariadb-client gawk util-linux \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 iputils-arping iputils-ping ndisc6 iptables curl mariadb-client gawk util-linux \
     && useradd --system --uid 991 --user-group --shell /usr/sbin/nologin gruezi-actuator \
     && useradd --system --uid 992 --user-group --shell /usr/sbin/nologin gruezi-notify \
     && rm -rf /var/lib/apt/lists/*
