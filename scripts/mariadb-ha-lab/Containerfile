@@ -1,8 +1,18 @@
 FROM ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iproute2 iputils-arping ndisc6 iptables curl mariadb-client \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 iputils-arping ndisc6 iptables curl mariadb-client gawk util-linux \
+    && useradd --system --uid 991 --user-group --shell /usr/sbin/nologin gruezi-actuator \
+    && useradd --system --uid 992 --user-group --shell /usr/sbin/nologin gruezi-notify \
     && rm -rf /var/lib/apt/lists/*
 COPY target/release/gruezi /usr/local/bin/gruezi
 COPY scripts/mariadb-ha-lab/read-only-hook.sh /usr/local/bin/read-only-hook
-RUN chmod 755 /usr/local/bin/read-only-hook
-ENTRYPOINT ["/usr/local/bin/gruezi"]
+COPY contrib/mariadb/gruezi-mariadb-adapter /usr/libexec/gruezi/gruezi-mariadb-adapter
+COPY scripts/mariadb-ha-lab/entrypoint.sh /usr/local/bin/lab-entrypoint
+COPY scripts/mariadb-ha-lab/lifecycle-wrapper.sh /usr/local/libexec/lifecycle-wrapper
+COPY scripts/mariadb-ha-lab/identity-probe.c /tmp/identity-probe.c
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && gcc -Wall -Wextra -Werror /tmp/identity-probe.c -o /usr/local/bin/identity-probe \
+    && chmod 4755 /usr/local/bin/identity-probe \
+    && rm /tmp/identity-probe.c && rm -rf /var/lib/apt/lists/*
+RUN chmod 755 /usr/local/bin/read-only-hook /usr/local/bin/lab-entrypoint /usr/local/libexec/lifecycle-wrapper /usr/libexec/gruezi/gruezi-mariadb-adapter
+ENTRYPOINT ["/usr/local/bin/lab-entrypoint"]
