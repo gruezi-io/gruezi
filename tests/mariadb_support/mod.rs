@@ -346,17 +346,19 @@ impl AdapterFixture {
         generation: &str,
         overrides: &[(&str, &str)],
     ) -> Result<Output> {
-        self.event_args(&[event], generation, overrides)
+        let mut vars = vec![("GRUEZI_EVENT", event)];
+        vars.extend_from_slice(overrides);
+        self.event_args(&[], generation, &vars)
     }
 
-    /// Run an administrative authorization with the activation binding.
+    /// Run explicit argv, or the packaged no-argument entrypoint with an event override.
     pub fn event_args(
         &self,
         args: &[&str],
         generation: &str,
         overrides: &[(&str, &str)],
     ) -> Result<Output> {
-        let event = *args.first().ok_or_else(|| anyhow!("event missing"))?;
+        let event = args.first().copied().unwrap_or("");
         let mut vars = vec![
             (
                 "GRUEZI_EVENT",
@@ -377,7 +379,7 @@ impl AdapterFixture {
             ("GRUEZI_DEACTIVATE_MODE", "handoff_release"),
         ];
         vars.extend_from_slice(overrides);
-        self.run_inner(args, true, &vars)
+        self.run_inner(args, !args.is_empty(), &vars)
     }
 
     /// Persist one fake-server control, independent of the adapter environment.
@@ -409,15 +411,15 @@ impl AdapterFixture {
             path.push(':');
             path.push_str(&old);
         }
-        let mut command = Command::new("bash");
+        let mut command = Command::new(ADAPTER_PATH);
         command
-            .arg(ADAPTER_PATH)
             .args(args)
             .env("GRUEZI_MARIADB_ADAPTER_CONF", &self.conf_path)
             .env("GRUEZI_FAKE_MARIADB_LOG", &self.call_log)
             .env("GRUEZI_FAKE_MARIADB_FIXTURE", &self.fixture_dir)
             .env("GRUEZI_FAKE_STATE_DIR", &self.state_dir)
             .env("PATH", &path)
+            .env_remove("GRUEZI_EVENT")
             .env_remove("GRUEZI_INSTANCE_ID")
             .env_remove("GRUEZI_GENERATION");
         if guard {

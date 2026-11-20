@@ -2103,8 +2103,12 @@ run_activate() {
 
 main() {
     if (($# == 0)); then
-        usage >&2
-        exit "$EXIT_USAGE"
+        # Packaged lifecycle commands receive the operation through the daemon
+        # environment. Administrative commands still require explicit argv.
+        case "${GRUEZI_EVENT:-}" in
+            activate | deactivate | verify) set -- "$GRUEZI_EVENT" ;;
+            *) usage >&2; exit "$EXIT_USAGE" ;;
+        esac
     fi
     local command="$1"
     shift

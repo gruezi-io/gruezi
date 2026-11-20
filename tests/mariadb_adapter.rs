@@ -7,6 +7,8 @@
 //! GTID parsing is exercised through the adapter's parser itself under the
 //! awk found on this host (mawk 1.3.4; the lab re-runs under gawk).
 
+#[path = "mariadb_support/entrypoint.rs"]
+mod entrypoint;
 mod mariadb_support;
 
 use anyhow::{Result, anyhow};
