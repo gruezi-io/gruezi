@@ -60,7 +60,7 @@ can be recorded before enable:
 timeout --signal=KILL COMMAND_TIMEOUT_S mariadb \
     --defaults-extra-file=<option-file> \
     --connect-timeout=CONNECT_TIMEOUT_S \
-    --max-statement-time=STATEMENT_TIMEOUT_S \
+    --init-command="SET SESSION max_statement_time=STATEMENT_TIMEOUT_S" \
     --batch --skip-column-names
 ```
 
@@ -68,6 +68,17 @@ SQL is passed on stdin; credentials live only in the option file, so no secret
 ever appears on argv. A wall-clock timeout is exit 12; any other client
 failure is exit 13; output is parsed strictly and any unparseable value is
 exit 13. Never a guess, never a default.
+
+The session initialization bounds statements on that connection without
+changing global server settings. MariaDB 11.8's client rejects
+`--max-statement-time`; the timeout is a session system variable.
+
+Mixed eligibility and release-snapshot reads use `--column-names` instead:
+MariaDB 11.8 also suppresses vertical field names with `--skip-column-names`.
+The adapter removes the `@@global.*` SELECT header lines from those fixed
+queries while preserving the named `SHOW ALL SLAVES STATUS\G` fields.
+Strict-mode and binlog booleans accept exactly `1`/`0` or `ON`/`OFF`, normalized
+to `ON`/`OFF` before eligibility evaluation; other values exit 13.
 
 ## `check` (read-only eligibility)
 

@@ -74,9 +74,9 @@ impl LocalFixture {
         Self {
             server_id: "1".to_owned(),
             domain: "0".to_owned(),
-            strict: "ON".to_owned(),
-            log_bin: "ON".to_owned(),
-            log_slave_updates: "ON".to_owned(),
+            strict: "1".to_owned(),
+            log_bin: "1".to_owned(),
+            log_slave_updates: "1".to_owned(),
             binlog_format: "ROW".to_owned(),
             slave_skip_errors: "OFF".to_owned(),
             pid_file: pid_file.to_owned(),
@@ -97,8 +97,8 @@ impl LocalFixture {
         }
     }
 
-    /// Render exactly what the real client would print for this fixture in
-    /// `--batch --skip-column-names` mode (tab row, then the vertical block).
+    /// Render scalar values and named vertical fields. The fake client applies
+    /// the invocation's column-name option, just as MariaDB 11.8 does.
     #[must_use]
     pub fn render(&self) -> String {
         let mut parts: Vec<String> = Vec::new();

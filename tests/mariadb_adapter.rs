@@ -230,6 +230,102 @@ fn check_requires_every_server_variable() -> Result<()> {
 }
 
 #[test]
+fn real_format_show_all_slaves_status_field_names() -> Result<()> {
+    let fx = AdapterFixture::new("real-field-names")?;
+    install_healthy(&fx)?;
+    let local = LocalFixture {
+        strict: "ON".to_owned(),
+        log_bin: "ON".to_owned(),
+        log_slave_updates: "ON".to_owned(),
+        seconds_behind_master: "NULL".to_owned(),
+        ..healthy_local(&fx)
+    };
+    fx.set_local_output(&local.render())?;
+    expect_exit(&fx.run(&["check"])?, 0)?;
+    assert!(fx.call_log()?.contains("--column-names"));
+    assert_no_write_sql(&fx.call_log()?)?;
+    Ok(())
+}
+
+#[test]
+fn real_format_numeric_booleans_accepted() -> Result<()> {
+    for (strict, log_bin, updates, code, reason) in [
+        ("1", "1", "1", 0, ""),
+        ("0", "1", "1", 11, "gtid_strict_mode_violation"),
+        ("1", "0", "1", 10, "log_bin_off"),
+        ("1", "1", "0", 10, "log_slave_updates_off"),
+        ("ON", "ON", "ON", 0, ""),
+        ("OFF", "ON", "ON", 11, "gtid_strict_mode_violation"),
+        ("ON", "OFF", "ON", 10, "log_bin_off"),
+        ("ON", "ON", "OFF", 10, "log_slave_updates_off"),
+    ] {
+        let fx = AdapterFixture::new("real-booleans")?;
+        install_healthy(&fx)?;
+        fx.set_local_output(
+            &LocalFixture {
+                strict: strict.to_owned(),
+                log_bin: log_bin.to_owned(),
+                log_slave_updates: updates.to_owned(),
+                ..healthy_local(&fx)
+            }
+            .render(),
+        )?;
+        let text = expect_exit(&fx.run(&["check"])?, code)?;
+        if !reason.is_empty() {
+            assert_reason(&text, reason);
+        }
+        let fx = lifecycle_fixture("real-snapshot-booleans")?;
+        fx.control("snapshot_strict", strict)?;
+        fx.control("snapshot_log_bin", log_bin)?;
+        fx.control("snapshot_log_slave_updates", updates)?;
+        expect_exit(&fx.event("activate", "1", &[])?, code)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn numeric_boolean_garbage_rejected() -> Result<()> {
+    for bad in ["2", "-1", "01", "00", "on", "off", "true", "NULL", "1 ", ""] {
+        for field in ["strict", "log_bin", "log_slave_updates"] {
+            let fx = AdapterFixture::new("bad-boolean")?;
+            install_healthy(&fx)?;
+            let mut local = healthy_local(&fx);
+            match field {
+                "strict" => local.strict = bad.to_owned(),
+                "log_bin" => local.log_bin = bad.to_owned(),
+                _ => local.log_slave_updates = bad.to_owned(),
+            }
+            fx.set_local_output(&local.render())?;
+            expect_exit(&fx.run(&["check"])?, 13)?;
+            let fx = lifecycle_fixture("bad-snapshot-boolean")?;
+            fx.control(&format!("snapshot_{field}"), bad)?;
+            expect_exit(&fx.event("activate", "1", &[])?, 13)?;
+            assert_no_enable(&fx)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn real_client_session_statement_timeout_accepted() -> Result<()> {
+    let fx = lifecycle_fixture("real-client-timeout")?;
+    expect_exit(&fx.event("activate", "1", &[])?, 0)?;
+    let log = fx.call_log()?;
+    let invocations: Vec<_> = log
+        .lines()
+        .filter(|line| line.starts_with("ARGV:"))
+        .collect();
+    assert_ne!(invocations.len(), 0);
+    assert!(
+        invocations
+            .iter()
+            .all(|line| line.contains("<--init-command=SET SESSION max_statement_time=5>"))
+    );
+    assert!(!log.contains("--max-statement-time="));
+    Ok(())
+}
+
+#[test]
 fn check_requires_both_threads_and_zero_errors() -> Result<()> {
     let fx = AdapterFixture::new("check-threads")?;
     install_healthy(&fx)?;
@@ -1446,6 +1542,10 @@ fn verify_call_log_contains_no_write_statement() -> Result<()> {
     );
     let log = fx.call_log()?;
     assert_no_write_sql(&log)?;
+    // The real client sets a session timeout via initialization; the old fake
+    // accepted an unsupported flag. Exempt only that exact argv option, keeping
+    // every SQL-body SET and every other session/global SET forbidden.
+    let log = log.replace("<--init-command=SET SESSION max_statement_time=5>", "");
     for forbidden in [
         "SET ",
         "KILL ",
@@ -1531,6 +1631,8 @@ fn verify_runs_through_configured_activate_command() -> Result<()> {
         0,
     )?;
     let log = fx.call_log()?;
+    // Permit only the real client's exact session-timeout initialization.
+    let log = log.replace("<--init-command=SET SESSION max_statement_time=5>", "");
     assert!(!log.contains("SET ") && !log.contains("peer.cnf"));
     assert_no_write_sql(&log)
 }

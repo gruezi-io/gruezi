@@ -117,6 +117,16 @@ is_canonical_uint() {
     [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]
 }
 
+# SELECT returns numeric booleans on MariaDB 11.8; SHOW variable forms use
+# ON/OFF. Normalize only those exact representations before policy evaluation.
+normalize_boolean() {
+    case "$1" in
+        1 | ON) printf 'ON' ;;
+        0 | OFF) printf 'OFF' ;;
+        *) return 1 ;;
+    esac
+}
+
 # fsync a file (or directory) through coreutils sync -f.
 fsync_path() { sync -f -- "$1"; }
 
@@ -331,6 +341,13 @@ SQL_CLIENT_RC=0
 # failure. Unparseable output is the caller's concern (exit 13).
 sql_run() {
     local optfile="$1" sql="$2" rc=0 errfile budget
+    local column_option=--skip-column-names
+    # The mixed reads contain only @@global SELECTs followed by vertical SHOW.
+    # MariaDB also suppresses vertical field names with --skip-column-names.
+    # Keep those names and remove only the SELECT headers below.
+    if [[ "$sql" == "$LOCAL_READ_SQL" || "$sql" == "$SNAPSHOT_SQL" ]]; then
+        column_option=--column-names
+    fi
     budget="$(remaining_seconds)" || return 2
     errfile="$(mktemp "$STATE_DIR/.tmp.stderr.XXXXXX")"
     SQL_OUT=""
@@ -340,13 +357,18 @@ sql_run() {
     SQL_OUT="$(printf '%s\n' "$sql" | timeout --signal=KILL "$budget" mariadb \
         --defaults-extra-file="$optfile" \
         --connect-timeout="$CFG_CONNECT_TIMEOUT_S" \
-        --max-statement-time="$CFG_STATEMENT_TIMEOUT_S" \
-        --batch --skip-column-names 2>"$errfile")" || rc=$?
+        --init-command="SET SESSION max_statement_time=$CFG_STATEMENT_TIMEOUT_S" \
+        --batch "$column_option" 2>"$errfile")" || rc=$?
     SQL_CLIENT_RC="$rc"
     SQL_ERR="$(head -n 1 -- "$errfile" | cut -c1-200)"
     rm -f -- "$errfile"
     case "$rc" in
-        0) return 0 ;;
+        0)
+            if [[ "$column_option" == --column-names ]]; then
+                SQL_OUT="$(awk '!/^@@global[.]/' <<<"$SQL_OUT")"
+            fi
+            return 0
+            ;;
         # GNU timeout reports 124 for graceful termination and 137 when the
         # KILL signal takes down the whole group; 143 covers a SIGTERM default.
         124 | 137 | 143) return 2 ;;
@@ -844,18 +866,9 @@ parse_local_state() {
 
     is_canonical_uint "$V_SERVER_ID" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
     is_canonical_uint "$V_DOMAIN" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
-    case "$V_STRICT" in
-        ON | OFF) ;;
-        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
-    esac
-    case "$V_LOG_BIN" in
-        ON | OFF) ;;
-        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
-    esac
-    case "$V_LOG_SLAVE_UPDATES" in
-        ON | OFF) ;;
-        *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
-    esac
+    V_STRICT="$(normalize_boolean "$V_STRICT")" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
+    V_LOG_BIN="$(normalize_boolean "$V_LOG_BIN")" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
+    V_LOG_SLAVE_UPDATES="$(normalize_boolean "$V_LOG_SLAVE_UPDATES")" || { CHECK_FATAL_REASON=output_unparseable; return 1; }
     case "$V_BINLOG_FORMAT" in
         STATEMENT | ROW | MIXED) ;;
         *) CHECK_FATAL_REASON=output_unparseable; return 1 ;;
@@ -1640,7 +1653,7 @@ snapshot() {
     S_POS="${rows[1]}" S_CURRENT="${rows[2]}" S_SLAVE="${rows[3]}" S_STATE="${rows[4]}"
     local index
     for index in 5 6 7; do
-        case "${fields[index]}" in ON | OFF) ;; *) fail 13 snapshot_unparseable ;; esac
+        fields[index]="$(normalize_boolean "${fields[index]}")" || fail 13 snapshot_unparseable
     done
     case "${fields[8]}" in ROW | STATEMENT | MIXED) ;; *) fail 13 snapshot_unparseable ;; esac
     local vector
@@ -1933,7 +1946,7 @@ enable_writes() {
     # to enable. A separate SELECT CONNECTION_ID() invocation cannot bind SQL.
     coproc ENABLE_SQL {
         timeout --signal=KILL "$budget" mariadb --defaults-extra-file="$CFG_LOCAL_OPTION_FILE" \
-            --connect-timeout="$CFG_CONNECT_TIMEOUT_S" --max-statement-time="$CFG_STATEMENT_TIMEOUT_S" \
+            --connect-timeout="$CFG_CONNECT_TIMEOUT_S" --init-command="SET SESSION max_statement_time=$CFG_STATEMENT_TIMEOUT_S" \
             --batch --skip-column-names --unbuffered
     }
     pid="$ENABLE_SQL_PID" input_fd="${ENABLE_SQL[1]}" output_fd="${ENABLE_SQL[0]}"

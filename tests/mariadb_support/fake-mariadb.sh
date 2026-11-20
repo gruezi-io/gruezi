@@ -11,13 +11,24 @@
 #   mode          optional: "normal" (default), "hang" (never answer; the
 #                 adapter's timeout must kill this process), "fail" (exit 1)
 #   out.<base>    the client output for the option file with basename <base>
-set -eu
+set -euo pipefail
 
 log="${GRUEZI_FAKE_MARIADB_LOG:?}"
 fix="${GRUEZI_FAKE_MARIADB_FIXTURE:?}"
 
 interactive=no
-for arg in "$@"; do [[ "$arg" != --unbuffered ]] || interactive=yes; done
+column_names=yes
+for arg in "$@"; do
+    case "$arg" in
+        --unbuffered) interactive=yes ;;
+        --skip-column-names) column_names=no ;;
+        --column-names) column_names=yes ;;
+        --max-statement-time=*)
+            printf "mariadb: unknown variable '%s'\n" "${arg#--}" >&2
+            exit 7
+            ;;
+    esac
+done
 if [[ "$interactive" == no ]]; then
     sql="$(cat)"
 else
@@ -56,6 +67,7 @@ case "$mode" in
         ;;
 esac
 
+respond() {
 if [[ -f "$fix/lifecycle" ]]; then
     control() {
         if [[ -f "$fix/$1" ]]; then cat "$fix/$1"; else printf '%s' "${2:-}"; fi
@@ -146,7 +158,7 @@ if [[ -f "$fix/lifecycle" ]]; then
             ;;
         *information_schema.GLOBAL_STATUS*)
             if [[ "$base" == local.cnf ]]; then
-                printf '1\t0\t%s\t%s\t100\tON\tON\tON\tROW\tOFF\n' "$(ro)" "$(control event_scheduler OFF)"
+                printf '1\t0\t%s\t%s\t100\t%s\t%s\t%s\tROW\tOFF\n' "$(ro)" "$(control event_scheduler OFF)" "$(control snapshot_strict 1)" "$(control snapshot_log_bin 1)" "$(control snapshot_log_slave_updates 1)"
                 head -n 4 "$fix/out.local.cnf" | tail -n 3 | head -n 1
                 head -n 4 "$fix/out.local.cnf" | tail -n 3 | head -n 1
                 head -n 4 "$fix/out.local.cnf" | tail -n 1
@@ -155,7 +167,7 @@ if [[ -f "$fix/lifecycle" ]]; then
             else
                 peer_ro=1
                 [[ ! -f "$fix/peer_writable" ]] || peer_ro=0
-                printf '2\t1\t%s\tOFF\t%s\tON\tON\tON\tROW\tOFF\n' "$peer_ro" "$(control peer_uptime 100)"
+                printf '2\t1\t%s\tOFF\t%s\t%s\t%s\t%s\tROW\tOFF\n' "$peer_ro" "$(control peer_uptime 100)" "$(control snapshot_strict 1)" "$(control snapshot_log_bin 1)" "$(control snapshot_log_slave_updates 1)"
                 head -n 2 "$fix/out.peer.cnf" | tail -n 1
                 head -n 2 "$fix/out.peer.cnf" | tail -n 1
                 head -n 4 "$fix/out.peer.cnf" | tail -n 1
@@ -182,3 +194,34 @@ if [[ ! -f "$output" ]]; then
     exit 1
 fi
 cat "$output"
+}
+
+# MariaDB's column-name option affects vertical output too. Mixed reads emit
+# SELECT headers before each scalar row and retain SHOW field names only when
+# names are enabled. This prevents fixtures from masking an invalid invocation.
+format_output() {
+    if [[ "$sql" != *'SHOW ALL SLAVES STATUS\G'* ]]; then cat; return; fi
+    FAKE_SQL="$sql" awk -v names="$column_names" '
+        BEGIN {
+            n = split(ENVIRON["FAKE_SQL"], statements, "\n")
+            for (i = 1; i <= n; i++) {
+                if (statements[i] ~ /^SELECT @@global[.]/) {
+                    header = substr(statements[i], 8)
+                    sub(/;$/, "", header)
+                    gsub(/,/, "\t", header)
+                    headers[++count] = header
+                }
+            }
+        }
+        NR <= count {
+            if (names == "yes") print headers[NR]
+            print
+            next
+        }
+        names == "no" {
+            sub(/^[ \t]*[A-Za-z_][A-Za-z0-9_]*: /, "")
+        }
+        { print }
+    '
+}
+respond | format_output
