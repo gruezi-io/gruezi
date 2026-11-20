@@ -1,0 +1,5 @@
+# Unsupported Ansible features are intentionally refused: YAML/JSON, plugins,
+# includes, groups/vars, ansible_connection, proxy arguments, ports and DNS.
+[gruezi_ha_lab]
+disposable-one ansible_host=10.88.0.10 ansible_user=ansible gruezi_interface=eth0 gruezi_vip=10.88.0.20/32
+disposable-two ansible_host=10.88.0.11 ansible_user=ansible gruezi_interface=eth0 gruezi_vip=10.88.0.20/32

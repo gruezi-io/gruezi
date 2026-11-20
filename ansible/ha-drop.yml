@@ -68,6 +68,22 @@
         - gruezi_drop_rule_check.rc != 0
       changed_when: true
 
+    - name: Observe complete OUTPUT rules before restoration
+      ansible.builtin.command:
+        argv: [/usr/sbin/iptables, -S, OUTPUT]
+      register: gruezi_drop_before
+      changed_when: false
+      when: gruezi_drop_state == 'absent'
+
+    - name: Require parseable OUTPUT state before restoration
+      ansible.builtin.assert:
+        that:
+          - gruezi_drop_before.stdout_lines | length > 0
+          - gruezi_drop_before.stdout_lines | first is match('^-P OUTPUT (ACCEPT|DROP)$')
+          - gruezi_drop_before.stdout_lines | reject('match', '^(?:-P OUTPUT (?:ACCEPT|DROP)|-A OUTPUT .+)$') | list | length == 0
+        fail_msg: Cannot establish OUTPUT state; manual recovery required
+      when: gruezi_drop_state == 'absent'
+
     - name: Remove HA UDP drop rule
       ansible.builtin.command:
         argv:
@@ -87,8 +103,26 @@
           - -j
           - DROP
       register: gruezi_drop_rule_remove
-      failed_when: false
       changed_when: gruezi_drop_rule_remove.rc == 0
+      when:
+        - gruezi_drop_state == 'absent'
+        - gruezi_drop_comment in gruezi_drop_before.stdout
+
+    - name: Observe complete OUTPUT rules after restoration
+      ansible.builtin.command:
+        argv: [/usr/sbin/iptables, -S, OUTPUT]
+      register: gruezi_drop_after
+      changed_when: false
+      when: gruezi_drop_state == 'absent'
+
+    - name: Confirm managed drop rules are absent
+      ansible.builtin.assert:
+        that:
+          - gruezi_drop_after.stdout_lines | length > 0
+          - gruezi_drop_after.stdout_lines | first is match('^-P OUTPUT (ACCEPT|DROP)$')
+          - gruezi_drop_after.stdout_lines | reject('match', '^(?:-P OUTPUT (?:ACCEPT|DROP)|-A OUTPUT .+)$') | list | length == 0
+          - gruezi_drop_comment not in gruezi_drop_after.stdout
+        fail_msg: Drop restoration is unconfirmed; manual recovery required
       when: gruezi_drop_state == 'absent'
 
     - name: Show matching iptables rules
@@ -98,6 +132,7 @@
         executable: /bin/bash
       register: gruezi_drop_rules
       changed_when: false
+      when: gruezi_drop_state == 'present'
 
     - name: Show matching nft drop rules
       ansible.builtin.shell: |
@@ -106,7 +141,9 @@
         executable: /bin/bash
       register: gruezi_drop_nft_rules
       changed_when: false
+      when: gruezi_drop_state == 'present'
 
     - name: Display matching iptables and nft rules
       ansible.builtin.debug:
         msg: '{{ inventory_hostname }} drop rules -> iptables: {{ gruezi_drop_rules.stdout | default("none") }}; nft: {{ gruezi_drop_nft_rules.stdout | default("none") }}'
+      when: gruezi_drop_state == 'present'

@@ -51,6 +51,32 @@
       when: gruezi_netem_state == 'present'
       changed_when: true
 
+    - name: Observe qdiscs before restoration
+      ansible.builtin.command:
+        argv: [tc, -j, qdisc, show, dev, '{{ gruezi_interface }}']
+      register: gruezi_netem_before_query
+      changed_when: false
+      when: gruezi_netem_state == 'absent'
+
+    - name: Parse qdiscs before restoration
+      ansible.builtin.set_fact:
+        gruezi_netem_before: '{{ gruezi_netem_before_query.stdout | from_json }}'
+      when: gruezi_netem_state == 'absent'
+
+    - name: Require complete qdisc identities before restoration
+      ansible.builtin.assert:
+        that:
+          - gruezi_netem_before is sequence and gruezi_netem_before is not string and gruezi_netem_before is not mapping
+          - gruezi_netem_before | select('mapping') | list | length == gruezi_netem_before | length
+          - gruezi_netem_before | selectattr('kind', 'defined') | list | length == gruezi_netem_before | length
+          - gruezi_netem_before | selectattr('handle', 'defined') | list | length == gruezi_netem_before | length
+          - gruezi_netem_before | map(attribute='kind') | select('string') | list | length == gruezi_netem_before | length
+          - gruezi_netem_before | map(attribute='handle') | select('string') | list | length == gruezi_netem_before | length
+          - gruezi_netem_before | map(attribute='kind') | reject('match', '^[a-zA-Z][a-zA-Z0-9_-]*$') | list | length == 0
+          - gruezi_netem_before | map(attribute='handle') | reject('match', '^[0-9a-fA-F]+:$') | list | length == 0
+        fail_msg: Cannot establish qdisc state; manual recovery required
+      when: gruezi_netem_state == 'absent'
+
     - name: Clear tc netem impairment from the HA interface
       ansible.builtin.command:
         argv:
@@ -61,8 +87,37 @@
           - '{{ gruezi_interface }}'
           - root
       register: gruezi_netem_clear
-      failed_when: false
       changed_when: gruezi_netem_clear.rc == 0
+      when:
+        - gruezi_netem_state == 'absent'
+        - gruezi_netem_before | selectattr('kind', 'equalto', 'netem') | list | length > 0 or gruezi_netem_before | selectattr('handle', 'equalto', '1:') | list | length > 0
+
+    - name: Observe qdiscs after restoration
+      ansible.builtin.command:
+        argv: [tc, -j, qdisc, show, dev, '{{ gruezi_interface }}']
+      register: gruezi_netem_after_query
+      changed_when: false
+      when: gruezi_netem_state == 'absent'
+
+    - name: Parse qdiscs after restoration
+      ansible.builtin.set_fact:
+        gruezi_netem_after: '{{ gruezi_netem_after_query.stdout | from_json }}'
+      when: gruezi_netem_state == 'absent'
+
+    - name: Confirm managed netem and root qdisc are absent
+      ansible.builtin.assert:
+        that:
+          - gruezi_netem_after is sequence and gruezi_netem_after is not string and gruezi_netem_after is not mapping
+          - gruezi_netem_after | select('mapping') | list | length == gruezi_netem_after | length
+          - gruezi_netem_after | selectattr('kind', 'defined') | list | length == gruezi_netem_after | length
+          - gruezi_netem_after | selectattr('handle', 'defined') | list | length == gruezi_netem_after | length
+          - gruezi_netem_after | map(attribute='kind') | select('string') | list | length == gruezi_netem_after | length
+          - gruezi_netem_after | map(attribute='handle') | select('string') | list | length == gruezi_netem_after | length
+          - gruezi_netem_after | map(attribute='kind') | reject('match', '^[a-zA-Z][a-zA-Z0-9_-]*$') | list | length == 0
+          - gruezi_netem_after | map(attribute='handle') | reject('match', '^[0-9a-fA-F]+:$') | list | length == 0
+          - gruezi_netem_after | selectattr('kind', 'equalto', 'netem') | list | length == 0
+          - gruezi_netem_after | selectattr('handle', 'equalto', '1:') | list | length == 0
+        fail_msg: Netem restoration is unconfirmed; manual recovery required
       when: gruezi_netem_state == 'absent'
 
     - name: Show current qdisc state
@@ -75,6 +130,7 @@
           - '{{ gruezi_interface }}'
       register: gruezi_netem_show
       changed_when: false
+      when: gruezi_netem_state == 'present'
 
     - name: Show current tc filters
       ansible.builtin.command:
@@ -86,11 +142,14 @@
           - '{{ gruezi_interface }}'
       register: gruezi_netem_filter_show
       changed_when: false
+      when: gruezi_netem_state == 'present'
 
     - name: Display current qdisc state
       ansible.builtin.debug:
         msg: '{{ inventory_hostname }} qdisc -> {{ gruezi_netem_show.stdout }}'
+      when: gruezi_netem_state == 'present'
 
     - name: Display current filter state
       ansible.builtin.debug:
         msg: '{{ inventory_hostname }} filter -> {{ gruezi_netem_filter_show.stdout }}'
+      when: gruezi_netem_state == 'present'

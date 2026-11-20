@@ -1,0 +1,6 @@
+# Example only; this file is NEVER read as authorization.
+# After approval of a specific run, create ignored vm-allowlist.txt with
+# exact inventory labels and canonical private IPv4 addresses, one pair per row.
+# No credentials, DNS names, SSH aliases, wildcards, groups, or reference VMs.
+# disposable-one 10.88.0.10
+# disposable-two 10.88.0.11

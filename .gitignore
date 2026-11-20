@@ -30,3 +30,4 @@ ansible/group_vars/gruezi_ha_lab.yml
 ansible/inventory/*.local.yml
 ansible/group_vars/*.local.yml
 ansible/artifacts/
+ansible/vm-allowlist.txt
