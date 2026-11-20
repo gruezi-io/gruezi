@@ -1,0 +1,33 @@
+---
+mode: ha
+node:
+  id: mariadb-a
+ha:
+  failure_policy: strict
+  peer_id: mariadb-b
+  bind: 0.0.0.0:9375
+  interface: eth0
+  group_id: mariadb-ha
+  addresses:
+    - 192.0.2.50/24
+  peer: 192.0.2.52:9375
+  priority: 110
+  preempt: false
+  advert_interval_ms: 1000
+  dead_factor: 3
+  hold_down_ms: 3000
+  jitter_ms: 100
+  command_timeout_ms: 3000
+  withdraw_timeout_ms: 5000
+  auth:
+    key: replace-with-a-private-shared-key
+  lifecycle:
+    activate_command: /usr/libexec/gruezi/gruezi-mariadb-adapter
+    deactivate_command: /usr/libexec/gruezi/gruezi-mariadb-adapter
+    timeout_ms: 2500
+  watchdog:
+    mode: required
+    device: /dev/watchdog0
+    timeout_ms: 30000
+    safety_margin_ms: 2000
+    nowayout: reject
