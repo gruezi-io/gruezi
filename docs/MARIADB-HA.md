@@ -5,6 +5,13 @@ Gruezi authority, a floating address, a MariaDB lifecycle adapter, and a Linux
 watchdog. It is not a production-readiness statement, a fencing guarantee, or
 a split-brain-proof design.
 
+**The strict HA investigation is closed.** This profile stays Experimental and
+is not a v1 requirement. Read
+[MARIADB_HA_LESSONS.md](MARIADB_HA_LESSONS.md) for the confirmed findings,
+the unresolved safety limitations, and the scenarios that remain NOT RUN,
+and [decisions/0001-ha-coordination-not-application-consistency.md](decisions/0001-ha-coordination-not-application-consistency.md)
+for the decision that bounds it.
+
 ## What the components do
 
 Gruezi owns election and VIP authority. The lifecycle adapter is the only

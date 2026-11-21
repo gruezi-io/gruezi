@@ -3,6 +3,24 @@
 Each milestone below is complete only when its acceptance criteria can be
 reproduced from a clean checkout and the recorded output is retained.
 
+## Current priorities, November 21, 2026
+
+Effort order, not new milestones. The existing milestones below are unchanged.
+
+1. **Two-node HA coordination.** Complete and stabilise the generic
+   coordination engine: ownership semantics, resource lifecycle, observability,
+   and documented failure guarantees. This is M1 and M2.
+2. **Three-node consensus.** Continue the existing OpenRaft work once the core
+   is stable. This is M3.
+3. **KV and compatibility.** Proceed with durable KV and the narrow
+   etcd-compatible subset. This is M4 and M5.
+
+Application integrations stay Experimental. MariaDB remains an example, and
+application-specific consistency and recovery are outside the generic
+coordinator's responsibility. See
+[decisions/0001-ha-coordination-not-application-consistency.md](decisions/0001-ha-coordination-not-application-consistency.md)
+and [MARIADB_HA_LESSONS.md](MARIADB_HA_LESSONS.md).
+
 ## M1: HA ownership correctness, Implemented
 
 **Objective:** Separate election, authority, resource state, and status, then
