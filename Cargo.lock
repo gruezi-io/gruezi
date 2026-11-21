@@ -683,7 +683,7 @@ dependencies = [
  "built",
  "chrono",
  "clap",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hmac",
  "libc",
  "opentelemetry",
